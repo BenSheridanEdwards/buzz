@@ -162,16 +162,25 @@ pub fn validate_imeta_tags(tags: &[Vec<String>], media_base_url: &str) -> Result
             return Err("imeta tag must include url, m, x, and size".into());
         }
 
-        // Video-only NIP-71 fields must not appear on image blobs.
+        // Playback fields describe timed media: `duration` and `bitrate` apply
+        // to video and to audio (voice notes, agent voice replies); a poster
+        // frame (`image`) only makes sense for video. Images and generic files
+        // carry none of them.
         let is_video = m_value == "video/mp4";
-        if !is_video {
-            for key in &["duration", "bitrate", "image"] {
+        let is_timed_media = is_video || m_value.starts_with("audio/");
+        if !is_timed_media {
+            for key in &["duration", "bitrate"] {
                 if seen_keys.contains(*key) {
                     return Err(format!(
-                        "imeta {key} is only valid for video/mp4, not {m_value}"
+                        "imeta {key} is only valid for video/mp4 or audio/*, not {m_value}"
                     ));
                 }
             }
+        }
+        if !is_video && seen_keys.contains("image") {
+            return Err(format!(
+                "imeta image is only valid for video/mp4, not {m_value}"
+            ));
         }
 
         // Cross-check internal consistency: url hash must match x, url ext must match m.
@@ -570,6 +579,45 @@ mod tests {
         ];
         let err = validate_imeta_tags(&[tag], BASE).unwrap_err();
         assert!(err.contains("url hash does not match x"), "{err}");
+    }
+
+    #[test]
+    fn test_imeta_audio_carries_duration_but_not_poster() {
+        let audio = vec![
+            "imeta".into(),
+            format!("url /media/{HASH}.mp3"),
+            "m audio/mpeg".into(),
+            format!("x {HASH}"),
+            "size 141688".into(),
+            "duration 11.78".into(),
+            "filename voice-note-1.mp3".into(),
+        ];
+        assert!(validate_imeta_tags(&[audio], BASE).is_ok());
+
+        let with_poster = vec![
+            "imeta".into(),
+            format!("url /media/{HASH}.m4a"),
+            "m audio/mp4".into(),
+            format!("x {HASH}"),
+            "size 6119".into(),
+            format!("image /media/{HASH}.jpg"),
+        ];
+        let err = validate_imeta_tags(&[with_poster], BASE).unwrap_err();
+        assert!(err.contains("image is only valid for video/mp4"), "{err}");
+
+        let image_with_duration = vec![
+            "imeta".into(),
+            format!("url /media/{HASH}.jpg"),
+            "m image/jpeg".into(),
+            format!("x {HASH}"),
+            "size 100".into(),
+            "duration 3".into(),
+        ];
+        let err = validate_imeta_tags(&[image_with_duration], BASE).unwrap_err();
+        assert!(
+            err.contains("duration is only valid for video/mp4 or audio/*"),
+            "{err}"
+        );
     }
 
     #[test]
