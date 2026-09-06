@@ -5,6 +5,7 @@ use bytes::Bytes;
 use sha2::{Digest, Sha256};
 use tokio::io::AsyncWriteExt;
 
+use crate::audio::{validate_audio_content, validate_iso_bmff_file, IsoBmffMedia};
 use crate::auth::verify_blossom_upload_auth;
 use crate::config::MediaConfig;
 use crate::error::MediaError;
@@ -14,7 +15,6 @@ use crate::types::BlobDescriptor;
 use crate::upload_record::{record_upload_event, UploadAttribution, UploadEventFacts};
 use crate::validation::{
     looks_like_mp4_iso_bmff, mime_to_ext, validate_content, validate_file_content,
-    validate_video_file,
 };
 
 /// Shared buffered-upload pipeline for the image and generic-file paths.
@@ -278,6 +278,53 @@ pub async fn process_file_upload(
     .await
 }
 
+/// Process a buffered audio upload (MP3) end-to-end.
+///
+/// Audio is small (bounded by `config.max_audio_bytes`), so it takes the
+/// buffered path like images. The bytes must be a canonical, metadata-free
+/// MPEG audio stream (see [`crate::audio`]); the sidecar records the measured
+/// duration so clients can draw the player before the file loads. ISO-BMFF
+/// audio (M4A) never arrives here: every `ftyp` container is routed through
+/// [`process_video_upload`], which accepts an audio-only file when the
+/// feature is enabled.
+pub async fn process_audio_upload(
+    storage: &MediaStorage,
+    config: &MediaConfig,
+    ctx: &TenantContext,
+    auth_event: &nostr::Event,
+    body: Bytes,
+    attribution: Option<UploadAttribution>,
+) -> Result<BlobDescriptor, MediaError> {
+    process_buffered_upload(
+        BufferedUploadInput {
+            storage,
+            config,
+            ctx,
+            auth_event,
+            body,
+            attribution,
+        },
+        |bytes, cfg| validate_audio_content(bytes, cfg).map(|(mime, ext, _)| (mime, ext)),
+        |input| async move {
+            // The stream was validated once already; measuring it again is a
+            // linear walk over a few megabytes and keeps the validator's
+            // signature identical to the other buffered paths.
+            let (_, _, audio) = validate_audio_content(&input.body, config)?;
+            Ok(BlobMeta {
+                dim: String::new(),
+                blurhash: String::new(),
+                thumb_url: String::new(),
+                size: input.body.len() as u64,
+                ext: input.ext,
+                mime_type: input.mime,
+                uploaded_at: input.uploaded_at,
+                duration_secs: Some(audio.duration_secs),
+            })
+        },
+    )
+    .await
+}
+
 /// Process a video upload end-to-end using a streaming pipeline.
 ///
 /// Unlike [`process_upload`], this function:
@@ -285,6 +332,8 @@ pub async fn process_file_upload(
 ///    SHA-256 incrementally — the full body is never in RAM simultaneously.
 /// 2. Verifies the Blossom auth event `x` tag against the computed hash.
 /// 3. Runs full MP4 validation (codec, duration, resolution, moov placement).
+///    When audio uploads are enabled, an audio-only AAC file passes as
+///    `audio/mp4` (stored as `.m4a`) instead of being rejected.
 /// 4. Stores the blob via [`MediaStorage::put_file`] (streaming read from disk).
 /// 5. Writes a sidecar with `duration_secs` (no thumbnail — desktop handles that).
 ///
@@ -399,7 +448,6 @@ pub async fn process_video_upload(
     if !looks_like_mp4_iso_bmff(&first_bytes) {
         return Err(MediaError::UnsupportedContainer);
     }
-    let mime = "video/mp4".to_string();
 
     // --- 3. Verify Blossom auth: x tag must match computed SHA-256 ---
     let auth = auth_event.clone();
@@ -417,12 +465,23 @@ pub async fn process_video_upload(
     // --- 4. Full MP4 validation on the temp file ---
     let tmp_path_clone = tmp_path.clone();
     let cfg = config.clone();
-    let video_meta =
-        tokio::task::spawn_blocking(move || validate_video_file(&tmp_path_clone, &cfg))
-            .await
-            .map_err(|_| MediaError::Internal)??;
-
-    let ext = "mp4";
+    let media = tokio::task::spawn_blocking(move || validate_iso_bmff_file(&tmp_path_clone, &cfg))
+        .await
+        .map_err(|_| MediaError::Internal)??;
+    let (mime, ext, dim, duration_secs) = match &media {
+        IsoBmffMedia::Video(video) => (
+            "video/mp4".to_string(),
+            "mp4",
+            format!("{}x{}", video.width, video.height),
+            video.duration_secs,
+        ),
+        IsoBmffMedia::Audio(audio) => (
+            "audio/mp4".to_string(),
+            "m4a",
+            String::new(),
+            audio.duration_secs,
+        ),
+    };
     let key = format!("{sha256_hex}.{ext}");
     let meta_key = MediaStorage::ctx_sidecar_key(ctx, &sha256_hex);
 
@@ -468,14 +527,14 @@ pub async fn process_video_upload(
 
     // --- 7. Build metadata (no thumbnail for video — desktop handles that) ---
     let meta = BlobMeta {
-        dim: format!("{}x{}", video_meta.width, video_meta.height),
+        dim,
         blurhash: String::new(),
         thumb_url: String::new(),
         ext: ext.to_string(),
         mime_type: mime.clone(),
         size: file_size,
         uploaded_at,
-        duration_secs: Some(video_meta.duration_secs),
+        duration_secs: Some(duration_secs),
     };
 
     // Record before publishing the sidecar serve gate. See the buffered path.
@@ -575,6 +634,8 @@ mod tests {
             max_gif_bytes: 10 * 1024 * 1024,
             max_video_bytes: 524_288_000,
             max_file_bytes: 104_857_600,
+            max_audio_bytes: 26_214_400,
+            audio_uploads_enabled: false,
             public_base_url: "https://media.example.com".to_string(),
             upload_records_enabled: false,
             upload_ip_header: None,

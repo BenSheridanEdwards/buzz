@@ -2,6 +2,7 @@
 //!
 //! Library crate — no Axum dependency for handlers. Axum handlers live in `buzz-relay`.
 
+pub mod audio;
 pub mod auth;
 pub mod bucket_index;
 pub mod config;
@@ -13,6 +14,10 @@ pub mod upload;
 pub mod upload_record;
 pub mod validation;
 
+pub use audio::{
+    is_supported_audio_mime, sniff_audio_mime, validate_audio_content, validate_iso_bmff_file,
+    validate_m4a_file, validate_mp3_stream, AudioMeta, IsoBmffMedia, MAX_AUDIO_DURATION_SECS,
+};
 pub use bucket_index::{
     classify_key, fold_bucket_listing, is_tenant_owned_key, sweep_bucket_taxonomy, tenant_prefixes,
     BucketAggregate, BucketSnapshot, CommunityStorage, KeyClass, Page, SweepError,
@@ -25,7 +30,7 @@ pub use storage::{
     ObjectVersionKind, ObjectVersionRef, ObjectVersionsPage,
 };
 pub use types::BlobDescriptor;
-pub use upload::{process_file_upload, process_upload, process_video_upload};
+pub use upload::{process_audio_upload, process_file_upload, process_upload, process_video_upload};
 pub use upload_record::{
     parse_port, parse_public_ip, upload_record_key, UploadAttribution, UploadNetworkInfo,
     UploadRecord, UPLOAD_RECORD_VERSION,

@@ -37,7 +37,11 @@ pub struct BlobDescriptor {
 }
 
 /// Build an `imeta` tag array from a BlobDescriptor (NIP-92 media metadata).
-pub fn build_imeta_tag(d: &BlobDescriptor) -> Vec<String> {
+///
+/// `filename` is the original basename. Clients use it to label file cards
+/// and to recognise voice notes (`voice-note-<id>.<ext>`), so pass it whenever
+/// the upload came from a named local file.
+pub fn build_imeta_tag(d: &BlobDescriptor, filename: Option<&str>) -> Vec<String> {
     let mut tag = vec![
         "imeta".to_string(),
         format!("url {}", d.url),
@@ -57,6 +61,9 @@ pub fn build_imeta_tag(d: &BlobDescriptor) -> Vec<String> {
     if let Some(dur) = d.duration {
         tag.push(format!("duration {dur}"));
     }
+    if let Some(name) = filename.map(str::trim).filter(|n| !n.is_empty()) {
+        tag.push(format!("filename {name}"));
+    }
     tag
 }
 
@@ -67,10 +74,19 @@ const ALLOWED_MIMES: &[&str] = &[
     "image/gif",
     "image/webp",
     "video/mp4",
+    // Audio is accepted by relays that advertise the `buzz-audio` NIP-11
+    // extension; other relays answer 415 and the caller sees that error.
+    "audio/mpeg",
+    "audio/mp4",
+    "audio/m4a",
+    "audio/x-m4a",
 ];
 
 /// Maximum file size for image uploads (50 MB).
 const MAX_IMAGE_BYTES: u64 = 50 * 1024 * 1024;
+
+/// Maximum file size for audio uploads (25 MB, matches the relay default).
+const MAX_AUDIO_BYTES: u64 = 25 * 1024 * 1024;
 
 /// Maximum file size for video uploads (500 MB).
 const MAX_VIDEO_BYTES: u64 = 500 * 1024 * 1024;
@@ -1182,6 +1198,8 @@ impl BuzzClient {
         // 3. Size check
         let max = if mime.starts_with("video/") {
             MAX_VIDEO_BYTES
+        } else if mime.starts_with("audio/") {
+            MAX_AUDIO_BYTES
         } else {
             MAX_IMAGE_BYTES
         };

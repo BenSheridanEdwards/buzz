@@ -385,19 +385,36 @@ pub async fn upload_blob(
                     .config
                     .media
                     .max_image_bytes
-                    .max(state.config.media.max_file_bytes);
+                    .max(state.config.media.max_file_bytes)
+                    .max(state.config.media.max_audio_bytes);
                 let bytes =
                     axum::body::to_bytes(axum::body::Body::from_stream(replay), max as usize)
                         .await
                         .map_err(|_| MediaError::FileTooLarge { size: 0, max })?;
 
+                let sniffed = infer::get(&bytes).map(|t| t.mime_type());
                 let is_image = matches!(
-                    infer::get(&bytes).map(|t| t.mime_type()),
+                    sniffed,
                     Some("image/jpeg" | "image/png" | "image/gif" | "image/webp")
                 );
+                // Audio takes its own validated path when the operator has
+                // enabled it. When disabled, it falls through to the generic
+                // path, which rejects recognized audio as before.
+                let is_audio = state.config.media.audio_uploads_enabled
+                    && buzz_media::sniff_audio_mime(&bytes).is_some();
 
                 if is_image {
                     buzz_media::process_upload(
+                        &state.media_storage,
+                        &state.config.media,
+                        &auth.tenant,
+                        &auth.auth_event,
+                        bytes,
+                        attribution,
+                    )
+                    .await?
+                } else if is_audio {
+                    buzz_media::process_audio_upload(
                         &state.media_storage,
                         &state.config.media,
                         &auth.tenant,

@@ -221,12 +221,20 @@ pub fn validate_file_content(
 /// Whether a stored blob should be served inline (rendered in the client) or as
 /// an attachment (forced download).
 ///
-/// Images and video are previewed inline by the renderer; everything else is a
-/// generic file card with a download action, so it serves as an attachment.
+/// Images, video and audio are previewed inline by the renderer; everything
+/// else is a generic file card with a download action, so it serves as an
+/// attachment.
 /// PDF is intentionally *not* inline yet — inline PDF preview is a planned
 /// fast-follow; until the renderer handles it, force download like any other file.
 pub fn serve_inline(mime: &str) -> bool {
-    mime.starts_with("image/") || mime.starts_with("video/")
+    mime.starts_with("image/") || mime.starts_with("video/") || mime.starts_with("audio/")
+}
+
+/// Structural checks shared by every ISO-BMFF upload: `moov` precedes `mdat`
+/// and the box tree contains nothing outside the metadata-free allow-list.
+pub(crate) fn check_mp4_structure(path: &Path) -> Result<(), MediaError> {
+    check_moov_before_mdat(path)?;
+    validate_mp4_metadata_free(path)
 }
 
 /// Metadata extracted from a validated MP4 file.
@@ -970,6 +978,8 @@ mod tests {
             max_gif_bytes: 10 * 1024 * 1024,
             max_video_bytes: 524_288_000,
             max_file_bytes: 104_857_600,
+            max_audio_bytes: 26_214_400,
+            audio_uploads_enabled: false,
             public_base_url: String::new(),
             upload_records_enabled: false,
             upload_ip_header: None,
@@ -2721,7 +2731,9 @@ mod tests {
         assert!(!serve_inline("application/pdf"));
         assert!(!serve_inline("application/zip"));
         assert!(!serve_inline("application/octet-stream"));
-        assert!(!serve_inline("audio/mpeg"));
+        // Audio renders inline as a voice note / audio card.
+        assert!(serve_inline("audio/mpeg"));
+        assert!(serve_inline("audio/mp4"));
         assert!(!serve_inline("text/plain"));
     }
 }
