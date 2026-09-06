@@ -106,7 +106,7 @@ M1 and M2 are the unblock. M3 is what makes the phone match.
 ## 6. Risks and honest notes
 
 - The relay block exists for a reason: audio containers carry metadata (ID3, GPS in M4A). The re-encode with `-map_metadata -1` is the mitigation, and it is the same tool upstream already uses for video.
-- ffmpeg must be in the relay image. The upstream runtime image is `debian-slim`; check whether it ships ffmpeg for the video pipeline (it must, since `process_video_upload` calls it) before assuming.
+- **The relay image has no ffmpeg.** Checked: the running container has neither ffmpeg nor ffprobe, and the video pipeline validates MP4 in pure Rust rather than transcoding. So the audio sanitizer has two options: add ffmpeg to the runtime stage of the Dockerfile (about 100 MB, simplest), or strip metadata in Rust (ID3v1/v2 for MP3, `udta`/`meta` atoms for M4A, comment headers for Ogg) with a small crate such as `id3`/`mp4` and no external binary. The Rust route is the upstreamable one. Clients already send metadata-free audio for their own recordings, and the Hermes plugin strips metadata before upload, so the sanitizer is defence in depth, not the first line.
 - Mobile from `main` means living on tip until upstream ships 0.17. Sideloaded builds do not auto-update; reinstall on each rebase.
 - Keep every change behind the NIP-11 flag so the fork stays a thin patch and can go upstream as a PR. Upstream's own comment signals they want this.
 - Two Skys of the same name in one workspace confuse humans and agents; the same applies to two relays. There will be one relay, the patched one.
