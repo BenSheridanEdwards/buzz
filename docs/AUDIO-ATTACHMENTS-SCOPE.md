@@ -115,3 +115,16 @@ M1 and M2 are the unblock. M3 is what makes the phone match.
 
 1. Go on M1 and M2 now (relay patch, rebuild, plugin), roughly two days of work, no change to the phone.
 2. Whether to invest in the Android toolchain for M3, or wait for upstream mobile 0.17 to ship voice notes and only patch the relay side.
+
+## 8. Status, 2026-09-06 evening
+
+Implemented on this branch (see `docs/VOICE-NOTES-ISSUE.md` for the design and acceptance list):
+
+- **3.1 Relay**: done, with one design change from the plan above. The relay does not run ffmpeg or rewrite bytes (Blossom binds the client's SHA-256 to the stored blob). Instead `crates/buzz-media/src/audio.rs` accepts only canonical, metadata-free MP3 (frame walk) and M4A (MP4 structural checks, one AAC track) and rejects anything else with `MetadataForbidden`, exactly the policy the video validator already applies. Duration is measured server-side. Off by default: `BUZZ_MEDIA_AUDIO_UPLOADS=true` turns it on and advertises NIP-11 `buzz-audio`.
+- **3.2 CLI**: done (allow-list, `filename` imeta, audio link markdown).
+- **3.3 Desktop**: sending done. When the relay advertises `buzz-audio`, voice notes upload as bare AAC M4A (`audio/mp4`); otherwise the envelope. Receiving needed nothing.
+- **3.5 Hermes plugin**: done locally (`~/.hermes/hermes-agent/plugins/platforms/buzz/adapter.py`, backup `adapter.py.bak-20260906-audio`). Outbound: NIP-11 probe, metadata-free MP3 (frame copy for MP3 sources, LAME otherwise), direct Blossom PUT with a kind-24242 auth event, kind-9 publish with `filename voice-note-<id>.mp3`; envelope fallback for older relays. Inbound: Buzz voice-note envelopes are demuxed to MP3 so they dispatch as audio and reach STT.
+- **3.4 Mobile**: not started. Receiving `audio/*` already works on `main`; sending real audio needs the native packagers to emit audio-only M4A. Blocked on the toolchain decision in section 7.
+- **Recorder UI** (lock, slide-to-cancel, review, transcript toggle) from the design canvas: not started on either client.
+
+Deploy on the Studio: build `buzz-relay:audio` from this branch (`DOCKER_BUILDKIT=1 docker build -t buzz-relay:audio .`, needs the `docker-buildx` plugin on Colima), set `BUZZ_IMAGE=buzz-relay:audio` and `BUZZ_MEDIA_AUDIO_UPLOADS=true` in `~/Chief/Projects/relay/.env`, `docker compose up -d`, then confirm `curl -H 'Accept: application/nostr+json' https://<relay>/` lists `buzz-audio`.

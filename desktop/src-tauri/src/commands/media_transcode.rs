@@ -356,6 +356,74 @@ pub(super) fn transcode_voice_note_to_mp4_with_cancellation(
     Ok(output)
 }
 
+/// Package a voice-note audio file as bare AAC in an M4A (`audio/mp4`) for
+/// relays that advertise the `buzz-audio` NIP-11 extension.
+///
+/// Same metadata-free recipe as the video envelope (bitexact, faststart, an
+/// empty encoder tag so ffmpeg writes only its canonical empty `udta`), minus
+/// the stub video track. The `ipod` muxer stamps the `M4A ` brand so the file
+/// sniffs as audio on both ends.
+///
+/// Returns the path to a temp M4A. Caller must clean up.
+pub(super) fn transcode_voice_note_to_m4a_with_cancellation(
+    source: &std::path::Path,
+    cancellation: Option<&CancellationToken>,
+) -> Result<std::path::PathBuf, String> {
+    let ffmpeg = find_ffmpeg()?;
+    let output = std::env::temp_dir().join(format!("buzz-voice-note-{}.m4a", uuid::Uuid::new_v4()));
+
+    let result = run_ffmpeg_with_cancellation(
+        ffmpeg_command(&ffmpeg)
+            .args(["-y", "-nostdin", "-loglevel", "error"])
+            .arg("-i")
+            .arg(source)
+            .args([
+                "-vn",
+                "-sn",
+                "-dn",
+                "-map_metadata",
+                "-1",
+                "-map_chapters",
+                "-1",
+                "-fflags",
+                "+bitexact",
+                "-flags:a",
+                "+bitexact",
+                "-c:a",
+                "aac",
+                "-b:a",
+                "96k",
+                "-movflags",
+                "+faststart",
+                "-metadata",
+                "encoder=",
+                "-f",
+                "ipod",
+            ])
+            .arg(&output)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped()),
+        FFMPEG_TIMEOUT,
+        cancellation,
+    )
+    .inspect_err(|_| {
+        let _ = std::fs::remove_file(&output);
+    })?;
+
+    if !result.status.success() {
+        let _ = std::fs::remove_file(&output);
+        let stderr = String::from_utf8_lossy(&result.stderr);
+        let detail = stderr
+            .lines()
+            .rev()
+            .find(|line| !line.is_empty() && !line.starts_with("  "))
+            .unwrap_or("unknown error");
+        return Err(format!("Voice note conversion failed: {detail}"));
+    }
+
+    Ok(output)
+}
+
 /// Transcode a HEIC/HEIF still image to JPEG via ffmpeg.
 ///
 /// The Tauri webview / Chromium cannot decode HEIC, so iPhone photos uploaded
@@ -786,6 +854,8 @@ mod tests {
             max_gif_bytes: 10 * 1024 * 1024,
             max_video_bytes: 524_288_000,
             max_file_bytes: 104_857_600,
+            max_audio_bytes: 26_214_400,
+            audio_uploads_enabled: false,
             public_base_url: String::new(),
             upload_records_enabled: false,
             upload_ip_header: None,

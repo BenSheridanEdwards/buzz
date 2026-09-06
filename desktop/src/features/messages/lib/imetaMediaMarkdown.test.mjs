@@ -199,6 +199,25 @@ test("formatImetaMediaLine: packaged voice note MP4 stays on the audio-card link
   );
 });
 
+test("formatImetaMediaLine: real audio voice note (buzz-audio relay) is a link, not media", () => {
+  assert.equal(
+    formatImetaMediaLine({
+      url: "https://relay.example/media/hash.m4a",
+      type: "audio/mp4",
+      filename: "voice-note-123.m4a",
+    }),
+    "\n[voice-note-123.m4a](https://relay.example/media/hash.m4a)",
+  );
+  assert.equal(
+    formatImetaMediaLine({
+      url: "https://relay.example/media/hash.mp3",
+      type: "audio/mpeg",
+      filename: "voice-note-456.mp3",
+    }),
+    "\n[voice-note-456.mp3](https://relay.example/media/hash.mp3)",
+  );
+});
+
 test("formatImetaMediaLine: generic mime → [filename](url) link", () => {
   assert.equal(
     formatImetaMediaLine({

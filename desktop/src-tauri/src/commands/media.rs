@@ -16,7 +16,8 @@ use super::media_transcode::{
 };
 use super::media_upload_progress::{emit_media_upload_phase, send_upload_attempt, UploadAttempt};
 use super::media_voice_note::{
-    is_voice_note_filename, prepare_voice_note_for_upload, voice_note_mp4_filename,
+    is_voice_note_filename, prepare_voice_note_for_upload, voice_note_upload_filename,
+    VoiceNoteContainer,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -711,10 +712,17 @@ pub(super) async fn upload_media_bytes_inner(
         .as_deref()
         .is_some_and(|name| has_heic_extension(std::path::Path::new(name)));
     let is_voice_note = is_voice_note_filename(filename.as_deref());
+    // Real audio only where the relay says it takes it; otherwise the envelope
+    // every relay accepts. Decided per upload so a workspace switch is honoured.
+    let voice_note_container = if is_voice_note && relay_accepts_audio_uploads(&state).await {
+        VoiceNoteContainer::M4aAudio
+    } else {
+        VoiceNoteContainer::Mp4Envelope
+    };
 
     let (body, poster_bytes) = if is_voice_note {
         emit_media_upload_phase(&app, progress_id.as_deref(), "processing-audio");
-        prepare_voice_note_for_upload(data, cancellation).await?
+        prepare_voice_note_for_upload(data, cancellation, voice_note_container).await?
     } else if is_video_file(&data) {
         emit_media_upload_phase(&app, progress_id.as_deref(), "processing-video");
         // Video: write to temp → transcode + extract poster → read results.
@@ -782,7 +790,7 @@ pub(super) async fn upload_media_bytes_inner(
 
     descriptor.filename = filename.as_deref().map(|name| {
         let upload_name = if is_voice_note {
-            voice_note_mp4_filename(name)
+            voice_note_upload_filename(name, voice_note_container)
         } else {
             name.to_string()
         };
@@ -792,11 +800,91 @@ pub(super) async fn upload_media_bytes_inner(
     Ok(descriptor)
 }
 
+// ── Relay audio capability ───────────────────────────────────────────────────
+
+/// How long a relay's `buzz-audio` verdict is trusted before re-reading NIP-11.
+const AUDIO_CAPABILITY_TTL: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// Whether the NIP-11 document lists the `buzz-audio` extension, i.e. the relay
+/// accepts metadata-free `audio/mpeg` and `audio/mp4` uploads and serves them
+/// inline.
+pub(crate) fn relay_info_advertises_audio(info: &serde_json::Value) -> bool {
+    info.get("supported_extensions")
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|extensions| {
+            extensions
+                .iter()
+                .any(|extension| extension.as_str() == Some("buzz-audio"))
+        })
+}
+
+/// Whether the active relay takes real audio uploads.
+///
+/// Read from NIP-11 and cached per relay base URL (community switches change
+/// the base URL, so a stale verdict can never leak across communities). Any
+/// failure reads as "no": the upload then uses the MP4 envelope every relay
+/// accepts, which is the safe direction.
+pub(crate) async fn relay_accepts_audio_uploads(state: &AppState) -> bool {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+    use std::time::Instant;
+
+    static CACHE: OnceLock<Mutex<HashMap<String, (bool, Instant)>>> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let base_url = relay_api_base_url_with_override(state);
+
+    let cached = cache
+        .lock()
+        .ok()
+        .and_then(|entries| entries.get(&base_url).copied());
+    if let Some((supported, checked_at)) = cached {
+        if checked_at.elapsed() < AUDIO_CAPABILITY_TTL {
+            return supported;
+        }
+    }
+
+    let supported = fetch_relay_audio_capability(&state.http_client, &base_url).await;
+    if let Ok(mut entries) = cache.lock() {
+        entries.insert(base_url, (supported, Instant::now()));
+    }
+    supported
+}
+
+async fn fetch_relay_audio_capability(client: &reqwest::Client, base_url: &str) -> bool {
+    let url = format!("{}/info", base_url.trim_end_matches('/'));
+    let response = match client
+        .get(&url)
+        .header("accept", "application/nostr+json")
+        .timeout(std::time::Duration::from_secs(5))
+        .send()
+        .await
+    {
+        Ok(response) if response.status().is_success() => response,
+        _ => return false,
+    };
+    match response.json::<serde_json::Value>().await {
+        Ok(info) => relay_info_advertises_audio(&info),
+        Err(_) => false,
+    }
+}
+
 // ── Tests ────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn relay_info_audio_extension_is_read_from_supported_extensions() {
+        let on = serde_json::json!({ "supported_extensions": ["nip-er", "buzz-audio"] });
+        let off = serde_json::json!({ "supported_extensions": ["nip-er"] });
+        let missing = serde_json::json!({ "name": "Buzz Relay" });
+        let malformed = serde_json::json!({ "supported_extensions": "buzz-audio" });
+        assert!(relay_info_advertises_audio(&on));
+        assert!(!relay_info_advertises_audio(&off));
+        assert!(!relay_info_advertises_audio(&missing));
+        assert!(!relay_info_advertises_audio(&malformed));
+    }
 
     #[test]
     fn test_extract_server_authority_default_ports() {

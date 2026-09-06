@@ -87,6 +87,21 @@ test("resolveAudioAttachment leaves non-audio files on the generic path", () => 
   );
 });
 
+test("real audio voice notes from a buzz-audio relay resolve to the audio player", () => {
+  for (const [filename, m] of [
+    ["voice-note-123.m4a", "audio/mp4"],
+    ["voice-note-456.mp3", "audio/mpeg"],
+  ]) {
+    const entry = { duration: 4.5, filename, m };
+    assert.equal(isVoiceNoteAttachment(entry), true, filename);
+    assert.equal(isAudioAttachment(entry), true, filename);
+  }
+  // A plain audio file without the voice-note prefix is audio, not a voice note.
+  const plain = { filename: "song.mp3", m: "audio/mpeg" };
+  assert.equal(isVoiceNoteAttachment(plain), false);
+  assert.equal(isAudioAttachment(plain), true);
+});
+
 test("packaged MP4 voice notes still resolve to the audio player", () => {
   const entry = {
     duration: 7.2,
