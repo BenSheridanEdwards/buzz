@@ -272,7 +272,13 @@ fn readiness_command_is_registered_and_never_persists_its_draft() {
             cmd: "evaluate_agent_readiness_draft".into(),
             callback: tauri::ipc::CallbackFn(0),
             error: tauri::ipc::CallbackFn(1),
-            url: "tauri://localhost".parse().expect("invoke url"),
+            url: if cfg!(any(windows, target_os = "android")) {
+                "http://tauri.localhost"
+            } else {
+                "tauri://localhost"
+            }
+            .parse()
+            .expect("invoke url"),
             body: tauri::ipc::InvokeBody::Json(serde_json::json!({
                 "draft": {
                     "kind": "existing",
