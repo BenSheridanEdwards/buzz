@@ -210,6 +210,29 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn login_probe_fails_closed_when_success_output_exceeds_bound() {
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().expect("temp dir");
+        let script_path = temp.path().join("noisy-login-probe");
+        fs::write(
+            &script_path,
+            "#!/bin/sh\nhead -c 1100000 /dev/zero\nexit 0\n",
+        )
+        .expect("write noisy probe");
+        fs::set_permissions(&script_path, fs::Permissions::from_mode(0o755))
+            .expect("chmod noisy probe");
+
+        assert_eq!(
+            super::login_probe(&script_path, &["noisy-login-probe"], None),
+            ProbeOutcome::LoggedOut,
+            "login readiness must stay bound even when a successful CLI floods output"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn login_probe_logged_out_on_nonzero_without_config_signal() {
         use std::fs;
         use std::os::unix::fs::PermissionsExt;

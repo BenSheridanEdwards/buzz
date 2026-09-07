@@ -257,9 +257,9 @@ pub fn get_baked_build_env() -> Vec<BakedEnvEntry> {
 /// patch to one exact saved agent. Projection reuses the production create,
 /// update, effective-config, harness, and readiness owners.
 #[tauri::command]
-pub async fn evaluate_agent_readiness_draft(
+pub async fn evaluate_agent_readiness_draft<R: tauri::Runtime>(
     draft: AgentReadinessDraft,
-    app: AppHandle,
+    app: tauri::AppHandle<R>,
     _state: State<'_, AppState>,
 ) -> Result<AgentReadinessEvaluation, String> {
     tokio::task::spawn_blocking(move || {
