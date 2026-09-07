@@ -36,6 +36,15 @@ X" flag): add it to `KnownAcpRuntime` first, expose it on
 `AcpRuntimeCatalogEntry`, then project it through the core. Do not shortcut
 with a TypeScript lookup table or an id comparison in a component.
 
+**Draft readiness is a backend question.** Unsaved managed-agent edits are
+submitted to `evaluate_agent_readiness_draft`, which applies the draft to a
+saved-record clone and then runs the same `resolve_effective_agent_env` →
+`agent_readiness` path used by persisted agents. The response is presentation-
+ready (`ready` plus structured `Requirement` rows with their `surface`
+discriminators). Frontends may use the old provider table only until their
+consumer migration lands; no new surface should derive provider/credential/CLI
+readiness in TypeScript or add another table.
+
 ## Rules
 
 1. **No hardcoded harness-ID checks in render code.** `runtime.id === "claude"`

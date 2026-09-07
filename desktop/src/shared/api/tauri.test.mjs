@@ -119,7 +119,11 @@ test("relay rate-limited: prefix check is case-sensitive (Rust always emits lowe
 // arrives as definitionEnv (camelCase), source "custom" is preserved, and the
 // env round-trips end-to-end so a save-then-edit cycle cannot erase env.
 
-const { fromRawAcpRuntimeCatalogEntry } = await import("./tauri.ts");
+const {
+  evaluateAgentReadiness,
+  evaluateAgentReadinessDraft,
+  fromRawAcpRuntimeCatalogEntry,
+} = await import("./tauri.ts");
 
 test("fromRawAcpRuntimeCatalogEntry maps definition_env to definitionEnv", () => {
   const raw = {
@@ -255,6 +259,75 @@ test("fromRawAcpRuntimeCatalogEntry omits maxParallelism when max_parallelism is
     undefined,
     "uncapped harness must have maxParallelism: undefined",
   );
+});
+
+// ── Agent readiness command wrappers ──────────────────────────────────────────
+
+test("evaluateAgentReadiness invokes the saved readiness command", async () => {
+  const calls = [];
+  const prior = globalThis.window.__TAURI_INTERNALS__;
+  globalThis.window.__TAURI_INTERNALS__ = {
+    invoke: async (command, args) => {
+      calls.push({ command, args });
+      return { ready: false, requirements: [] };
+    },
+  };
+
+  try {
+    const result = await evaluateAgentReadiness("agent-pubkey");
+    assert.deepStrictEqual(result, { ready: false, requirements: [] });
+    assert.deepStrictEqual(calls, [
+      {
+        command: "evaluate_agent_readiness",
+        args: { pubkey: "agent-pubkey" },
+      },
+    ]);
+  } finally {
+    globalThis.window.__TAURI_INTERNALS__ = prior;
+  }
+});
+
+test("evaluateAgentReadinessDraft forwards draft overrides without persisting", async () => {
+  const calls = [];
+  const prior = globalThis.window.__TAURI_INTERNALS__;
+  globalThis.window.__TAURI_INTERNALS__ = {
+    invoke: async (command, args) => {
+      calls.push({ command, args });
+      return {
+        ready: false,
+        requirements: [{ surface: "env_key", key: "ANTHROPIC_API_KEY" }],
+      };
+    },
+  };
+
+  try {
+    const result = await evaluateAgentReadinessDraft({
+      pubkey: "agent-pubkey",
+      runtime: "buzz-agent",
+      provider: "anthropic",
+      model: "claude-opus-4-5",
+      envVars: { ANTHROPIC_API_KEY: "" },
+    });
+    assert.deepStrictEqual(result.requirements, [
+      { surface: "env_key", key: "ANTHROPIC_API_KEY" },
+    ]);
+    assert.deepStrictEqual(calls, [
+      {
+        command: "evaluate_agent_readiness_draft",
+        args: {
+          draft: {
+            pubkey: "agent-pubkey",
+            runtime: "buzz-agent",
+            provider: "anthropic",
+            model: "claude-opus-4-5",
+            envVars: { ANTHROPIC_API_KEY: "" },
+          },
+        },
+      },
+    ]);
+  } finally {
+    globalThis.window.__TAURI_INTERNALS__ = prior;
+  }
 });
 
 // ── Teardown ──────────────────────────────────────────────────────────────────

@@ -286,6 +286,41 @@ export type ManagedAgentRuntimeLifecycle =
   | "failed"
   | "stopped";
 
+export type AgentReadinessRequirement =
+  | { surface: "normalized_field"; field: string }
+  | { surface: "env_key"; key: string }
+  | {
+      surface: "cli_login";
+      probe_args: string[];
+      setup_copy: string;
+      availability: AcpAvailabilityStatus;
+    }
+  | {
+      surface: "cli_config_invalid";
+      probe_args: string[];
+      setup_copy: string;
+      diagnostic: string;
+    }
+  | { surface: "git_bash" }
+  | { surface: "missing_binary"; command: string };
+
+export type AgentReadinessEvaluation = {
+  ready: boolean;
+  requirements: AgentReadinessRequirement[];
+};
+
+export type AgentReadinessDraft = {
+  /** Saved agent baseline for edit drafts. Omit for create drafts. */
+  pubkey?: string;
+  /** Runtime id override. null clears to inherited/default resolution. */
+  runtime?: string | null;
+  /** Custom/raw command override. Prefer runtime for catalog-known harnesses. */
+  agentCommand?: string | null;
+  model?: string | null;
+  provider?: string | null;
+  envVars?: Record<string, string>;
+};
+
 export type ManagedAgentRuntimeStatus = {
   pubkey: string;
   /** Exact submitted descriptor, present only on startup reconcile results. */
