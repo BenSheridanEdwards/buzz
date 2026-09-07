@@ -2,9 +2,9 @@ import { type MouseEvent as ReactMouseEvent, useEffect } from "react";
 import { EditorContent, useEditor } from "@tiptap/react";
 import StarterKit from "@tiptap/starter-kit";
 
-import { TILE_NODE_NAME, TileNode } from "@/features/composer/tileNode";
-import type { TileAddress } from "@/shared/tiles/address";
-import { resetTileFaces, tileFaces } from "@/shared/tiles/faceResolver";
+import { CHIP_NODE_NAME, ChipNode } from "@/features/composer/chipNode";
+import type { ChipAddress } from "@/shared/chips/address";
+import { resetChipFaces, chipFaces } from "@/shared/chips/faceResolver";
 
 declare global {
   interface Window {
@@ -15,20 +15,20 @@ declare global {
       addresses: string[];
     };
     /** Spike-only: renames an identity the way a profile update would. */
-    __SPIKE_RENAME__?: (address: TileAddress, label: string) => void;
+    __SPIKE_RENAME__?: (address: ChipAddress, label: string) => void;
     /** Spike-only: simulates switching community. */
     __SPIKE_RESET_FACES__?: () => void;
   }
 }
 
-const MORGAN: TileAddress = { kind: "person", id: "pk-morgan" };
-const ALEX: TileAddress = { kind: "person", id: "pk-alex" };
+const MORGAN: ChipAddress = { kind: "person", id: "pk-morgan" };
+const ALEX: ChipAddress = { kind: "person", id: "pk-alex" };
 
 /**
- * Harness for the tile composer's editing contract.
+ * Harness for the chip composer's editing contract.
  *
- * Not a product surface. It mounts the real TileNode, the real node view, and
- * the real shared InlineTile so browser tests bind production seams rather
+ * Not a product surface. It mounts the real ChipNode, the real node view, and
+ * the real shared InlineChip so browser tests bind production seams rather
  * than a test-only stand-in. Delete it once the product composer exists,
  * folding its assertions into that composer's tests.
  */
@@ -36,25 +36,25 @@ export function ComposerSpikePage() {
   const editor = useEditor({
     extensions: [
       StarterKit.configure({ heading: false, link: false }),
-      TileNode,
+      ChipNode,
     ],
     content: { type: "doc", content: [{ type: "paragraph" }] },
     editorProps: {
       attributes: {
         "data-testid": "spike-editor",
-        "aria-label": "Tile composer harness",
+        "aria-label": "Chip composer harness",
         class: "spike-editor",
       },
     },
   });
 
-  // Seed the faces these tiles resolve to. The product resolves them from real
+  // Seed the faces these chips resolve to. The product resolves them from real
   // identity; the harness only needs them present. Deliberately no cleanup:
   // resetting on unmount would make a community-reset test tear down the very
   // harness it is measuring.
   useEffect(() => {
-    tileFaces.put(MORGAN, { label: "Morgan", loading: false, resolved: true });
-    tileFaces.put(ALEX, { label: "Alex", loading: false, resolved: true });
+    chipFaces.put(MORGAN, { label: "Morgan", loading: false, resolved: true });
+    chipFaces.put(ALEX, { label: "Alex", loading: false, resolved: true });
   }, []);
 
   // Read live editor state on demand. A React-rendered readout lags editor
@@ -72,13 +72,13 @@ export function ComposerSpikePage() {
         json,
         text: editor.getText(),
         addresses: inline
-          .filter((node) => node.type === TILE_NODE_NAME)
+          .filter((node) => node.type === CHIP_NODE_NAME)
           .map((node) => `${node.attrs?.kind}/${node.attrs?.id}`),
       };
     };
     window.__SPIKE_RENAME__ = (address, label) =>
-      tileFaces.put(address, { label, loading: false, resolved: true });
-    window.__SPIKE_RESET_FACES__ = () => resetTileFaces();
+      chipFaces.put(address, { label, loading: false, resolved: true });
+    window.__SPIKE_RESET_FACES__ = () => resetChipFaces();
     return () => {
       window.__SPIKE_READ__ = undefined;
       window.__SPIKE_RENAME__ = undefined;
@@ -90,21 +90,21 @@ export function ComposerSpikePage() {
 
   // Insert controls must not take focus, or the caret leaves the editor and
   // every keyboard assertion afterwards measures the wrong thing. The real
-  // tile picker owes the same.
+  // chip picker owes the same.
   const keepFocus = (event: ReactMouseEvent) => event.preventDefault();
 
-  const insertTile = (address: TileAddress) =>
+  const insertChip = (address: ChipAddress) =>
     editor
       .chain()
       .focus()
-      .insertContent({ type: TILE_NODE_NAME, attrs: address })
+      .insertContent({ type: CHIP_NODE_NAME, attrs: address })
       .run();
 
   return (
     <div className="flex flex-col gap-4 p-8">
-      <h1 className="text-title text-primary">Tile composer harness</h1>
+      <h1 className="text-title text-primary">Chip composer harness</h1>
       <p className="text-body text-secondary">
-        Exercises the production tile node, node view, and shared InlineTile.
+        Exercises the production chip node, node view, and shared InlineChip.
         Temporary.
       </p>
 
@@ -113,7 +113,7 @@ export function ComposerSpikePage() {
           type="button"
           data-testid="insert-morgan"
           onMouseDown={keepFocus}
-          onClick={() => insertTile(MORGAN)}
+          onClick={() => insertChip(MORGAN)}
           className="rounded-md bg-inset px-3 py-1 text-body text-primary"
         >
           Insert Morgan
@@ -122,7 +122,7 @@ export function ComposerSpikePage() {
           type="button"
           data-testid="insert-alex"
           onMouseDown={keepFocus}
-          onClick={() => insertTile(ALEX)}
+          onClick={() => insertChip(ALEX)}
           className="rounded-md bg-inset px-3 py-1 text-body text-primary"
         >
           Insert Alex

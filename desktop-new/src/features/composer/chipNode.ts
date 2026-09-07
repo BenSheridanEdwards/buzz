@@ -2,17 +2,17 @@ import { mergeAttributes, Node } from "@tiptap/core";
 import { ReactNodeViewRenderer } from "@tiptap/react";
 
 import {
-  formatTileAddress,
-  isTileKind,
-  type TileAddress,
-} from "@/shared/tiles/address";
+  formatChipAddress,
+  isChipKind,
+  type ChipAddress,
+} from "@/shared/chips/address";
 
-import { TileNodeView } from "./ui/TileNodeView";
+import { ChipNodeView } from "./ui/ChipNodeView";
 
-export const TILE_NODE_NAME = "tile";
+export const CHIP_NODE_NAME = "chip";
 
 /**
- * A tile in the composer document.
+ * A chip in the composer document.
  *
  * The document stores an address — a kind and an identity — and nothing else.
  * No display name, because a name in the document would make every profile
@@ -23,20 +23,20 @@ export const TILE_NODE_NAME = "tile";
  * spike (see the Desktop New plan):
  *
  * - `selectable: false` is load-bearing. With it true, an arrow key selects the
- *   tile and the very next keystroke REPLACES it, so the tile silently
+ *   chip and the very next keystroke REPLACES it, so the chip silently
  *   disappears mid-sentence. TipTap's own mention extension ships false for the
  *   same reason.
  * - `atom: true` is currently redundant — ProseMirror computes `isAtom` as
  *   `isLeaf || spec.atom` and a contentless node is already a leaf — and is
- *   kept as a statement of intent. It becomes load-bearing if a tile ever
+ *   kept as a statement of intent. It becomes load-bearing if a chip ever
  *   holds content.
  *
- * Whole-tile deletion needs no keyboard handler: Backspace from just after a
- * tile removes it entirely, natively. The spike proved this by removing a
+ * Whole-chip deletion needs no keyboard handler: Backspace from just after a
+ * chip removes it entirely, natively. The spike proved this by removing a
  * hand-written handler and re-running.
  */
-export const TileNode = Node.create({
-  name: TILE_NODE_NAME,
+export const ChipNode = Node.create({
+  name: CHIP_NODE_NAME,
   group: "inline",
   inline: true,
   atom: true,
@@ -60,42 +60,42 @@ export const TileNode = Node.create({
   },
 
   parseHTML() {
-    return [{ tag: "span[data-tile]" }];
+    return [{ tag: "span[data-chip]" }];
   },
 
   renderHTML({ HTMLAttributes }) {
     return [
       "span",
       mergeAttributes(HTMLAttributes, {
-        "data-tile": "",
+        "data-chip": "",
         "data-kind": undefined,
       }),
     ];
   },
 
   /**
-   * The plain-text projection of a tile is its address, never its label.
+   * The plain-text projection of a chip is its address, never its label.
    *
    * This is what a sent message carries and what an agent reads. A reader that
-   * knows nothing about tiles still receives a meaningful `buzz://` link rather
+   * knows nothing about chips still receives a meaningful `buzz://` link rather
    * than broken markup, so the reference degrades rather than disappearing.
    */
   renderText({ node }) {
-    const address = tileAddressFromAttrs(node.attrs);
-    return address ? formatTileAddress(address) : "";
+    const address = chipAddressFromAttrs(node.attrs);
+    return address ? formatChipAddress(address) : "";
   },
 
   addNodeView() {
-    return ReactNodeViewRenderer(TileNodeView);
+    return ReactNodeViewRenderer(ChipNodeView);
   },
 });
 
 /** Reads an address off node attributes, or null when they are not a valid one. */
-export function tileAddressFromAttrs(
+export function chipAddressFromAttrs(
   attrs: Record<string, unknown>,
-): TileAddress | null {
+): ChipAddress | null {
   const kind = String(attrs.kind ?? "");
   const id = String(attrs.id ?? "");
-  if (!isTileKind(kind) || id.length === 0) return null;
+  if (!isChipKind(kind) || id.length === 0) return null;
   return { kind, id };
 }

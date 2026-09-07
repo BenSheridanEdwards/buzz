@@ -5,7 +5,7 @@ import { expect, test, type Page } from "@playwright/test";
  *
  * Answers one question before the composer is designed: does staged character
  * input — Japanese, Korean, Chinese — survive directly beside an inline atom
- * tile? These languages assemble characters in a composition session before
+ * chip? These languages assemble characters in a composition session before
  * committing them, and an inline non-editable box is where that assembly is
  * documented to break (lexical#7985, lexical#6296).
  *
@@ -69,7 +69,7 @@ function read(page: Page): Promise<SpikeRead> {
   });
 }
 
-async function tileCount(page: Page): Promise<number> {
+async function chipCount(page: Page): Promise<number> {
   return (await read(page)).addresses.length;
 }
 
@@ -81,13 +81,13 @@ async function text(page: Page): Promise<string> {
   return (await read(page)).text;
 }
 
-test.describe("composition input beside an inline tile", () => {
-  test("composes Japanese immediately after a tile", async ({ page }) => {
+test.describe("composition input beside an inline chip", () => {
+  test("composes Japanese immediately after a chip", async ({ page }) => {
     await openSpike(page);
     const ime = await imeFor(page);
 
     await page.getByTestId("insert-morgan").click();
-    expect(await tileCount(page)).toBe(1);
+    expect(await chipCount(page)).toBe(1);
     const before = await addresses(page);
 
     // Compose "にほんご" the way an IME does: staged, then committed.
@@ -96,12 +96,12 @@ test.describe("composition input beside an inline tile", () => {
     await ime.setComposition("にほん");
     await ime.commit("にほんご");
 
-    expect(await tileCount(page)).toBe(1);
+    expect(await chipCount(page)).toBe(1);
     expect(await addresses(page)).toEqual(before);
     expect(await text(page)).toContain("にほんご");
   });
 
-  test("composes Korean immediately before a leading tile", async ({
+  test("composes Korean immediately before a leading chip", async ({
     page,
   }) => {
     await openSpike(page);
@@ -110,40 +110,40 @@ test.describe("composition input beside an inline tile", () => {
     await page.getByTestId("insert-morgan").click();
     const before = await addresses(page);
 
-    // Caret to the very start, in front of the tile that opens the document.
+    // Caret to the very start, in front of the chip that opens the document.
     await page.keyboard.press("Home");
 
     await ime.setComposition("ㅎ");
     await ime.setComposition("하");
     await ime.commit("한국어");
 
-    expect(await tileCount(page)).toBe(1);
+    expect(await chipCount(page)).toBe(1);
     expect(await addresses(page)).toEqual(before);
     expect(await text(page)).toContain("한국어");
   });
 
-  test("composes Chinese between two adjacent tiles", async ({ page }) => {
+  test("composes Chinese between two adjacent chips", async ({ page }) => {
     await openSpike(page);
     const ime = await imeFor(page);
 
     await page.getByTestId("insert-morgan").click();
     await page.getByTestId("insert-alex").click();
-    expect(await tileCount(page)).toBe(2);
+    expect(await chipCount(page)).toBe(2);
     const before = await addresses(page);
 
-    // Land between the two tiles: one press back from the end.
+    // Land between the two chips: one press back from the end.
     await page.keyboard.press("ArrowLeft");
 
     await ime.setComposition("z");
     await ime.setComposition("zh");
     await ime.commit("中文");
 
-    expect(await tileCount(page)).toBe(2);
+    expect(await chipCount(page)).toBe(2);
     expect(await addresses(page)).toEqual(before);
     expect(await text(page)).toContain("中文");
   });
 
-  test("backspace mid-composition beside a tile leaves the tile intact", async ({
+  test("backspace mid-composition beside a chip leaves the chip intact", async ({
     page,
   }) => {
     await openSpike(page);
@@ -158,14 +158,14 @@ test.describe("composition input beside an inline tile", () => {
     await ime.setComposition("");
     await page.keyboard.press("Backspace");
 
-    // The tile may or may not be deleted by that Backspace — either is a
+    // The chip may or may not be deleted by that Backspace — either is a
     // defensible product choice. What must not happen is a corrupted document.
     const after = await addresses(page);
     expect(after.length === before.length || after.length === 0).toBe(true);
     for (const address of after) expect(before).toContain(address);
   });
 
-  test("committed composition does not alter a tile's address", async ({
+  test("committed composition does not alter a chip's address", async ({
     page,
   }) => {
     await openSpike(page);
@@ -182,13 +182,13 @@ test.describe("composition input beside an inline tile", () => {
   });
 });
 
-test.describe("caret boundaries around an inline tile", () => {
+test.describe("caret boundaries around an inline chip", () => {
   // The keyboard route to the leading boundary WORKS with the production node
-  // view, in both engines. An earlier harness that rendered the tile as static
+  // view, in both engines. An earlier harness that rendered the chip as static
   // markup failed this — so the node view is not merely a nicer rendering, it
   // repaired a caret boundary. Both Home and ArrowLeft are covered because
   // keyboard routes must not diverge.
-  test("Home then typing lands before a leading tile", async ({ page }) => {
+  test("Home then typing lands before a leading chip", async ({ page }) => {
     await openSpike(page);
     await page.getByTestId("insert-morgan").click();
 
@@ -202,19 +202,19 @@ test.describe("caret boundaries around an inline tile", () => {
   });
 
   // EXPECTED FAILURE, and now the only known caret gap. A pointer click on the
-  // left edge of a leading tile lands after it, in Chromium and WebKit alike —
+  // left edge of a leading chip lands after it, in Chromium and WebKit alike —
   // the documented browser defect (ProseMirror discuss #2538, #4502; Lexical
   // #6916). The keyboard routes above already work, so the boundary layer only
   // owes the pointer case. Remove `test.fail()` when it lands.
-  test("clicking a leading tile's left edge lands before it", async ({
+  test("clicking a leading chip's left edge lands before it", async ({
     page,
   }) => {
     test.fail();
     await openSpike(page);
     await page.getByTestId("insert-morgan").click();
 
-    const box = await page.locator(".inline-tile").first().boundingBox();
-    if (!box) throw new Error("Tile is not laid out");
+    const box = await page.locator(".inline-chip").first().boundingBox();
+    if (!box) throw new Error("Chip is not laid out");
     await page.mouse.click(box.x + 2, box.y + box.height / 2);
     await page.keyboard.type("L");
 
@@ -224,7 +224,7 @@ test.describe("caret boundaries around an inline tile", () => {
     );
   });
 
-  test("ArrowLeft reaches the position before a leading tile", async ({
+  test("ArrowLeft reaches the position before a leading chip", async ({
     page,
   }) => {
     await openSpike(page);
@@ -239,12 +239,12 @@ test.describe("caret boundaries around an inline tile", () => {
     );
   });
 
-  // Typing between two adjacent tiles is NONDETERMINISTIC in Chrome without a
+  // Typing between two adjacent chips is NONDETERMINISTIC in Chrome without a
   // boundary layer: across repeated runs the text sometimes lands between the
-  // tiles and sometimes after both. Asserting a position here would be a flaky
+  // chips and sometimes after both. Asserting a position here would be a flaky
   // test, so this asserts the invariant that always holds — the document is
   // never corrupted — and the boundary layer owns making the position reliable.
-  test("typing between two adjacent tiles never corrupts the document", async ({
+  test("typing between two adjacent chips never corrupts the document", async ({
     page,
   }) => {
     await openSpike(page);
@@ -254,7 +254,7 @@ test.describe("caret boundaries around an inline tile", () => {
     await page.keyboard.press("ArrowLeft");
     await page.keyboard.type("and");
 
-    expect(await tileCount(page)).toBe(2);
+    expect(await chipCount(page)).toBe(2);
     expect(await addresses(page)).toEqual([
       "person/pk-morgan",
       "person/pk-alex",
@@ -266,50 +266,50 @@ test.describe("caret boundaries around an inline tile", () => {
   // NOT bind the `atom: true` flag: a contentless node is already a leaf and
   // therefore already atomic (ProseMirror computes `isAtom` as
   // `isLeaf || spec.atom`). What this does bind is `selectable: false` —
-  // flipping that turns this red, because a selected tile is replaced by the
+  // flipping that turns this red, because a selected chip is replaced by the
   // next keystroke.
-  test("the caret cannot be placed inside a tile", async ({ page }) => {
+  test("the caret cannot be placed inside a chip", async ({ page }) => {
     await openSpike(page);
     await page.getByTestId("insert-morgan").click();
 
     // Aim at the visual middle of the label — inside it, if that were possible.
-    const box = await page.locator(".inline-tile").first().boundingBox();
-    if (!box) throw new Error("Tile is not laid out");
+    const box = await page.locator(".inline-chip").first().boundingBox();
+    if (!box) throw new Error("Chip is not laid out");
     await page.mouse.click(box.x + box.width / 2, box.y + box.height / 2);
     await page.keyboard.type("ZZ");
 
     // The address is untouched and the typed text never split the label.
     expect(await addresses(page)).toEqual(["person/pk-morgan"]);
     // The rendered face is intact: typing did not split the label.
-    await expect(page.locator(".inline-tile-label")).toHaveText("@Morgan");
+    await expect(page.locator(".inline-chip-label")).toHaveText("@Morgan");
   });
 
-  test("arrow traversal never lands inside a tile", async ({ page }) => {
+  test("arrow traversal never lands inside a chip", async ({ page }) => {
     await openSpike(page);
     await page.getByTestId("insert-morgan").click();
     await page.keyboard.press("End");
     await page.keyboard.type("x");
 
     // Walk left across the whole document. Whatever the caret does at the
-    // boundaries, it must never split the tile: its address stays intact and
-    // the tile count never changes.
+    // boundaries, it must never split the chip: its address stays intact and
+    // the chip count never changes.
     for (let i = 0; i < 4; i++) await page.keyboard.press("ArrowLeft");
 
-    expect(await tileCount(page)).toBe(1);
+    expect(await chipCount(page)).toBe(1);
     expect(await addresses(page)).toEqual(["person/pk-morgan"]);
   });
 
-  test("backspace from just after a tile removes the whole tile", async ({
+  test("backspace from just after a chip removes the whole chip", async ({
     page,
   }) => {
     await openSpike(page);
     await page.getByTestId("insert-morgan").click();
-    expect(await tileCount(page)).toBe(1);
+    expect(await chipCount(page)).toBe(1);
 
     await page.keyboard.press("End");
     await page.keyboard.press("Backspace");
 
-    expect(await tileCount(page)).toBe(0);
+    expect(await chipCount(page)).toBe(0);
   });
 });
 
@@ -335,8 +335,8 @@ test.describe("the address is the binding, not the name", () => {
     await page.keyboard.type(" and ");
     await page.getByTestId("insert-alex").click();
 
-    // Both tiles read "Morgan" and are still different references.
-    await expect(page.locator(".inline-tile-label")).toHaveText([
+    // Both chips read "Morgan" and are still different references.
+    await expect(page.locator(".inline-chip-label")).toHaveText([
       "@Morgan",
       "@Morgan",
     ]);
@@ -347,7 +347,7 @@ test.describe("the address is the binding, not the name", () => {
 
     // Rename one. The other is untouched, and neither address moved.
     await rename(page, "pk-alex", "Alex");
-    await expect(page.locator(".inline-tile-label")).toHaveText([
+    await expect(page.locator(".inline-chip-label")).toHaveText([
       "@Morgan",
       "@Alex",
     ]);
@@ -373,7 +373,7 @@ test.describe("the address is the binding, not the name", () => {
 
     const before = await read(page);
     await rename(page, "pk-morgan", "Morgan Mulvaney");
-    await expect(page.locator(".inline-tile-label")).toHaveText(
+    await expect(page.locator(".inline-chip-label")).toHaveText(
       "@Morgan Mulvaney",
     );
 
@@ -394,7 +394,7 @@ test.describe("the address is the binding, not the name", () => {
 
     // Undo is Meta+z on macOS. Using the wrong modifier silently does nothing
     // and the test would pass for the wrong reason.
-    // One undo step covers the typing; a second covers the tile insert. What
+    // One undo step covers the typing; a second covers the chip insert. What
     // matters is that undo walks the document the person authored and is not
     // perturbed by the rename at all.
     await page.keyboard.press(
@@ -410,20 +410,20 @@ test.describe("the address is the binding, not the name", () => {
   test("a name does not survive a community reset", async ({ page }) => {
     await openSpike(page);
     await page.getByTestId("insert-morgan").click();
-    await expect(page.locator(".inline-tile-label")).toHaveText("@Morgan");
+    await expect(page.locator(".inline-chip-label")).toHaveText("@Morgan");
 
     await resetFaces(page);
 
-    // The tile survives; only its name is forgotten. It falls back to an
+    // The chip survives; only its name is forgotten. It falls back to an
     // abbreviation, never the full identity, and announces itself as
     // unresolved rather than reading an abbreviation aloud.
-    await expect(page.locator(".inline-tile")).toHaveCount(1);
+    await expect(page.locator(".inline-chip")).toHaveCount(1);
     // The forgotten name is gone. (The stand-in is derived from the id, which
     // in this harness is short enough not to be abbreviated; the abbreviation
     // rule for real 64-character identities is covered in the unit tests.)
-    const label = await page.locator(".inline-tile-label").innerText();
+    const label = await page.locator(".inline-chip-label").innerText();
     expect(label).not.toContain("Morgan");
-    await expect(page.locator(".inline-tile")).toHaveAttribute(
+    await expect(page.locator(".inline-chip")).toHaveAttribute(
       "aria-label",
       "Unresolved person",
     );
@@ -435,7 +435,7 @@ test.describe("the address is the binding, not the name", () => {
   /**
    * The plain-text projection is the address. This is what a sent message
    * carries and what an agent reads, and it is why a reader that knows nothing
-   * about tiles still receives something meaningful.
+   * about chips still receives something meaningful.
    */
   test("the text projection is the address, never the label", async ({
     page,

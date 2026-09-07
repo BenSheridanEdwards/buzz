@@ -8,7 +8,7 @@ import {
 import type { ReactNode } from "react";
 import { useState } from "react";
 import { Avatar } from "@/shared/ui/Avatar";
-import { InlineTile } from "@/shared/ui/InlineTile";
+import { InlineChip } from "@/shared/ui/InlineChip";
 import { Button } from "@/shared/ui/Button";
 import { IconButton } from "@/shared/ui/IconButton";
 import { NavigatorRow } from "@/shared/ui/NavigatorRow";
@@ -17,8 +17,8 @@ import { PanelHeader } from "@/shared/ui/PanelHeader";
 import { SearchField } from "@/shared/ui/SearchField";
 import { SegmentedNavigation } from "@/shared/ui/SegmentedNavigation";
 import { WorkspaceSurface } from "@/shared/ui/WorkspaceSurface";
-import type { TileAddress } from "@/shared/tiles/address";
-import { tileFaces } from "@/shared/tiles/faceResolver";
+import type { ChipAddress } from "@/shared/chips/address";
+import { chipFaces } from "@/shared/chips/faceResolver";
 
 const DESTINATIONS = [
   { value: "home", label: "Home" },
@@ -383,90 +383,133 @@ function NavigatorRowSpecimen() {
   );
 }
 
-const TILE_PERSON: TileAddress = { kind: "person", id: "pk-morgan" };
-const TILE_AGENT: TileAddress = { kind: "agent", id: "pk-vogue" };
-const TILE_CHANNEL: TileAddress = { kind: "channel", id: "ch-design" };
-const TILE_UNRESOLVED: TileAddress = {
+const CHIP_PERSON: ChipAddress = { kind: "person", id: "pk-morgan" };
+const CHIP_AGENT: ChipAddress = { kind: "agent", id: "pk-morgarita" };
+const CHIP_CHANNEL: ChipAddress = { kind: "channel", id: "ch-buzz-team" };
+const CHIP_MESSAGE: ChipAddress = { kind: "message", id: "ev-thread-root" };
+const CHIP_LINK: ChipAddress = {
+  kind: "link",
+  id: "https://github.com/block/buzz",
+};
+const CHIP_UNRESOLVED: ChipAddress = {
   kind: "person",
   id: "9f2c4a1b7e5d8306a4b2c1d9e8f7a6b5c4d3e2f1a0b9c8d7e6f5a4b3c2d1e0f9",
 };
-const TILE_LONG: TileAddress = { kind: "person", id: "pk-long" };
+const CHIP_LONG: ChipAddress = { kind: "person", id: "pk-long" };
+
+const CHIP_KIND_ROWS = [
+  { label: "Person", address: CHIP_PERSON },
+  { label: "Agent", address: CHIP_AGENT },
+  { label: "Channel", address: CHIP_CHANNEL },
+  { label: "Message", address: CHIP_MESSAGE },
+  { label: "Link", address: CHIP_LINK },
+] as const;
 
 /**
- * Seeds faces so the specimens show resolved tiles. The product resolves these
+ * Seeds faces so the specimens show resolved chips. The product resolves these
  * from real identity; the page only needs the shapes to be visible.
  */
-function seedTileFaces() {
-  tileFaces.put(TILE_PERSON, {
-    label: "Morgan",
-    status: "online",
+function seedChipFaces() {
+  chipFaces.put(CHIP_PERSON, {
+    label: "Morgan Martin",
     loading: false,
     resolved: true,
   });
-  tileFaces.put(TILE_AGENT, {
-    label: "Vogue",
-    status: "busy",
+  chipFaces.put(CHIP_AGENT, {
+    label: "Morgarita",
     loading: false,
     resolved: true,
   });
-  tileFaces.put(TILE_CHANNEL, {
-    label: "design",
+  chipFaces.put(CHIP_CHANNEL, {
+    label: "buzz-team",
     loading: false,
     resolved: true,
   });
-  tileFaces.put(TILE_LONG, {
+  chipFaces.put(CHIP_MESSAGE, {
+    label: "buzz-team",
+    loading: false,
+    resolved: true,
+  });
+  chipFaces.put(CHIP_LINK, {
+    label: "github.com/block/buzz",
+    loading: false,
+    resolved: true,
+  });
+  chipFaces.put(CHIP_LONG, {
     label: "A deliberately very long display name that must truncate",
     loading: false,
     resolved: true,
   });
 }
 
-function InlineTileSpecimen() {
+function InlineChipSpecimen() {
   const [activated, setActivated] = useState<string | null>(null);
-  seedTileFaces();
+  seedChipFaces();
 
   return (
     <div className="component-specimen-stack">
       <SpecimenGroup label="Kinds">
-        <div className="component-specimen-row">
-          <InlineTile address={TILE_PERSON} />
-          <InlineTile address={TILE_AGENT} />
-          <InlineTile address={TILE_CHANNEL} />
+        <div className="flex flex-col gap-3">
+          {CHIP_KIND_ROWS.map((row) => (
+            <div key={row.label} className="flex items-baseline gap-3">
+              <span className="w-16 shrink-0 text-body-sm text-tertiary">
+                {row.label}
+              </span>
+              <InlineChip address={row.address} />
+            </div>
+          ))}
         </div>
       </SpecimenGroup>
 
       <SpecimenGroup label="In a sentence">
         <p className="text-body text-primary">
-          Asked <InlineTile address={TILE_PERSON} /> and{" "}
-          <InlineTile address={TILE_AGENT} /> to look at the thread in{" "}
-          <InlineTile address={TILE_CHANNEL} /> before the review.
+          Asked <InlineChip address={CHIP_PERSON} /> and{" "}
+          <InlineChip address={CHIP_AGENT} /> to look at{" "}
+          <InlineChip address={CHIP_MESSAGE} /> in{" "}
+          <InlineChip address={CHIP_CHANNEL} />, alongside{" "}
+          <InlineChip address={CHIP_LINK} /> before the review.
         </p>
       </SpecimenGroup>
 
       <SpecimenGroup label="Read-only, as a conversation renders it">
         <p className="text-body text-primary">
-          A tile in a sent message is not a control when the surface has no
+          A chip in a sent message is not a control when the surface has no
           detail to open:{" "}
-          <InlineTile address={TILE_PERSON} interactive={false} />
+          <InlineChip address={CHIP_PERSON} interactive={false} />
         </p>
       </SpecimenGroup>
 
-      <SpecimenGroup label="Unresolved identity">
-        <div className="component-specimen-row">
-          <InlineTile address={TILE_UNRESOLVED} />
+      <SpecimenGroup label="Unresolved reference">
+        <div className="flex flex-col gap-3">
+          <div className="component-specimen-row">
+            <InlineChip address={CHIP_UNRESOLVED} />
+          </div>
+          <p className="max-w-md text-body-sm text-tertiary">
+            No name to show and nothing to open, so it reads as inert and
+            announces itself as unresolved rather than speaking an identity
+            fragment aloud.
+          </p>
         </div>
       </SpecimenGroup>
 
       <SpecimenGroup label="Long label truncates">
         <div className="component-specimen-row">
-          <InlineTile address={TILE_LONG} />
+          <InlineChip address={CHIP_LONG} />
         </div>
+      </SpecimenGroup>
+
+      <SpecimenGroup label="Wrapping across lines">
+        <p className="max-w-xs text-body text-primary">
+          A chip sits in the text flow, so a line break falls before or after it
+          and never inside it: <InlineChip address={CHIP_PERSON} />{" "}
+          <InlineChip address={CHIP_AGENT} /> <InlineChip address={CHIP_LINK} />
+        </p>
       </SpecimenGroup>
 
       <SpecimenGroup label="Activation">
         <div className="component-specimen-row">
-          <InlineTile
-            address={TILE_PERSON}
+          <InlineChip
+            address={CHIP_PERSON}
             onActivate={(address) => setActivated(address.id)}
           />
           <span className="text-body-sm text-tertiary">
@@ -482,7 +525,7 @@ export const COMPONENT_SPECIMENS: Record<string, () => ReactNode> = {
   button: ButtonSpecimen,
   "icon-button": IconButtonSpecimen,
   avatar: AvatarSpecimen,
-  "inline-tile": InlineTileSpecimen,
+  "inline-chip": InlineChipSpecimen,
   "workspace-surface": WorkspaceSurfaceSpecimen,
   "segmented-navigation": SegmentedNavigationSpecimen,
   "panel-header": PanelHeaderSpecimen,

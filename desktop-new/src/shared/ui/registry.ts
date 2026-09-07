@@ -39,12 +39,12 @@ export const COMPONENTS: readonly ComponentDefinition[] = [
     owner: "desktop-new Messages",
   },
   {
-    slug: "inline-tile",
-    name: "InlineTile",
+    slug: "inline-chip",
+    name: "InlineChip",
     purpose:
-      "A reference to a person, agent, or channel shown inline in a sentence.",
+      "A reference to a person, agent, channel, message, or link shown inline in a sentence.",
     behavior: "Semantic native button or image role",
-    variants: ["person", "agent", "channel"],
+    variants: ["person", "agent", "channel", "message", "link"],
     status: "proposed",
     owner: "desktop-new Messages",
   },
