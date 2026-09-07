@@ -309,17 +309,29 @@ export type AgentReadinessEvaluation = {
   requirements: AgentReadinessRequirement[];
 };
 
-export type AgentReadinessDraft = {
-  /** Saved agent baseline for edit drafts. Omit for create drafts. */
-  pubkey?: string;
-  /** Runtime id override. null clears to inherited/default resolution. */
-  runtime?: string | null;
-  /** Custom/raw command override. Prefer runtime for catalog-known harnesses. */
-  agentCommand?: string | null;
-  model?: string | null;
-  provider?: string | null;
-  envVars?: Record<string, string>;
-};
+export type AgentReadinessDraft =
+  | {
+      kind: "new";
+      config: {
+        /** Same authoritative harness command submitted by Create. */
+        agentCommand?: string;
+        model?: string;
+        provider?: string;
+        envVars?: Record<string, string>;
+      };
+    }
+  | {
+      kind: "existing";
+      config: {
+        pubkey: string;
+        /** Same command or inheritance sentinel submitted by Save. */
+        agentCommand?: string;
+        harnessOverride?: boolean;
+        model?: string | null;
+        provider?: string | null;
+        envVars?: Record<string, string>;
+      };
+    };
 
 export type ManagedAgentRuntimeStatus = {
   pubkey: string;

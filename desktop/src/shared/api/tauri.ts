@@ -944,31 +944,13 @@ export async function getAgentConfigSurface(
   });
 }
 
-/** Evaluate a saved managed agent's backend-owned readiness requirements. */
-export async function evaluateAgentReadiness(
-  pubkey: string,
-): Promise<AgentReadinessEvaluation> {
-  return invokeTauri<AgentReadinessEvaluation>("evaluate_agent_readiness", {
-    pubkey,
-  });
-}
-
-/** Evaluate unsaved config edits without persisting them. */
+/** Evaluate an unsaved new-agent config or exact saved-agent patch. */
 export async function evaluateAgentReadinessDraft(
   draft: AgentReadinessDraft,
 ): Promise<AgentReadinessEvaluation> {
-  const payload: AgentReadinessDraft = {};
-  if (draft.pubkey !== undefined) payload.pubkey = draft.pubkey;
-  if (draft.runtime !== undefined) payload.runtime = draft.runtime;
-  if (draft.agentCommand !== undefined)
-    payload.agentCommand = draft.agentCommand;
-  if (draft.model !== undefined) payload.model = draft.model;
-  if (draft.provider !== undefined) payload.provider = draft.provider;
-  if (draft.envVars !== undefined) payload.envVars = draft.envVars;
-
   return invokeTauri<AgentReadinessEvaluation>(
     "evaluate_agent_readiness_draft",
-    { draft: payload },
+    { draft },
   );
 }
 

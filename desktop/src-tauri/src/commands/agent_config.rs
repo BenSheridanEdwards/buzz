@@ -1,10 +1,13 @@
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use tauri::{AppHandle, Manager, State};
+
+#[path = "agent_config_readiness.rs"]
+mod readiness_preview;
+pub use readiness_preview::{AgentReadinessDraft, AgentReadinessEvaluation};
 
 use crate::{
     app_state::AppState,
     managed_agents::{
-        agent_readiness,
         config_bridge::{
             read_goose_file_config,
             reader::read_config_surface,
@@ -15,10 +18,8 @@ use crate::{
         },
         current_instance_id, is_reserved_env_key, is_safe_to_reveal, is_well_formed_env_key,
         known_acp_runtime, load_managed_agents, load_personas, resolve_effective_agent_env,
-        save_managed_agents, sync_managed_agent_processes, AgentDefinition, AgentReadiness,
-        BackendKind, GlobalAgentConfig, KnownAcpRuntime, ManagedAgentRecord,
-        ManagedAgentRuntimeKey, Requirement, RespondTo, DEFAULT_ACP_COMMAND,
-        DEFAULT_AGENT_PARALLELISM, DEFAULT_AGENT_TURN_TIMEOUT_SECONDS, MAX_ENV_VALUE_BYTES,
+        save_managed_agents, sync_managed_agent_processes, AgentDefinition, GlobalAgentConfig,
+        KnownAcpRuntime, ManagedAgentRecord, ManagedAgentRuntimeKey, MAX_ENV_VALUE_BYTES,
     },
 };
 
@@ -59,237 +60,6 @@ fn sanitize_inherited_env(
 /// `None`, matching `effective_config`'s `non_blank` helper.
 fn non_blank(v: Option<&str>) -> Option<String> {
     v.filter(|s| !s.trim().is_empty()).map(str::to_owned)
-}
-
-fn trim_to_option(value: Option<String>) -> Option<String> {
-    value.and_then(|value| {
-        let trimmed = value.trim();
-        (!trimmed.is_empty()).then(|| trimmed.to_string())
-    })
-}
-
-/// A proposed managed-agent configuration to evaluate before persistence.
-///
-/// Every field is an optional draft override of the same persisted field on
-/// [`ManagedAgentRecord`]. Edit drafts include `pubkey` and inherit omitted
-/// fields from that saved record; create drafts omit `pubkey` and are evaluated
-/// from only the submitted draft plus global defaults. JSON `null` for
-/// tri-state fields clears that value in the draft only. The resulting record
-/// is never written to disk.
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct AgentReadinessDraft {
-    /// Saved agent to use as the baseline for edit drafts. Omit for create
-    /// drafts, which are evaluated from only the submitted proposed config and
-    /// global defaults.
-    #[serde(default)]
-    pub pubkey: Option<String>,
-    /// Draft runtime id. `null` clears the instance runtime so a linked agent
-    /// inherits from its persona.
-    #[serde(default, deserialize_with = "crate::util::double_option")]
-    pub runtime: Option<Option<String>>,
-    /// Draft explicit command pin. `null` clears the pin. Prefer `runtime` for
-    /// catalog-known harnesses; this exists for Custom command drafts.
-    #[serde(default, deserialize_with = "crate::util::double_option")]
-    pub agent_command: Option<Option<String>>,
-    /// Draft model selection. `null` clears the selection.
-    #[serde(default, deserialize_with = "crate::util::double_option")]
-    pub model: Option<Option<String>>,
-    /// Draft provider selection. `null` clears the selection.
-    #[serde(default, deserialize_with = "crate::util::double_option")]
-    pub provider: Option<Option<String>>,
-    /// Draft agent-local env vars. When present, replaces the record's env var
-    /// map for evaluation only.
-    #[serde(default)]
-    pub env_vars: Option<std::collections::BTreeMap<String, String>>,
-}
-
-/// Presentation-ready readiness result for a saved or draft managed-agent
-/// configuration.
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-pub struct AgentReadinessEvaluation {
-    /// `true` when all backend-owned requirements are satisfied.
-    pub ready: bool,
-    /// Structured missing requirements, including the `surface` discriminator
-    /// the UI uses to choose the resolution affordance.
-    pub requirements: Vec<Requirement>,
-}
-
-fn readiness_to_evaluation(readiness: AgentReadiness) -> AgentReadinessEvaluation {
-    match readiness {
-        AgentReadiness::Ready => AgentReadinessEvaluation {
-            ready: true,
-            requirements: Vec::new(),
-        },
-        AgentReadiness::NotReady { requirements } => AgentReadinessEvaluation {
-            ready: false,
-            requirements,
-        },
-    }
-}
-
-fn apply_draft_override(record: &mut ManagedAgentRecord, draft: AgentReadinessDraft) {
-    let AgentReadinessDraft {
-        pubkey: _,
-        runtime,
-        agent_command,
-        model,
-        provider,
-        env_vars,
-    } = draft;
-    let runtime_supplied = runtime.is_some();
-    if let Some(runtime) = runtime {
-        record.runtime = trim_to_option(runtime);
-        record.agent_command_override = None;
-    }
-    if let Some(agent_command) = agent_command {
-        if !runtime_supplied || record.runtime.is_none() {
-            record.agent_command_override = trim_to_option(agent_command);
-            if record.agent_command_override.is_some() {
-                record.runtime = None;
-            }
-        }
-    }
-    if let Some(model) = model {
-        record.model = trim_to_option(model);
-    }
-    if let Some(provider) = provider {
-        record.provider = trim_to_option(provider);
-    }
-    if let Some(env_vars) = env_vars {
-        record.env_vars = env_vars;
-    }
-}
-
-fn evaluate_agent_record_readiness(
-    record: &ManagedAgentRecord,
-    personas: &[AgentDefinition],
-    global: &GlobalAgentConfig,
-) -> AgentReadinessEvaluation {
-    let command = crate::managed_agents::record_agent_command(record, personas);
-    let metadata = known_acp_runtime(&command);
-    let effective = resolve_effective_agent_env(record, personas, metadata, global);
-    readiness_to_evaluation(agent_readiness(&effective))
-}
-
-fn build_draft_baseline(draft: &AgentReadinessDraft) -> ManagedAgentRecord {
-    let command = draft
-        .agent_command
-        .as_ref()
-        .and_then(|value| value.as_ref())
-        .and_then(|value| non_blank(Some(value)))
-        .or_else(|| {
-            draft
-                .runtime
-                .as_ref()
-                .and_then(|value| value.as_ref())
-                .and_then(|id| crate::managed_agents::command_for_runtime_id(id))
-        })
-        .unwrap_or_else(crate::managed_agents::default_agent_command);
-
-    ManagedAgentRecord {
-        pubkey: draft.pubkey.clone().unwrap_or_default(),
-        name: "Draft Agent".to_string(),
-        description: None,
-        persona_id: None,
-        team_id: None,
-        private_key_nsec: String::new(),
-        auth_tag: None,
-        relay_url: String::new(),
-        avatar_url: None,
-        acp_command: DEFAULT_ACP_COMMAND.to_string(),
-        agent_command: command,
-        agent_command_override: None,
-        agent_args: Vec::new(),
-        mcp_command: String::new(),
-        turn_timeout_seconds: DEFAULT_AGENT_TURN_TIMEOUT_SECONDS,
-        idle_timeout_seconds: None,
-        max_turn_duration_seconds: None,
-        parallelism: DEFAULT_AGENT_PARALLELISM,
-        system_prompt: None,
-        model: None,
-        provider: None,
-        persona_source_version: None,
-        env_vars: Default::default(),
-        start_on_app_launch: false,
-        auto_restart_on_config_change: true,
-        runtime_pid: None,
-        backend: BackendKind::Local,
-        backend_agent_id: None,
-        provider_policy_pending: false,
-        provider_binary_path: None,
-        persona_team_dir: None,
-        persona_name_in_team: None,
-        created_at: String::new(),
-        updated_at: String::new(),
-        last_started_at: None,
-        last_stopped_at: None,
-        last_exit_code: None,
-        last_error: None,
-        last_error_code: None,
-        respond_to: RespondTo::OwnerOnly,
-        respond_to_allowlist: Vec::new(),
-        display_name: None,
-        slug: None,
-        runtime: None,
-        name_pool: Vec::new(),
-        is_builtin: false,
-        is_active: true,
-        shared: false,
-        source_team: None,
-        source_team_persona_slug: None,
-        catalog_source: None,
-        team_catalog_source: None,
-        definition_respond_to: None,
-        definition_respond_to_allowlist: Vec::new(),
-        definition_parallelism: None,
-        relay_mesh: None,
-        effort_level: None,
-    }
-}
-
-fn evaluate_saved_agent_readiness_for_app<R: tauri::Runtime>(
-    app: &tauri::AppHandle<R>,
-    state: &AppState,
-    pubkey: &str,
-) -> Result<AgentReadinessEvaluation, String> {
-    let _store_guard = state
-        .managed_agents_store_lock
-        .lock()
-        .map_err(|e| e.to_string())?;
-    let records = load_managed_agents(app)?;
-    let record = records
-        .iter()
-        .find(|record| record.pubkey == pubkey)
-        .ok_or_else(|| format!("agent {pubkey} not found"))?;
-    let personas = load_personas(app).unwrap_or_default();
-    let global = crate::managed_agents::load_global_agent_config(app).unwrap_or_default();
-    Ok(evaluate_agent_record_readiness(record, &personas, &global))
-}
-
-fn evaluate_draft_agent_readiness_for_app<R: tauri::Runtime>(
-    app: &tauri::AppHandle<R>,
-    state: &AppState,
-    draft: AgentReadinessDraft,
-) -> Result<AgentReadinessEvaluation, String> {
-    let _store_guard = state
-        .managed_agents_store_lock
-        .lock()
-        .map_err(|e| e.to_string())?;
-    let records = load_managed_agents(app)?;
-    let mut record = draft
-        .pubkey
-        .as_deref()
-        .and_then(|pubkey| records.into_iter().find(|record| record.pubkey == pubkey))
-        .unwrap_or_else(|| build_draft_baseline(&draft));
-    if let Some(ref env_vars) = draft.env_vars {
-        crate::managed_agents::validate_user_env_keys(env_vars)?;
-    }
-    apply_draft_override(&mut record, draft);
-    let personas = load_personas(app).unwrap_or_default();
-    let global = crate::managed_agents::load_global_agent_config(app).unwrap_or_default();
-    Ok(evaluate_agent_record_readiness(&record, &personas, &global))
 }
 
 /// Build a sanitized `InheritedConfigTiers` snapshot at the command boundary.
@@ -481,32 +251,11 @@ pub fn get_baked_build_env() -> Vec<BakedEnvEntry> {
         .collect()
 }
 
-/// Evaluate the readiness of a saved managed-agent configuration.
+/// Evaluate a proposed managed-agent configuration without persisting it.
 ///
-/// This is the structured counterpart to the legacy runtime-status
-/// `local_setup` boolean. It returns the exact backend-computed missing
-/// requirements instead of forcing the frontend to rederive provider,
-/// credential, CLI-login, or missing-binary readiness.
-#[tauri::command]
-pub async fn evaluate_agent_readiness(
-    pubkey: String,
-    app: AppHandle,
-    _state: State<'_, AppState>,
-) -> Result<AgentReadinessEvaluation, String> {
-    tokio::task::spawn_blocking(move || {
-        let state = app.state::<AppState>();
-        evaluate_saved_agent_readiness_for_app(&app, &state, &pubkey)
-    })
-    .await
-    .map_err(|e| format!("spawn_blocking failed: {e}"))?
-}
-
-/// Evaluate a draft managed-agent configuration before it is persisted.
-///
-/// The saved agent is used only as a baseline for persona/global inheritance,
-/// harness definition env, and omitted fields. Draft overrides are applied to a
-/// clone and then passed through the same effective-env resolver and readiness
-/// predicate that saved agents use. This command performs no write.
+/// The request explicitly distinguishes a complete new-agent proposal from a
+/// patch to one exact saved agent. Projection reuses the production create,
+/// update, effective-config, harness, and readiness owners.
 #[tauri::command]
 pub async fn evaluate_agent_readiness_draft(
     draft: AgentReadinessDraft,
@@ -514,8 +263,21 @@ pub async fn evaluate_agent_readiness_draft(
     _state: State<'_, AppState>,
 ) -> Result<AgentReadinessEvaluation, String> {
     tokio::task::spawn_blocking(move || {
-        let state = app.state::<AppState>();
-        evaluate_draft_agent_readiness_for_app(&app, &state, draft)
+        // Snapshot persisted inputs while holding the store lock; readiness may
+        // probe an external CLI and therefore runs only after this scope exits.
+        let (records, definitions, global) = {
+            let state = app.state::<AppState>();
+            let _store_guard = state
+                .managed_agents_store_lock
+                .lock()
+                .map_err(|error| error.to_string())?;
+            (
+                load_managed_agents(&app)?,
+                load_personas(&app)?,
+                crate::managed_agents::load_global_agent_config(&app)?,
+            )
+        };
+        readiness_preview::evaluate_draft(draft, &records, &definitions, &global)
     })
     .await
     .map_err(|e| format!("spawn_blocking failed: {e}"))?
