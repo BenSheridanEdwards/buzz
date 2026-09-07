@@ -12,50 +12,34 @@ use std::sync::Mutex;
 
 static GOOSE_PATH_ROOT_LOCK: Mutex<()> = Mutex::new(());
 
-struct EnvVarGuard {
-    key: &'static str,
-    prior: Option<std::ffi::OsString>,
-}
+struct TestAppDataGuard(std::path::PathBuf);
 
-impl EnvVarGuard {
-    fn set(key: &'static str, value: &std::path::Path) -> Self {
-        let prior = std::env::var_os(key);
-        std::env::set_var(key, value);
-        Self { key, prior }
-    }
-}
-
-impl Drop for EnvVarGuard {
+impl Drop for TestAppDataGuard {
     fn drop(&mut self) {
-        match &self.prior {
-            Some(value) => std::env::set_var(self.key, value),
-            None => std::env::remove_var(self.key),
-        }
+        let _ = std::fs::remove_dir_all(&self.0);
     }
 }
 
 struct ReadinessIpcFixture {
     app: tauri::App<tauri::test::MockRuntime>,
-    _temp: tempfile::TempDir,
-    _home: EnvVarGuard,
-    _xdg: EnvVarGuard,
+    _data: TestAppDataGuard,
 }
 
 fn readiness_ipc_fixture() -> ReadinessIpcFixture {
-    let temp = tempfile::tempdir().expect("temp app data root");
-    let home = EnvVarGuard::set("HOME", temp.path());
-    let xdg = EnvVarGuard::set("XDG_DATA_HOME", temp.path());
+    static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let suffix = NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let mut context = tauri::test::mock_context(tauri::test::noop_assets());
+    context.config_mut().identifier = format!(
+        "com.block.buzz.readiness-test-{}-{suffix}",
+        std::process::id()
+    );
     let app = tauri::test::mock_builder()
         .manage(crate::app_state::build_app_state())
         .invoke_handler(tauri::generate_handler![evaluate_agent_readiness_draft])
-        .build(tauri::test::mock_context(tauri::test::noop_assets()))
+        .build(context)
         .expect("mock app builds");
-    ReadinessIpcFixture {
-        app,
-        _temp: temp,
-        _home: home,
-        _xdg: xdg,
-    }
+    let data = TestAppDataGuard(app.path().app_data_dir().expect("test app data dir"));
+    ReadinessIpcFixture { app, _data: data }
 }
 
 /// Run a test body with GOOSE_PATH_ROOT set to a non-existent path so that the
@@ -223,7 +207,6 @@ fn production_handler_registers_readiness_command() {
 
 #[test]
 fn readiness_command_is_registered_and_never_persists_its_draft() {
-    let _env_guard = crate::managed_agents::lock_env_mutex();
     let fixture = readiness_ipc_fixture();
     let mut saved = agent_record();
     saved.pubkey = "a".repeat(64);
