@@ -88,6 +88,10 @@ Buzz is a place where people build together and bring their agents into the room
 - **Accent is signal, never structure.** Reaching for an accent surface where a neutral one belongs is the most common way a functional screen starts to look decorated.
 - **Never use a status colour decoratively.** A green that does not mean success teaches people to stop trusting green.
 - **Categorical colours are the one place appearance-naming is allowed.** Telling two projects apart genuinely is a choice about appearance.
+- **Opacity is not how you reach a subtler colour.** If a tint looks too strong, take a different palette step — do not dim a stronger one. `purple-950/50` composites to a real, correct colour, which is exactly the trap: it is a colour decision with no name, no light/dark pair, and nothing the contrast guard can measure. A missing shade is a missing palette step, and adding one is an ordinary reviewed edit. `scripts/check-color.mjs` enforces this.
+- **Transparency is a different axis from shade, and it has its own tokens.** `glass-*` exists for surfaces something must show through. Alpha baked into a named value at the palette layer is the system working; alpha applied to a token in a component is not.
+- **A dark value is authored, never derived.** A hue's dark steps are not its light steps darkened or dimmed — Tailwind's purple gets *more* saturated as it descends, so a dark tint drawn from its bottom end reads as oversaturated. This is why the palette holds two authored ramps per hue rather than one ramp and a transform.
+- **Two tokens doing the same job must resolve to the same step, not merely to the same value.** Matching literals drift; a shared reference cannot. The accent tint and the categorical purple were the same colour in light mode and two different colours in dark, and nothing caught it because both were hand-picked.
 
 ## Contrast
 

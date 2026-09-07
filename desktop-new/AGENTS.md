@@ -32,9 +32,10 @@ Port 1430, so it can run alongside the existing client on 1420.
 
 ```bash
 pnpm typecheck      # tsc --noEmit
-pnpm check          # biome + the type-system and contrast guards
+pnpm check          # biome + the type, contrast, and colour guards
 pnpm check:type     # the type-system guard alone
 pnpm check:contrast # the contrast guard alone
+pnpm check:color    # the colour-system guard alone
 pnpm biome check --write .   # auto-fix
 ```
 
@@ -63,6 +64,52 @@ so it cannot drift from the tokens it audits. Buzz judges contrast with APCA,
 not the WCAG 2 ratio — see DESIGN.md § Contrast for the evidence, and note the
 consequence: a pairing can pass WCAG AA and still fail here, which is the point.
 `#8f8f8f` on `#1c1c1c` scores WCAG 5.27:1 and APCA Lc 40.
+
+`scripts/check-color.mjs` enforces one rule: **opacity is not how you reach a
+subtler colour.** It rejects an opacity modifier on a colour utility
+(`bg-accent-tint/50`), `color-mix()` and alpha `rgb()`/`hsl()` in component
+code, and any component reaching past the role layer to a palette or family
+token. It exists because of a real near-miss: the accent tint was right in light
+mode and oversaturated in dark, and the obvious fix was `purple-950/50`. That
+value is *correct* — it composites to almost exactly the palette step now in
+use — but as an expression in a component it has no name, no light/dark pair,
+and nothing the contrast guard can measure. A missing shade is a missing palette
+step. Genuine translucency is a separate axis with its own tokens (`glass-*`),
+and the token file is the one place alpha is legitimately baked into a value.
+
+---
+
+## Colour layers
+
+Four layers, and only the role layer is used when building a screen:
+
+| Layer | Example | What it is |
+|---|---|---|
+| **0 palette** | `--palette-purple-3` | Every hue, twelve steps, authored per mode. The only place a literal lives. |
+| **1 families** | `--accent-tint` | The five jobs a hue does: tint, tint-hover, border, fill, text. |
+| **2 roles** | `--bg-accent-tint` | What a thing *is* in the interface. The only public layer. |
+| **3 components** | `bg-accent-tint` | Tailwind utilities. |
+
+The palette was added after the families accumulated 114 hand-picked hex values
+with nothing enforcing that two tokens doing the same job agreed — and they
+drifted: `accent-2` and `tint-purple` were the same purple in light mode and two
+different purples in dark. Referencing a step cannot drift that way, and
+`src/shared/tokens/palette.test.ts` asserts it.
+
+Family steps are **named for their job, not numbered**. `--accent-2` invited
+reading as "a light purple" when it means "the surface an accent tint sits on".
+
+Palette values are Radix Colors (MIT), transcribed rather than depended on —
+Radix is not on Block's Tech Radar, so this is a values-only copy with no
+package. Its twelve-step contract is the one this system already described in
+comments, step for step. Two deliberate divergences, both documented in
+`tokens.css`: family **text** takes step 12 rather than the 11 Radix names
+"low-contrast text" (Radix sizes 11 for WCAG 4.5:1; every hue's step 11 measured
+Lc 55–61 against this system's Lc 60 target), and the **dark neutral surfaces**
+stay hand-authored because they were sized against the real panel stack.
+
+To change the accent hue, point the five `--accent-*` families at a different
+palette hue. Nothing above them knows the colour.
 
 ---
 

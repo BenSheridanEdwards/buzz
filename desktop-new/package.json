@@ -9,13 +9,14 @@
     "typecheck": "tsc --noEmit",
     "preview": "vite preview",
     "lint": "biome lint .",
-    "check": "biome check . && node scripts/check-type.mjs && node scripts/check-contrast.mjs",
+    "check": "biome check . && node scripts/check-type.mjs && node scripts/check-contrast.mjs && node scripts/check-color.mjs",
     "format": "biome format --write .",
     "check:type": "node scripts/check-type.mjs",
     "check:contrast": "node scripts/check-contrast.mjs",
     "test": "vitest run src",
     "test:e2e": "playwright test",
-    "tauri:dev": "node ../desktop/scripts/tauri-command.mjs dev --config ../desktop-new/tauri.conf.json --config ../desktop/src-tauri/tauri.dev.conf.json"
+    "tauri:dev": "node ../desktop/scripts/tauri-command.mjs dev --config ../desktop-new/tauri.conf.json --config ../desktop/src-tauri/tauri.dev.conf.json",
+    "check:color": "node scripts/check-color.mjs"
   },
   "dependencies": {
     "@base-ui/react": "1.7.0",

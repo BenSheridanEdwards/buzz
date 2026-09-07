@@ -1,5 +1,6 @@
 import {
   EXCEPTIONS,
+  PALETTE,
   RAMPS,
   ROLE_GROUPS,
   type Role,
@@ -50,12 +51,46 @@ export function ColourPage() {
     <>
       <PageHeader
         title="Colour"
-        intro="Three layers, and only the role layer is ever used when building a screen. Private ramps hold values; public roles hold meanings. Everything below is rendered from the token registry, so a token added there appears here automatically and this page cannot drift from the system."
+        intro="Four layers, and only the role layer is ever used when building a screen. The palette holds values, families hold the jobs a hue does, roles hold meanings. Everything below is rendered from the token registry, so a token added there appears here automatically and this page cannot drift from the system."
       />
 
       <Section
-        title="Layer 1 — private ramps"
-        description="A ramp is a contrast instrument, not an assignment. It gives values with known perceptual relationships, so a role encodes a distance rather than a colour — which is what stays true when the palette changes. Components never reference these."
+        title="Layer 0 — palette"
+        description="Every hue, twelve steps, authored per mode — the only place a literal colour lives. It exists because the layer above it was 114 hand-picked values with nothing keeping two tokens that do the same job in agreement, and they drifted. Dark steps are authored for dark surfaces rather than derived by dimming light ones, so a subtler deep colour is a step you pick instead of an opacity you write."
+      >
+        <div className="flex flex-col gap-6">
+          {PALETTE.map((hue) => (
+            <div key={hue.id} className="flex flex-col gap-2">
+              <div className="flex flex-wrap items-baseline gap-2">
+                <h3 className="text-body text-primary">{hue.id}</h3>
+                <span className="text-body-sm text-tertiary">
+                  {hue.usedBy ? `drawn from by ${hue.usedBy}` : "unassigned"}
+                </span>
+              </div>
+              <div className="flex gap-1">
+                {hue.steps.map((step) => (
+                  <div
+                    key={step.variable}
+                    className="flex min-w-0 flex-1 flex-col gap-1"
+                  >
+                    <div
+                      className="h-10 rounded-md border border-tertiary"
+                      style={{ background: `var(${step.variable})` }}
+                    />
+                    <span className="text-center text-body-sm text-tertiary">
+                      {step.step}
+                    </span>
+                  </div>
+                ))}
+              </div>
+            </div>
+          ))}
+        </div>
+      </Section>
+
+      <Section
+        title="Layer 1 — families"
+        description="The jobs a hue does. Five per coloured family — tint, tint-hover, border, fill, text — each pointing at a palette step, so changing the accent means pointing five names at a different hue. Steps are named for their job rather than numbered, because a number reads as a lightness and means a role. Components never reference these."
       >
         <div className="flex flex-col gap-8">
           {RAMPS.map((ramp) => (
@@ -77,8 +112,16 @@ export function ColourPage() {
                   <Swatch
                     key={step.variable}
                     variable={step.variable}
-                    label={`${ramp.id} ${step.step}`}
-                    sublabel={step.job}
+                    label={
+                      step.palette
+                        ? `${ramp.id}-${step.job.split(" — ")[0]}`
+                        : `${ramp.id} ${step.step}`
+                    }
+                    sublabel={
+                      step.palette
+                        ? `${step.job.split(" — ")[1]} · palette step ${step.step}`
+                        : step.job
+                    }
                     translucent={ramp.translucent}
                   />
                 ))}
@@ -89,8 +132,8 @@ export function ColourPage() {
       </Section>
 
       <Section
-        title="Layer 2 — public roles"
-        description="The only layer a screen may use. Every role points at a ramp step, so changing a theme is a change of values rather than a change of code."
+        title="Layer 2 — roles"
+        description="The only layer a screen may use. Every role points at a family step or a neutral step, so changing a theme is a change of values rather than a change of code."
       >
         <div className="flex flex-col gap-8">
           {ROLE_GROUPS.map((group) => (
@@ -113,7 +156,7 @@ export function ColourPage() {
 
       <Section
         title="Deliberate exceptions"
-        description="Literal values exist only in the ramps, and nothing above a ramp holds one — except these. The list is short and complete on purpose: a vague exception policy is how a layered system quietly erodes."
+        description="Literal values exist only in the palette, and nothing above it holds one — except these. The list is short and complete on purpose: a vague exception policy is how a layered system quietly erodes."
       >
         {/* No swatch here to do the separating, so these entries keep a little
             structure — the token name leads and the spacing groups it with its

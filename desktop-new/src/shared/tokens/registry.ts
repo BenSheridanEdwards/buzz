@@ -21,6 +21,8 @@ export interface RampStep {
   job: string;
   /** The CSS custom property, without `var()`. */
   variable: string;
+  /** The palette step this resolves to, when the ramp is a family. */
+  palette?: string;
 }
 
 /** A private ramp. */
@@ -72,33 +74,86 @@ const NEUTRAL_JOBS = [
   "border",
   "border hover",
   "solid fill",
-  "solid fill hover",
+  "secondary text",
   "dark fill",
   "high-contrast text",
 ];
 
-/** The five accent steps any role points at. The rest exist so the ramp is
- *  complete and interpolation stays even. */
-const IDENTITY_STEPS: Array<[number, string]> = [
-  [2, "tinted surface"],
-  [3, "tint hover / selected"],
-  [8, "border, focus ring"],
-  [9, "solid fill"],
-  [11, "accent text"],
+/**
+ * The five jobs every coloured family does, and the palette step each takes.
+ *
+ * Named rather than numbered, because a number invited reading `--accent-2` as
+ * "a light purple" when it means "the surface an accent tint sits on". The step
+ * numbers are the palette position, shown so the ramp relationship stays legible.
+ *
+ * Text takes step 12, not the 11 Radix names "low-contrast text": Radix sizes 11
+ * for WCAG 4.5:1, and every hue's step 11 measured Lc 55-61 against this
+ * system's Lc 60 target on the surfaces these roles must clear.
+ */
+const FAMILY_JOBS: Array<[string, number, string]> = [
+  ["tint", 3, "tinted surface"],
+  ["tint-hover", 4, "tint hover / selected"],
+  ["border", 8, "border, focus ring"],
+  ["fill", 9, "solid fill"],
+  ["text", 12, "text on a tint or a neutral surface"],
 ];
 
-function identityRamp(id: string, name: string, description: string): Ramp {
+function identityRamp(
+  id: string,
+  name: string,
+  description: string,
+  hue: string,
+): Ramp {
   return {
     id,
     name,
     description,
-    steps: IDENTITY_STEPS.map(([step, job]) => ({
+    steps: FAMILY_JOBS.map(([job, step, use]) => ({
       step,
-      job,
-      variable: `--${id}-${step}`,
+      job: `${job} — ${use}`,
+      variable: `--${id}-${job}`,
+      palette: `--palette-${hue}-${step}`,
     })),
   };
 }
+
+/** A palette hue: twelve steps, authored per mode. The bottom layer. */
+export interface PaletteHue {
+  id: string;
+  /** Which family, if any, currently draws from this hue. */
+  usedBy?: string;
+  steps: Array<{ step: number; variable: string }>;
+}
+
+/**
+ * Every hue in the palette.
+ *
+ * The layer beneath the families, and the only place a literal colour lives.
+ * Values are Radix Colors (MIT), transcribed rather than depended on — Radix is
+ * not on Block's Tech Radar, so this is a values-only copy with no package.
+ *
+ * It exists for two reasons. The families above it were 114 hand-picked hex
+ * values with nothing enforcing that two tokens doing the same job agreed, and
+ * they drifted. And a hue's dark steps are not its light steps dimmed: reaching
+ * for a subtler dark purple by writing `purple-950/50` in a component put a real
+ * colour decision somewhere it could not be named, paired, or measured.
+ */
+export const PALETTE: PaletteHue[] = [
+  { id: "gray", usedBy: "neutral", steps: [] },
+  { id: "purple", usedBy: "accent", steps: [] },
+  { id: "red", usedBy: "danger", steps: [] },
+  { id: "green", usedBy: "success", steps: [] },
+  { id: "amber", usedBy: "warning", steps: [] },
+  { id: "blue", usedBy: "info", steps: [] },
+  { id: "cyan", steps: [] },
+  { id: "orange", steps: [] },
+].map((hue) => ({
+  ...hue,
+  steps: Array.from({ length: 12 }, (_, i) => ({
+    step: i + 1,
+    variable: `--palette-${hue.id}-${i + 1}`,
+  })),
+}));
 
 export const RAMPS: Ramp[] = [
   {
@@ -115,16 +170,18 @@ export const RAMPS: Ramp[] = [
   identityRamp(
     "accent",
     "Accent — a slot, not a colour",
-    "Nothing above this ramp knows the hue, so the accent can change, become a person's preference, or vary per theme without a single component changing. Step 9 barely moves between modes because a saturated fill reads on white and on near-black; step 11 inverts direction to stay readable.",
+    "Nothing above this family knows the hue, so the accent can change, become a person's preference, or vary per theme without a single component changing. Point the five steps at a different palette hue and every role follows.",
+    "purple",
   ),
   identityRamp(
     "danger",
     "Danger",
     "The same five jobs as accent. Learning one family teaches all of them.",
+    "red",
   ),
-  identityRamp("success", "Success", "The same five jobs as accent."),
-  identityRamp("warning", "Warning", "The same five jobs as accent."),
-  identityRamp("info", "Info", "The same five jobs as accent."),
+  identityRamp("success", "Success", "The same five jobs as accent.", "green"),
+  identityRamp("warning", "Warning", "The same five jobs as accent.", "amber"),
+  identityRamp("info", "Info", "The same five jobs as accent.", "blue"),
   {
     id: "glass",
     name: "Glass",
@@ -158,7 +215,7 @@ function identityGroup(
       {
         token: `bg-${id}`,
         variable: `--bg-${id}`,
-        pointsAt: `${id} 9`,
+        pointsAt: `${id} fill`,
         use: "The solid fill: primary buttons, active toggles. Takes its paired text.",
         status: "core",
       },
@@ -174,28 +231,28 @@ function identityGroup(
       {
         token: `text-${id}`,
         variable: `--text-${id}`,
-        pointsAt: `${id} 11`,
+        pointsAt: `${id} text`,
         use: "Coloured text on a neutral background: links, labels.",
         status: "core",
       },
       {
         token: `bg-${id}-tint`,
         variable: `--bg-${id}-tint`,
-        pointsAt: `${id} 2`,
+        pointsAt: `${id} tint`,
         use: "A tinted surface carrying meaning: chips, callouts, selected rows. Takes coloured text.",
         status: "core",
       },
       {
         token: `bg-${id}-tint-hover`,
         variable: `--bg-${id}-tint-hover`,
-        pointsAt: `${id} 3`,
+        pointsAt: `${id} tint-hover`,
         use: "That tinted surface hovered or selected.",
         status: "core",
       },
       {
         token: `border-${id}`,
         variable: `--border-${id}`,
-        pointsAt: `${id} 8`,
+        pointsAt: `${id} border`,
         use: "Focus rings and active borders.",
         status: "core",
       },
@@ -394,7 +451,7 @@ export const ROLE_GROUPS: RoleGroup[] = [
       {
         token: "ring-focus",
         variable: "--ring-focus",
-        pointsAt: "accent 8",
+        pointsAt: "accent border",
         use: "The keyboard focus ring.",
         status: "core",
       },
