@@ -41,6 +41,11 @@ import { parseImetaTags } from "@/shared/ui/markdown/parseImeta";
 import { useMessageEmoji } from "@/features/messages/lib/useMessageEmoji";
 import { parseWaveMessageContent } from "@/features/messages/lib/waveMessage";
 import { resolveSnapshotSharedBy } from "@/features/messages/lib/snapshotSharedBy";
+import {
+  isVoiceNoteAttachment,
+  splitVoiceNoteTranscript,
+} from "@/features/messages/lib/audioAttachment";
+import type { VoiceNoteCardContext } from "@/shared/ui/markdown/types";
 import { resolveMentionProps } from "@/shared/lib/resolveMentionNames";
 import type { VideoReviewContext } from "@/shared/ui/VideoPlayer";
 import { VideoReviewCommentMarkdown } from "@/shared/ui/VideoReviewCommentMarkdown";
@@ -302,7 +307,40 @@ export const MessageRow = React.memo(
     );
     const bodyOffsetClass = emojiOnly ? "mt-1" : "mt-conversation-body";
 
-    const { nonDmChannelNames: channelNames } = useChannelNavigation();
+    const { channels, nonDmChannelNames: channelNames } =
+      useChannelNavigation();
+    // A voice note carries its accompanying prose inside the card as the
+    // transcript, so the body handed to Markdown keeps only the link.
+    const voiceNotePresentation = React.useMemo<{
+      content: string;
+      voiceNoteCard: VoiceNoteCardContext;
+    } | null>(() => {
+      if (!imetaByUrl) return null;
+      let hasVoiceNote = false;
+      for (const entry of imetaByUrl.values()) {
+        if (isVoiceNoteAttachment(entry)) {
+          hasVoiceNote = true;
+          break;
+        }
+      }
+      if (!hasVoiceNote) return null;
+      const split = splitVoiceNoteTranscript(message.body, (url) =>
+        isVoiceNoteAttachment(imetaByUrl.get(url)),
+      );
+      const conversation =
+        channels.find((channel) => channel.id === channelId)?.channelType ===
+        "dm"
+          ? "dm"
+          : "channel";
+      return {
+        content: split?.content ?? message.body,
+        voiceNoteCard: {
+          conversation,
+          sender: message.author,
+          transcript: split?.transcript,
+        },
+      };
+    }, [channelId, channels, imetaByUrl, message.author, message.body]);
 
     const indentRem = getThreadReplyIndentRem(message.depth);
     const descendantGuideOffsetRem = connectDescendants
@@ -430,7 +468,7 @@ export const MessageRow = React.memo(
                 message,
                 isKnownAgentPubkey,
               )}
-              content={message.body}
+              content={voiceNotePresentation?.content ?? message.body}
               messageId={message.id}
               linkPreviewsSuppressed={linkPreviewsSuppressed}
               linkPreviewTags={message.tags}
@@ -445,6 +483,7 @@ export const MessageRow = React.memo(
               snapshotSharedBy={snapshotSharedBy}
               videoReviewCommentRootId={videoReviewCommentRootId}
               videoReviewContext={videoReviewContext}
+              voiceNoteCard={voiceNotePresentation?.voiceNoteCard}
             />
           );
         }

@@ -14,6 +14,46 @@ async function openMoreActionsMenu(page: Page, messageId: string) {
   await expect(page.locator('[role="menuitem"]').first()).toBeVisible();
 }
 
+/**
+ * Start a hands-free recording from the keyboard: Enter on the focused mic is
+ * the click-activation path (no pointer hold to release), so the note waits
+ * for an explicit Send. Pointer holds live in voice-note-recorder.spec.ts.
+ */
+async function startLockedRecording(page: Page) {
+  const mic = page.getByRole("button", { name: "Record voice note" });
+  await mic.focus();
+  await page.keyboard.press("Enter");
+  await expect(page.getByTestId("voice-note-recorder")).toBeVisible();
+}
+
+async function emitVoiceNoteMessage(
+  page: Page,
+  channelName: string,
+  audioUrl: string,
+  transcript?: string,
+) {
+  await page.evaluate(
+    ({ audioUrl, channelName, transcript }) => {
+      const emit = window.__BUZZ_E2E_EMIT_MOCK_MESSAGE__;
+      if (!emit) throw new Error("Mock message emitter is unavailable.");
+      emit({
+        channelName,
+        content: `${transcript ? `${transcript}\n` : ""}[voice-note-123.mp4](${audioUrl})`,
+        extraTags: [
+          [
+            "imeta",
+            `url ${audioUrl}`,
+            "m video/mp4",
+            "duration 9.4",
+            "filename voice-note-123.mp4",
+          ],
+        ],
+      });
+    },
+    { audioUrl, channelName, transcript },
+  );
+}
+
 async function waitForMockLiveSubscription(page: Page, channelName: string) {
   await expect
     .poll(() =>
@@ -35,6 +75,11 @@ async function waitForMockLiveSubscription(page: Page, channelName: string) {
 }
 
 test.beforeEach(async ({ page }, testInfo) => {
+  // These specs exercise the review flow (finished note waits in the composer
+  // for Send). Release-sends coverage lives in voice-note-recorder.spec.ts.
+  await page.addInitScript(() => {
+    window.localStorage.setItem("buzz.voiceNote.reviewBeforeSend", "on");
+  });
   await page.addInitScript(() => {
     Object.defineProperty(navigator.mediaDevices, "getUserMedia", {
       configurable: true,
@@ -85,10 +130,9 @@ test("restores the voice note and shows a send error after upload succeeds", asy
   await expect(channel).toBeVisible({ timeout: 10_000 });
   await channel.click();
 
-  await page.getByRole("button", { name: "Record voice note" }).click();
-  await expect(page.getByTestId("voice-note-recorder")).toBeVisible();
+  await startLockedRecording(page);
   await page.waitForTimeout(100);
-  await page.getByRole("button", { name: "Finish voice note" }).click();
+  await page.getByRole("button", { name: "Send voice note" }).click();
 
   const composerCard = page.getByTestId("composer-voice-note-card");
   await expect(composerCard).toBeVisible();
@@ -106,11 +150,10 @@ test("keeps pasted snapshots and channel drops out of an active voice note", asy
   await page.goto("/");
   await page.getByTestId("channel-general").click();
 
-  await page.getByRole("button", { name: "Record voice note" }).click();
-  await expect(page.getByTestId("voice-note-recorder")).toBeVisible();
+  await startLockedRecording(page);
   await page.waitForTimeout(100);
 
-  await page.getByRole("button", { name: "Finish voice note" }).click();
+  await page.getByRole("button", { name: "Send voice note" }).click();
   await expect(page.getByTestId("composer-voice-note-card")).toBeVisible();
 
   await page
@@ -168,8 +211,7 @@ test("discards an active recording when entering edit mode", async ({
   await page.goto("/");
   await page.getByTestId("channel-general").click();
 
-  await page.getByRole("button", { name: "Record voice note" }).click();
-  await expect(page.getByTestId("voice-note-recorder")).toBeVisible();
+  await startLockedRecording(page);
 
   await openMoreActionsMenu(page, "mock-general-welcome");
   await page.getByTestId("edit-message-mock-general-welcome").click();
@@ -200,12 +242,12 @@ test("editor Enter never saves an edit while a voice note is recording", async (
   await page.keyboard.press("ControlOrMeta+A");
   await page.keyboard.type(editedContent);
 
-  await page.getByRole("button", { name: "Record voice note" }).click();
-  await expect(page.getByTestId("voice-note-recorder")).toBeVisible();
+  await startLockedRecording(page);
   await page.waitForTimeout(100);
 
-  // The editor's Enter shortcut must not slip past the Finish/Discard flow: the
+  // The editor's Enter shortcut must not slip past the Send/Discard flow: the
   // edit stays unsaved and the recording stays live until explicitly resolved.
+  await input.focus();
   await input.press("Enter");
 
   await expect(page.getByTestId("edit-target")).toBeVisible();
@@ -214,8 +256,8 @@ test("editor Enter never saves an edit while a voice note is recording", async (
     editedContent,
   );
 
-  // Finishing the recording still works, proving the note was never discarded.
-  await page.getByRole("button", { name: "Finish voice note" }).click();
+  // Sending the recording still works, proving the note was never discarded.
+  await page.getByRole("button", { name: "Send voice note" }).click();
   await expect(page.getByTestId("composer-voice-note-card")).toBeVisible();
 });
 
@@ -241,10 +283,9 @@ test("discards while voice-note processing is pending", async ({ page }) => {
   await page.getByTestId("channel-general").click();
 
   const discardPendingRecording = async (keyboard: boolean) => {
-    await page.getByRole("button", { name: "Record voice note" }).click();
-    await expect(page.getByTestId("voice-note-recorder")).toBeVisible();
+    await startLockedRecording(page);
     await page.waitForTimeout(100);
-    await page.getByRole("button", { name: "Finish voice note" }).click();
+    await page.getByRole("button", { name: "Send voice note" }).click();
     await expect(page.getByText("Preparing voice note…")).toBeVisible();
     const discard = page.getByRole("button", { name: "Discard voice note" });
     await expect(discard).toBeEnabled();
@@ -599,9 +640,15 @@ test("records from the composer and renders an inline waveform card", async ({
   expect(recordBox?.x).toBeGreaterThan(attachBox?.x ?? 0);
   expect(recordBox?.x).toBeLessThan(emojiBox?.x ?? Number.POSITIVE_INFINITY);
 
-  await record.click();
+  await startLockedRecording(page);
   const recorder = page.getByTestId("voice-note-recorder");
   await expect(recorder).toBeVisible();
+  // Keyboard activation has no release to wait for, so it starts locked.
+  await expect(recorder).toHaveAttribute("data-voice-note-state", "locked");
+  await expect(page.getByTestId("voice-note-lock-chip")).toHaveAttribute(
+    "data-locked",
+    "true",
+  );
   await expect(
     page.getByRole("status", { name: "Recording voice note" }),
   ).toHaveCount(0);
@@ -618,8 +665,10 @@ test("records from the composer and renders an inline waveform card", async ({
     (recorderBox?.x ?? 0) + 1,
   );
   await expect(recorder).toContainText(/\d+:\d{2} \/ 5:00/);
-  const finish = page.getByRole("button", { name: "Finish voice note" });
+  const finish = page.getByRole("button", { name: "Send voice note" });
   await expect(finish).toBeEnabled();
+  await expect(finish).toHaveAttribute("data-voice-note-locked", "true");
+  await expect(finish).toHaveText("Send");
   const liveWaveform = page.getByTestId("voice-note-live-waveform");
   const firstRecordedSample = liveWaveform.locator(
     '[data-waveform-sample="recorded-0"]',
@@ -790,12 +839,24 @@ test("records from the composer and renders an inline waveform card", async ({
   ).toBeVisible();
   await expect(card).toContainText(/\d+:\d{2}/);
   await expect(card).not.toContainText(/· Voice note/);
+  await expect(card.getByTestId("voice-note-sender")).toHaveText(
+    (
+      await page.locator('[data-testid="message-author"]').last().innerText()
+    ).trim(),
+  );
+  // Current / total: the tagged 9.4s is replaced by the real clip length once
+  // the media element reports its duration.
+  await expect(card.getByTestId("voice-note-time")).toHaveText(
+    /^0:00 \/ 0:0\d$/,
+  );
   const playbackRate = card.getByTestId("voice-note-playback-rate");
   const playbackRateValue = card.getByTestId("voice-note-playback-rate-value");
-  await expect(playbackRate).toHaveCSS("opacity", "0");
-  await waitForAnimations(page);
-  await card.hover();
+  // The speed pill is always visible, not a hover reveal.
   await expect(playbackRate).toHaveCSS("opacity", "1");
+  await expect(playbackRate).toHaveAccessibleName(
+    "Playback speed 1x; next 1.5x",
+  );
+  await waitForAnimations(page);
   await expectSmoothCorners(playbackRate);
   await expect(playbackRate).toHaveCSS("padding-left", "10px");
   await expect(playbackRate).toHaveCSS("padding-top", "2px");
@@ -818,26 +879,59 @@ test("records from the composer and renders an inline waveform card", async ({
     widestPlaybackRateWidth,
   );
   await expect(card.locator("audio")).toHaveJSProperty("playbackRate", 1.5);
+  await expect(playbackRate).toHaveAccessibleName(
+    "Playback speed 1.5x; next 2x",
+  );
   await playbackRate.click();
   await expect(playbackRateValue).toHaveText("2×");
   expect((await playbackRate.boundingBox())?.width).toBe(
     widestPlaybackRateWidth,
   );
-  await playbackRate.click();
-  await expect(playbackRateValue).toHaveText(".5×");
-  expect((await playbackRate.boundingBox())?.width).toBe(
-    widestPlaybackRateWidth,
-  );
+  await expect(card.locator("audio")).toHaveJSProperty("playbackRate", 2);
   await playbackRate.click();
   await expect(playbackRateValue).toHaveText("1×");
+  await expect(card.locator("audio")).toHaveJSProperty("playbackRate", 1);
 
   const slider = card.getByRole("slider", {
     name: "Voice note playback position",
   });
-  await slider.focus();
+  // The range input is the single scrub control: invisible until keyboard
+  // focus reaches it, then the waveform shows a focus ring.
+  await expect(slider).toHaveCSS("opacity", "0");
+  await playbackRate.focus();
+  await page.keyboard.press("Shift+Tab");
+  await expect(slider).toBeFocused();
   await expect(card.getByTestId("voice-note-playback-waveform")).toHaveCSS(
     "box-shadow",
     /rgb/,
+  );
+  // Arrow keys scrub in whole seconds (Shift: five), clamped to the clip.
+  const readScrub = () =>
+    slider.evaluate((element: HTMLInputElement) => ({
+      max: Number(element.max),
+      value: Number(element.value),
+    }));
+  const total = (await readScrub()).max;
+  await page.keyboard.press("ArrowRight");
+  await expect
+    .poll(async () => (await readScrub()).value)
+    .toBeCloseTo(Math.min(1, total), 2);
+  await expect(card.getByTestId("voice-note-time")).toHaveText(
+    /^0:0\d \/ 0:0\d$/,
+  );
+  await page.keyboard.press("Home");
+  await expect.poll(async () => (await readScrub()).value).toBe(0);
+  await page.keyboard.press("Shift+ArrowRight");
+  await expect
+    .poll(async () => (await readScrub()).value)
+    .toBeCloseTo(Math.min(5, total), 2);
+  await page.keyboard.press("End");
+  await expect
+    .poll(async () => (await readScrub()).value)
+    .toBeCloseTo(total, 2);
+  await page.keyboard.press("Home");
+  await expect(card.getByTestId("voice-note-time")).toHaveText(
+    /^0:00 \/ 0:0\d$/,
   );
   await slider.evaluate((element: HTMLInputElement) => {
     element.value = String(Number(element.max) / 2);
@@ -872,9 +966,9 @@ test("keeps emoji available but blocks GIFs beside a queued voice note", async (
 
   await page.goto("/");
   await page.getByTestId("channel-general").click();
-  await page.getByRole("button", { name: "Record voice note" }).click();
+  await startLockedRecording(page);
   await page.waitForTimeout(100);
-  await page.getByRole("button", { name: "Finish voice note" }).click();
+  await page.getByRole("button", { name: "Send voice note" }).click();
   await expect(page.getByTestId("composer-voice-note-card")).toBeVisible();
 
   const pickerButton = page.getByTestId("composer-emoji-button");
@@ -933,4 +1027,97 @@ test("starting a duplicate voice-note player pauses the other instance", async (
   await cards.nth(1).getByRole("button", { name: "Play voice note" }).click();
   await expect(firstAudio).toHaveJSProperty("paused", true);
   await expect(secondAudio).toHaveJSProperty("paused", false);
+});
+
+test("received card titles the sender and folds the transcript in a channel", async ({
+  page,
+}) => {
+  await page.goto("/");
+  await page.getByTestId("channel-general").click();
+  await waitForMockLiveSubscription(page, "general");
+  const transcript = "Status is green on the Studio. Say the word.";
+  await emitVoiceNoteMessage(page, "general", AUDIO_URL, transcript);
+
+  const card = page.getByTestId("audio-message-attachment").last();
+  await expect(card).toBeVisible();
+  const row = page.locator("[data-message-id]").filter({ has: card });
+  const author = (
+    await row.locator('[data-testid="message-author"]').first().innerText()
+  ).trim();
+  expect(author.length).toBeGreaterThan(0);
+  await expect(card.getByTestId("voice-note-sender")).toHaveText(author);
+  // Current / total: the tagged 9.4s is replaced by the real clip length once
+  // the media element reports its duration.
+  await expect(card.getByTestId("voice-note-time")).toHaveText(
+    /^0:00 \/ 0:0\d$/,
+  );
+  // The prose lives in the card, not as a separate paragraph above it.
+  await expect(row.locator("p").filter({ hasText: transcript })).toHaveCount(1);
+
+  const toggle = card.getByRole("button", { name: "Transcript" });
+  const text = card.getByTestId("voice-note-transcript-text");
+  await expect(toggle).toHaveAttribute("aria-expanded", "false");
+  await expect(toggle).toHaveAttribute("aria-controls", /.+/);
+  await expect(text).toBeHidden();
+  await expect(text).toHaveAttribute(
+    "id",
+    (await toggle.getAttribute("aria-controls")) ?? "",
+  );
+
+  await toggle.focus();
+  await page.keyboard.press("Enter");
+  await expect(toggle).toHaveAttribute("aria-expanded", "true");
+  await expect(text).toBeVisible();
+  await expect(text).toHaveText(transcript);
+  expect(
+    await page.evaluate(() =>
+      window.localStorage.getItem("buzz.voiceNote.transcriptOpen"),
+    ),
+  ).toBe("open");
+  await waitForAnimations(page);
+  await card.screenshot({
+    path: "test-results/voice-note/voice-note-card-transcript.png",
+  });
+
+  // The last choice survives a reload.
+  await page.reload();
+  await page.getByTestId("channel-general").click();
+  await waitForMockLiveSubscription(page, "general");
+  await emitVoiceNoteMessage(page, "general", AUDIO_URL, transcript);
+  const reloadedCard = page.getByTestId("audio-message-attachment").last();
+  await expect(
+    reloadedCard.getByRole("button", { name: "Transcript" }),
+  ).toHaveAttribute("aria-expanded", "true");
+  await reloadedCard.getByRole("button", { name: "Transcript" }).click();
+  expect(
+    await page.evaluate(() =>
+      window.localStorage.getItem("buzz.voiceNote.transcriptOpen"),
+    ),
+  ).toBe("closed");
+
+  // No accompanying text: no Transcript row at all.
+  await emitVoiceNoteMessage(page, "general", AUDIO_URL);
+  const bareCard = page.getByTestId("audio-message-attachment").last();
+  await expect(bareCard).toBeVisible();
+  await expect(bareCard.getByTestId("voice-note-transcript")).toHaveCount(0);
+});
+
+test("received card opens the transcript by default in a DM", async ({
+  page,
+}) => {
+  await page.goto("/");
+  await page.getByTestId("dm-list").getByTestId("channel-alice-tyler").click();
+  await waitForMockLiveSubscription(page, "alice-tyler");
+  await emitVoiceNoteMessage(
+    page,
+    "alice-tyler",
+    AUDIO_URL,
+    "Chief, it's Neo. Two things need your eyes.",
+  );
+
+  const card = page.getByTestId("audio-message-attachment").last();
+  await expect(card).toBeVisible();
+  const toggle = card.getByRole("button", { name: "Transcript" });
+  await expect(toggle).toHaveAttribute("aria-expanded", "true");
+  await expect(card.getByTestId("voice-note-transcript-text")).toBeVisible();
 });

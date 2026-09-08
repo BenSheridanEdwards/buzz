@@ -1,6 +1,10 @@
 import * as React from "react";
 import { ChevronDown, Play, Trash2, Upload, Volume2 } from "lucide-react";
 
+import {
+  setVoiceNoteReviewEnabled,
+  useVoiceNoteReviewEnabled,
+} from "@/features/messages/lib/voiceNoteReviewPreference";
 import { invokeTauri } from "@/shared/api/tauri";
 import { cn } from "@/shared/lib/cn";
 import { Button } from "@/shared/ui/button";
@@ -54,6 +58,7 @@ export function VoiceSettingsCard() {
   const [deleteCandidate, setDeleteCandidate] =
     React.useState<VoiceRegistryEntry | null>(null);
   const [error, setError] = React.useState<string | null>(null);
+  const reviewVoiceNotes = useVoiceNoteReviewEnabled();
 
   React.useEffect(() => {
     let disposed = false;
@@ -216,6 +221,32 @@ export function VoiceSettingsCard() {
               onCheckedChange={(checked) => {
                 if (settings) void saveEnabled(checked);
               }}
+            />
+          </SettingsOptionRow>
+        </SettingsOptionGroup>
+
+        <SettingsOptionGroup title="Voice notes">
+          <SettingsOptionRow>
+            <div className="min-w-0">
+              <label
+                className="text-sm font-medium"
+                htmlFor="voice-note-review-switch"
+              >
+                Review before sending
+              </label>
+              <p
+                className="text-sm text-muted-foreground/70"
+                data-settings-subcopy
+              >
+                Listen back and re-record a voice note before it goes out. Off
+                sends as soon as you release the mic.
+              </p>
+            </div>
+            <Switch
+              checked={reviewVoiceNotes}
+              data-testid="voice-note-review-toggle"
+              id="voice-note-review-switch"
+              onCheckedChange={setVoiceNoteReviewEnabled}
             />
           </SettingsOptionRow>
         </SettingsOptionGroup>

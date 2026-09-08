@@ -1232,6 +1232,7 @@ export function createMarkdownComponents(
       relayOrigin,
       resolveChannelReferences,
       snapshotSharedBy,
+      voiceNoteCard,
     } = useMarkdownRuntime();
     if (!interactive) {
       return <span className="font-medium text-current">{children}</span>;
@@ -1249,6 +1250,7 @@ export function createMarkdownComponents(
       href && isRelayDownloadable(href, relayOrigin ?? undefined)
         ? href
         : undefined,
+      voiceNoteCard,
     );
     if (audioAttachment) return audioAttachment;
 
@@ -1695,6 +1697,7 @@ function MarkdownInner({
   searchQuery,
   snapshotSharedBy,
   videoReviewContext,
+  voiceNoteCard,
 }: MarkdownProps) {
   const { channels: rawChannels } = useChannelNavigation();
   const channels = useStableArray(rawChannels);
@@ -1743,6 +1746,7 @@ function MarkdownInner({
       relayOrigin,
       resolveChannelReferences: true,
       snapshotSharedBy,
+      voiceNoteCard,
       onImportSnapshotFromUrl: (
         fileBytes: number[],
         fileName: string,
@@ -1763,6 +1767,7 @@ function MarkdownInner({
       onOpenMessageLink,
       relayOrigin,
       snapshotSharedBy,
+      voiceNoteCard,
       goAgents,
     ],
   );
