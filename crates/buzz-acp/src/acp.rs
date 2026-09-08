@@ -1774,7 +1774,17 @@ impl AcpClient {
                     .get("kind")
                     .and_then(|v| v.as_str())
                     .unwrap_or("unknown");
-                tracing::info!(target: "buzz_acp::acp::tool", "tool_call: {title} ({kind})");
+                // Debug, not info, for the same reason as the reply chunk
+                // above: the desktop persists this child's stdout to a
+                // per-agent log file under `RUST_LOG=buzz_acp=info`, and
+                // engines build these titles by interpolating the tool
+                // arguments. Hermes puts the shell command, the file path,
+                // the grep pattern or the search query (model text derived
+                // from the user's message) straight into the title. The
+                // desktop transcript renders tool cards from the observer
+                // stream, not from this line. `tool_call_update` below stays
+                // at info: it carries only an id and a status.
+                tracing::debug!(target: "buzz_acp::acp::tool", "tool_call: {title} ({kind})");
                 true
             }
             "tool_call_update" => {

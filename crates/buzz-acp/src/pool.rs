@@ -6888,38 +6888,59 @@ done"#
         rest_stub: tokio::task::JoinHandle<()>,
     }
 
-    /// Build a [`FirstPromptHarness`] for `protocol_version`.
-    ///
-    /// `chunk_text`, when set, makes the scripted engine emit an
-    /// `agent_message_chunk` session update ahead of each turn result, the
-    /// notification a real engine streams as it composes its reply.
+    /// The `session/update` notifications the scripted engine streams ahead of
+    /// each turn result, as a real engine does while it works.
+    #[derive(Default)]
+    struct ScriptedUpdates<'a> {
+        /// Text of an `agent_message_chunk`, the engine composing its reply.
+        chunk_text: Option<&'a str>,
+        /// Title of a `tool_call`, the string engines build by interpolating
+        /// the tool's arguments.
+        tool_call_title: Option<&'a str>,
+    }
+
+    /// Build a [`FirstPromptHarness`] for `protocol_version`, with the scripted
+    /// engine emitting `updates` ahead of each turn result.
     async fn spawn_first_prompt_harness(
         protocol_version: u32,
-        chunk_text: Option<&str>,
+        updates: ScriptedUpdates<'_>,
     ) -> FirstPromptHarness {
         use crate::relay::RestClient;
 
         let capture_dir = tempfile::tempdir().expect("capture tempdir");
         let capture = capture_dir.path().join("acp-requests.ndjson");
         let quoted_capture = capture.to_string_lossy().replace('\'', "'\\''");
-        let chunk = chunk_text
-            .map(|text| {
-                let notification = serde_json::json!({
-                    "jsonrpc": "2.0",
-                    "method": "session/update",
-                    "params": {
-                        "sessionId": "sess-spawn",
-                        "update": {
-                            "sessionUpdate": "agent_message_chunk",
-                            "content": {"type": "text", "text": text},
-                        },
-                    },
-                })
-                .to_string()
-                .replace('\'', "'\\''");
-                format!("printf '%s\\n' '{notification}'\n       ")
+        // One `printf` per scripted notification, shell-quoted into the script.
+        let notify = |update: serde_json::Value| {
+            let notification = serde_json::json!({
+                "jsonrpc": "2.0",
+                "method": "session/update",
+                "params": {"sessionId": "sess-spawn", "update": update},
             })
-            .unwrap_or_default();
+            .to_string()
+            .replace('\'', "'\\''");
+            format!("printf '%s\\n' '{notification}'\n       ")
+        };
+        let scripted_updates: String = [
+            updates.chunk_text.map(|text| {
+                notify(serde_json::json!({
+                    "sessionUpdate": "agent_message_chunk",
+                    "content": {"type": "text", "text": text},
+                }))
+            }),
+            updates.tool_call_title.map(|title| {
+                notify(serde_json::json!({
+                    "sessionUpdate": "tool_call",
+                    "toolCallId": "tool-spawn-1",
+                    "title": title,
+                    "kind": "execute",
+                    "status": "pending",
+                }))
+            }),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
         // Scripted engine: `session/new` gets a session id, every other
         // request (the prompts) ends its turn. Request ids are sequential
         // from 0, matching the client's allocation.
@@ -6931,7 +6952,7 @@ while IFS= read -r line; do
   count=$((count + 1))
   case "$line" in
     *'"session/new"'*) printf '%s\n' '{{"jsonrpc":"2.0","id":'"$id"',"result":{{"sessionId":"sess-spawn"}}}}' ;;
-    *) {chunk}printf '%s\n' '{{"jsonrpc":"2.0","id":'"$id"',"result":{{"stopReason":"end_turn"}}}}' ;;
+    *) {scripted_updates}printf '%s\n' '{{"jsonrpc":"2.0","id":'"$id"',"result":{{"stopReason":"end_turn"}}}}' ;;
   esac
 done"#
         );
@@ -7088,7 +7109,12 @@ done"#
     async fn capture_events<F: std::future::Future<Output = ()>>(f: F) -> Vec<CapturedEvent> {
         static INSTALL: std::sync::Once = std::sync::Once::new();
         INSTALL.call_once(|| {
-            let _ = tracing::subscriber::set_global_default(ThreadCaptureSubscriber);
+            // Not `let _ =`: the `Once` already guarantees a single call, so a
+            // failure here can only mean another test installed its own global
+            // subscriber first. Swallowed, that surfaces as an empty capture
+            // and an assertion failure naming production code that is fine.
+            tracing::subscriber::set_global_default(ThreadCaptureSubscriber)
+                .expect("capture subscriber must be the process-wide default");
             tracing::callsite::rebuild_interest_cache();
         });
         CAPTURED_EVENTS.with(|slot| *slot.borrow_mut() = Some(Vec::new()));
@@ -7126,7 +7152,7 @@ done"#
                 capture,
                 _capture_dir,
                 rest_stub,
-            } = spawn_first_prompt_harness(protocol_version, None).await;
+            } = spawn_first_prompt_harness(protocol_version, ScriptedUpdates::default()).await;
             let (result_tx, mut result_rx) = mpsc::unbounded_channel();
 
             let message_m = "M-9f3a: what is the fleet status right now?";
@@ -7308,19 +7334,23 @@ done"#
     /// rotated at the next launch. That directive admits every `buzz_acp::*`
     /// target, so the emitted level is the only thing keeping a line off disk.
     ///
-    /// Message bodies must stay below it: neither the agent's reply chunks
-    /// (`buzz_acp::acp::stream`) nor the slash-command pass-through line, which
-    /// carries the whole message text after the command word, nor the
-    /// `sections` field, whose first entry is the bare command block on a
-    /// pass-through turn.
+    /// Message bodies and the text an agent derives from them must stay below
+    /// it: not the agent's reply chunks (`buzz_acp::acp::stream`), not the
+    /// slash-command pass-through line, which carries the whole message text
+    /// after the command word, not the `sections` field, whose first entry is
+    /// the bare command block on a pass-through turn, and not tool-call titles
+    /// (`buzz_acp::acp::tool`), which engines build by interpolating the tool
+    /// arguments: for Hermes the shell command, the file path, the grep
+    /// pattern or the search query.
     ///
-    /// Falsifiable in both directions: the same turn must still emit both lines
-    /// at debug with their content, so promoting either back to info fails the
-    /// first half and deleting either instead of demoting it fails the second.
+    /// Falsifiable in both directions: the same turn must still emit all three
+    /// lines at debug with their content, so promoting any back to info fails
+    /// the first half and deleting one instead of demoting it fails the second.
     #[tokio::test]
     async fn message_bodies_stay_out_of_the_desktop_info_log() {
         const SECRET_ARGUMENT: &str = "ARG-4b71-secret-slash-argument";
         const REPLY_CHUNK: &str = "CHUNK-9e02-agent-reply-text";
+        const TOOL_TITLE: &str = "TOOL-1d55-rg secret-pattern /srv/app/config";
 
         let FirstPromptHarness {
             agent,
@@ -7329,7 +7359,14 @@ done"#
             capture: _capture,
             _capture_dir,
             rest_stub,
-        } = spawn_first_prompt_harness(1, Some(REPLY_CHUNK)).await;
+        } = spawn_first_prompt_harness(
+            1,
+            ScriptedUpdates {
+                chunk_text: Some(REPLY_CHUNK),
+                tool_call_title: Some(TOOL_TITLE),
+            },
+        )
+        .await;
         let batch = first_prompt_batch(channel_id, &[&format!("/deploy {SECRET_ARGUMENT}")]);
         let (result_tx, mut result_rx) = mpsc::unbounded_channel();
         let events = capture_events(run_prompt_task(
@@ -7382,6 +7419,10 @@ done"#
             !rendered.contains(REPLY_CHUNK),
             "no agent reply text reaches the log at info; got:\n{rendered}"
         );
+        assert!(
+            !rendered.contains(TOOL_TITLE),
+            "no tool-call title reaches the log at info; got:\n{rendered}"
+        );
 
         let below: Vec<&CapturedEvent> = events
             .iter()
@@ -7402,6 +7443,14 @@ done"#
                 .any(|event| event.target == "buzz_acp::acp::stream"
                     && event.text.contains(REPLY_CHUNK)),
             "the stream line still carries the reply at debug; got:\n{}",
+            render(&below)
+        );
+        assert!(
+            below
+                .iter()
+                .any(|event| event.target == "buzz_acp::acp::tool"
+                    && event.text.contains(TOOL_TITLE)),
+            "the tool-call line still carries the title at debug; got:\n{}",
             render(&below)
         );
     }
