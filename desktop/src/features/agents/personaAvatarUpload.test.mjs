@@ -118,7 +118,12 @@ function mountMutation(useMutationHook) {
   dom.window.document.body.appendChild(container);
   const root = createRoot(container);
   const queryClient = new QueryClient({
-    defaultOptions: { mutations: { retry: false }, queries: { retry: false } },
+    // gcTime 0: the default 5-minute cache timer would keep the test runner's
+    // event loop alive long after the assertions finish.
+    defaultOptions: {
+      mutations: { gcTime: 0, retry: false },
+      queries: { gcTime: 0, retry: false },
+    },
   });
   act(() => {
     root.render(
