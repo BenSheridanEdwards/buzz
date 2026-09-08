@@ -7,11 +7,20 @@
  * forever. Create already uploads data URLs to relay media, and a profile-
  * picked avatar arrives as exactly such a data URL, so edit must too.
  *
+ * The contract on this seam: **an absent `avatarUrl` clears the stored
+ * avatar.** `UpdatePersonaRequest.avatar_url` is an `Option<String>` that
+ * serde fills with `None` for a missing key, `update.rs` assigns it
+ * unconditionally, and that is how the definition dialog's "Remove avatar"
+ * affordance works. So a failed upload must never resolve to an absent avatar:
+ * that would read as a deliberate removal and wipe the persona's face and
+ * every linked instance's while reporting success. It propagates instead.
+ *
  * These tests drive the production mutation hooks through a real
  * QueryClientProvider against a stubbed Tauri bridge: deleting the
  * `personaInputWithResolvedAvatar` call in either mutationFn leaves the data
  * URL in the `update_persona` / `update_persona_and_publish` payload and fails
- * here.
+ * here, and restoring the swallow-and-return-`undefined` failure branch fails
+ * `a failed upload rejects the save instead of clearing the avatar`.
  */
 
 import assert from "node:assert/strict";
@@ -42,6 +51,9 @@ const UPLOADED_URL = "https://relay.example/media/abc123.jpg";
 /** Every invoke the code under test made, in order. */
 const calls = [];
 
+/** Flipped by the failure test so relay media rejects the upload. */
+let uploadFails = false;
+
 const rawPersona = {
   id: "persona-1",
   display_name: "Bond",
@@ -56,6 +68,9 @@ globalThis.__TAURI_INTERNALS__ = {
   invoke: (command, args) => {
     calls.push({ args, command });
     if (command === "upload_media_bytes") {
+      if (uploadFails) {
+        return Promise.reject(new Error("relay media is offline"));
+      }
       return Promise.resolve({
         sha256: "deadbeef",
         size: args.data.length,
@@ -194,7 +209,56 @@ describe("persona edit avatar resolution", () => {
     mounted.unmount();
   });
 
-  it("leaves an https avatar and an absent avatar alone", async () => {
+  it("a failed upload rejects the save instead of clearing the avatar", async () => {
+    uploadFails = true;
+    const mounted = mountMutation(useUpdatePersonaMutation);
+    let thrown = null;
+    await act(async () => {
+      await mounted.latest.current
+        .mutateAsync({ ...editInput, avatarUrl: AVATAR_DATA_URL })
+        .catch((error) => {
+          thrown = error;
+        });
+    });
+
+    // Rule 1: the failure propagates. Swallowing it and dropping the key would
+    // be read downstream as "the user removed the avatar" — `avatar_url` is an
+    // Option that a missing key fills with None, and `update_persona` assigns
+    // it unconditionally and republishes every linked instance's kind:0.
+    assert.ok(thrown instanceof Error, "mutateAsync must reject");
+    assert.match(thrown.message, /relay media is offline/);
+    assert.ok(
+      !calls.some((call) => call.command === "update_persona"),
+      "no persona write may happen once the avatar upload failed",
+    );
+    mounted.unmount();
+    uploadFails = false;
+  });
+
+  it("the same failure never reaches the save-and-publish path either", async () => {
+    uploadFails = true;
+    const mounted = mountMutation(() =>
+      useUpdatePersonaAndPublishMutation("community-1"),
+    );
+    let thrown = null;
+    await act(async () => {
+      await mounted.latest.current
+        .mutateAsync({ ...editInput, avatarUrl: AVATAR_DATA_URL })
+        .catch((error) => {
+          thrown = error;
+        });
+    });
+
+    assert.ok(thrown instanceof Error, "mutateAsync must reject");
+    assert.ok(
+      !calls.some((call) => call.command === "update_persona_and_publish"),
+      "no persona write may happen once the avatar upload failed",
+    );
+    mounted.unmount();
+    uploadFails = false;
+  });
+
+  it("leaves an https avatar alone and lets an absent one clear the stored avatar", async () => {
     const mounted = mountMutation(useUpdatePersonaMutation);
     await act(async () => {
       await mounted.latest.current.mutateAsync({
@@ -212,7 +276,10 @@ describe("persona edit avatar resolution", () => {
     await act(async () => {
       await mounted.latest.current.mutateAsync(editInput);
     });
-    // Absent means "leave the stored avatar alone", not "clear it".
+    // Absent means CLEAR: that is how "Remove avatar" works. This resolver
+    // must therefore pass an absent avatar through untouched and never
+    // manufacture one out of a failure.
+    assert.ok(!calls.some((call) => call.command === "upload_media_bytes"));
     assert.equal(payloadFor("update_persona").avatarUrl, undefined);
     mounted.unmount();
   });

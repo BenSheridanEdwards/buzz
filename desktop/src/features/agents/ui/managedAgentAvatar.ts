@@ -21,17 +21,33 @@ export type UploadMediaBytes = (
  * persona head then sits in the sync queue and is retried every 30 s forever.
  * An avatar picked from a Hermes profile is exactly such a data URL.
  *
- * An input that carries no `avatarUrl` at all is returned untouched: absent
- * means "leave the stored avatar alone", which is not the same as clearing it.
+ * **On a persona update, an absent `avatarUrl` means CLEAR the stored avatar,
+ * not "leave it alone."** `UpdatePersonaRequest.avatar_url` is an
+ * `Option<String>` that serde fills with `None` for a missing key, and
+ * `update.rs` assigns it unconditionally; the definition dialog's "Remove
+ * avatar" affordance is exactly `setAvatarUrl("")` plus
+ * `avatarUrl: avatarUrl.trim() || undefined` on submit. That is the contract,
+ * and it is why this function must never *manufacture* an absent avatar: a
+ * failed upload that returned `undefined` here would read downstream as a
+ * deliberate removal and wipe the persona's face and every linked instance's,
+ * reporting success. So the upload failure propagates (rule 1) and the dialog
+ * shows it. `resolveManagedAgentAvatarUrl`'s swallow-and-fall-back branch
+ * exists for create, which has a runtime avatar to fall back to and no stored
+ * avatar to destroy; edit has neither.
+ *
+ * An input that carries no `avatarUrl` key, or one that is already an https or
+ * inline-SVG emoji URL, is passed through untouched.
  */
 export async function personaInputWithResolvedAvatar<
   T extends { avatarUrl?: string },
->(input: T, upload?: UploadMediaBytes): Promise<T> {
-  if (input.avatarUrl === undefined) {
+>(input: T, upload: UploadMediaBytes = defaultUploadMediaBytes): Promise<T> {
+  const avatarUrl = input.avatarUrl?.trim() || undefined;
+  // Emoji avatars are inline percent-encoded SVG, not base64: nothing to
+  // upload, and `atob` would throw on them.
+  if (!avatarUrl?.startsWith("data:image/") || !isBase64DataUri(avatarUrl)) {
     return input;
   }
-  const avatarUrl = await resolveManagedAgentAvatarUrl(input.avatarUrl, upload);
-  return avatarUrl === input.avatarUrl ? input : { ...input, avatarUrl };
+  return { ...input, avatarUrl: await uploadAvatarDataUrl(avatarUrl, upload) };
 }
 
 export async function resolveManagedAgentAvatarUrl(
@@ -52,17 +68,34 @@ export async function resolveManagedAgentAvatarUrl(
     return resolvedAvatarUrl;
   }
 
+  // Create only: the caller supplies the runtime's own avatar as a fallback and
+  // there is no stored avatar to lose, so a failed upload degrades to the
+  // harness icon rather than blocking the create. Never reuse this on an
+  // update path — see `personaInputWithResolvedAvatar`.
   try {
-    const [, b64] = resolvedAvatarUrl.split(",", 2);
-    if (!b64) {
-      throw new Error("empty data URI payload");
-    }
-    const bytes = Array.from(atob(b64), (char) => char.charCodeAt(0));
-    const blob = await upload(bytes);
-    return blob.url;
+    return await uploadAvatarDataUrl(resolvedAvatarUrl, upload);
   } catch {
     return safeFallbackAvatarUrl(fallbackAvatarUrl);
   }
+}
+
+/**
+ * Upload a base64 `data:image/...` avatar to relay media, returning its https
+ * URL. Throws when the payload is malformed or the upload fails; callers that
+ * can afford to degrade catch it, callers that would otherwise destroy stored
+ * state must not.
+ */
+async function uploadAvatarDataUrl(
+  dataUrl: string,
+  upload: UploadMediaBytes,
+): Promise<string> {
+  const [, b64] = dataUrl.split(",", 2);
+  if (!b64) {
+    throw new Error("empty data URI payload");
+  }
+  const bytes = Array.from(atob(b64), (char) => char.charCodeAt(0));
+  const blob = await upload(bytes);
+  return blob.url;
 }
 
 async function defaultUploadMediaBytes(data: number[], filename?: string) {
