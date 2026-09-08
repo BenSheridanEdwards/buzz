@@ -17,6 +17,8 @@ pub(crate) mod config_bridge;
 pub(crate) mod custom_harnesses;
 mod definition_validation;
 mod discovery;
+mod hermes_profiles;
+pub use hermes_profiles::{default_hermes_profiles_dir, scan_hermes_profiles, HermesProfile};
 pub(crate) mod effective_config;
 mod env_vars;
 pub(crate) mod git_bash;
