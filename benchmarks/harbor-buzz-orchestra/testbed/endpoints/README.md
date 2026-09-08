@@ -12,8 +12,11 @@ all entries as endpoint configs (no comment keys).
 ## openai-live-wire-debug.json
 
 Diagnostic variant of `openai-live.json` for local runs. It enables
-`acp::wire=debug`, so retained agent stdout logs include full ACP messages,
-including tool-call arguments and results. These logs may contain prompt or
+`buzz_acp::acp::wire=debug`, so retained agent stdout logs include full ACP
+messages, including tool-call arguments and results. `EnvFilter` matches a
+directive against the whole target prefix, so the directive has to carry the
+crate prefix the harness emits (`buzz_acp::acp::wire`); a bare `acp::wire`
+matches nothing and captures no frames. These logs may contain prompt or
 command content; keep them local. The verifier and reward do not read them.
 
 ## m1-local.json
