@@ -72,6 +72,14 @@ import { useAgentDialogDefaults } from "./useAgentDialogDefaults";
 import { AgentDefaultsDialog } from "./AgentDefaultsDialog";
 import { AgentHarnessField } from "./AgentHarnessField";
 import {
+  HermesProfileField,
+  useHermesProfilePicker,
+} from "./HermesProfileField";
+import {
+  envVarsWithoutHermesProfile,
+  isHermesHarness,
+} from "./hermesProfileSelection";
+import {
   AgentAiConfigurationModeField,
   AgentCreateAiDefaultsSummary,
   type AgentAiConfigurationMode,
@@ -398,6 +406,27 @@ export function AgentDefinitionDialog({
   }
 
   const selectedRuntime = runtimes.find((p) => p.id === runtime);
+  const isHermesSelected = isHermesHarness(runtime, selectedRuntime?.command);
+  const hermesPicker = useHermesProfilePicker({
+    draft: {
+      displayName,
+      description: descriptionDraft,
+      avatarUrl,
+      systemPrompt,
+      envVars,
+      parallelism: behaviorDraft.parallelism,
+    },
+    enabled: open && isHermesSelected,
+    onApply: (next) => {
+      setHasUserChanges(true);
+      setDisplayName(next.displayName);
+      setDescriptionDraft(next.description);
+      setAvatarUrl(next.avatarUrl);
+      setSystemPrompt(next.systemPrompt);
+      setEnvVars(next.envVars);
+      setBehaviorDraft({ ...behaviorDraft, parallelism: next.parallelism });
+    },
+  });
   const blankRuntimeModelProviderEditable =
     initialModelProviderEditableWithoutRuntime && runtime.trim().length === 0;
   const runtimeCanChooseLlmProvider =
@@ -681,15 +710,25 @@ export function AgentDefinitionDialog({
     // The user made an explicit choice — no longer auto-seeded.
     isRuntimeAutoSeededRef.current = false;
     setRuntime(nextRuntime);
+    const nextRuntimeEntry = runtimes.find((p) => p.id === nextRuntime);
+    // Leaving Hermes drops the profile pin; it means nothing elsewhere.
+    const envVarsForNext =
+      isHermesSelected &&
+      !isHermesHarness(nextRuntime, nextRuntimeEntry?.command)
+        ? envVarsWithoutHermesProfile(selection.envVars)
+        : selection.envVars;
     applySelection(
-      selectionOnRuntimeChange(selection, {
-        previousRuntime: runtime,
-        nextRuntime,
-        nextRuntimeCanChooseProvider:
-          nextRuntime.trim().length > 0 &&
-          runtimeSupportsLlmProviderSelection(nextRuntime),
-        lockedRuntimeReset: "full",
-      }),
+      selectionOnRuntimeChange(
+        { ...selection, envVars: envVarsForNext },
+        {
+          previousRuntime: runtime,
+          nextRuntime,
+          nextRuntimeCanChooseProvider:
+            nextRuntime.trim().length > 0 &&
+            runtimeSupportsLlmProviderSelection(nextRuntime),
+          lockedRuntimeReset: "full",
+        },
+      ),
     );
   }
 
@@ -815,6 +854,15 @@ export function AgentDefinitionDialog({
               placeholder={blankRuntimeOptionLabel}
               value={runtimeDropdownValue}
               warning={runtimeWarning}
+            />
+          ) : null}
+          {isHermesSelected ? (
+            <HermesProfileField
+              disabled={isPending}
+              envVars={envVars}
+              onProfileChange={hermesPicker.handleProfileChange}
+              profiles={hermesPicker.profiles}
+              status={hermesPicker.status}
             />
           ) : null}
           {llmProviderFieldVisible && aiConfigurationMode === "custom" ? (
