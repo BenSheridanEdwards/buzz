@@ -1755,7 +1755,13 @@ impl AcpClient {
         match update_type {
             "agent_message_chunk" => {
                 if let Some(text) = update["content"]["text"].as_str() {
-                    tracing::info!(target: "buzz_acp::acp::stream", "{text}");
+                    // Debug, not info: the desktop runs its managed agents with
+                    // `RUST_LOG=buzz_acp=info` and persists the child's stdout to
+                    // a per-agent log file on disk, so an info-level chunk would
+                    // write every reply the agent sends into a DM to that file in
+                    // plaintext. The desktop transcript renders these chunks from
+                    // the observer stream, not from this line.
+                    tracing::debug!(target: "buzz_acp::acp::stream", "{text}");
                 }
                 false
             }

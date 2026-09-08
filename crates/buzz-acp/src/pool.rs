@@ -2765,7 +2765,12 @@ pub async fn run_prompt_task(
             .collect();
         slash_command = crate::queue::slash_command_for_batch(b, &known_names);
         if let Some(ref cmd) = slash_command {
-            tracing::info!(
+            // Debug, not info: `extract_slash_command` returns the whole
+            // remaining message text, arguments included, and the desktop runs
+            // its managed agents at `buzz_acp=info` with the child's stdout
+            // persisted to a per-agent log file, so an info-level line here
+            // would write `/foo <anything>` verbatim to disk.
+            tracing::debug!(
                 target: "buzz_acp::pool::prompt",
                 channel = %b.channel_id,
                 command = %cmd,
@@ -2833,7 +2838,17 @@ pub async fn run_prompt_task(
     // engine that logs a truncated prefix of the joined prompt shows only the
     // leading `<base>` section; this field is the harness-side record of
     // every section that actually travelled in the turn.
-    let prompt_sections_summary = prompt_block_labels(&prompt_blocks);
+    let mut prompt_sections_summary = prompt_block_labels(&prompt_blocks);
+    if slash_command.is_some() {
+        // Every other block is section-framed, so its first line is a tag. The
+        // slash-command block is the raw message text, so name it instead of
+        // quoting it: this line is info, and the desktop persists info to the
+        // on-disk managed-agent log.
+        if let Some(first) = prompt_sections_summary.first_mut() {
+            first.clear();
+            first.push_str(SLASH_COMMAND_SECTION_LABEL);
+        }
+    }
     let has_standing_context = match &source {
         PromptSource::Channel(_) => !standing.sections().is_empty(),
         PromptSource::Heartbeat => ctx.base_prompt.is_some(),
@@ -2853,6 +2868,8 @@ pub async fn run_prompt_task(
         "prompt_context_delivery",
         serde_json::json!({
             "promptBytes": prompt_bytes,
+            "promptBlocks": prompt_blocks.len(),
+            "sections": prompt_sections_summary,
             "standingContextIncluded": standing_context_included,
             "eventDeltaCount": pending_delivered_event_ids.len(),
         }),
@@ -4549,9 +4566,13 @@ fn classify_control_cancel_failure(
     }
 }
 
-/// How a turn's source is named in the `pool::prompt` log lines.
+/// Name for the slash-command pass-through block in the `sections` log field.
 ///
-/// Shared by the turn-start and turn-stop lines so a log can be read as pairs.
+/// That block is the raw message text rather than a framed section, so it is
+/// named, never quoted: the line carrying `sections` is info level and the
+/// desktop persists info to the on-disk managed-agent log.
+const SLASH_COMMAND_SECTION_LABEL: &str = "<slash-command>";
+
 /// First line of each prompt content block, trimmed and capped, in wire order.
 ///
 /// Section framing puts the tag on its own first line (`<base>`, `<context>`,
@@ -4571,6 +4592,9 @@ fn prompt_block_labels(blocks: &[&str]) -> Vec<String> {
         .collect()
 }
 
+/// How a turn's source is named in the `buzz_acp::pool::prompt` log lines.
+///
+/// Shared by the turn-start and turn-stop lines so a log can be read as pairs.
 fn prompt_label(source: &PromptSource) -> String {
     match source {
         PromptSource::Channel(scope) => format!(
@@ -6827,6 +6851,251 @@ done"#
         assert_eq!(labels[3], "");
     }
 
+    /// Minimal HTTP stub answering `[]` to every request. Returns its base
+    /// URL and the server task; abort the task when done.
+    async fn spawn_empty_query_stub() -> (String, tokio::task::JoinHandle<()>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind REST stub");
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let mut request = vec![0; 16 * 1024];
+                let _ = socket.read(&mut request).await;
+                let _ = socket
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n[]",
+                    )
+                    .await;
+            }
+        });
+        (base_url, server)
+    }
+
+    /// A scripted ACP engine plus the exact worker state a spawn or respawn
+    /// leaves behind, wired to a REST stub so `run_prompt_task` exercises its
+    /// real new-session path without waiting out relay fetch timeouts.
+    struct FirstPromptHarness {
+        agent: OwnedAgent,
+        ctx: Arc<PromptContext>,
+        channel_id: Uuid,
+        /// Every JSON-RPC line the engine received, one per line.
+        capture: std::path::PathBuf,
+        /// Deletes `capture` on drop, so a failed assertion leaves nothing in
+        /// the system temp directory.
+        _capture_dir: tempfile::TempDir,
+        rest_stub: tokio::task::JoinHandle<()>,
+    }
+
+    /// Build a [`FirstPromptHarness`] for `protocol_version`.
+    ///
+    /// `chunk_text`, when set, makes the scripted engine emit an
+    /// `agent_message_chunk` session update ahead of each turn result, the
+    /// notification a real engine streams as it composes its reply.
+    async fn spawn_first_prompt_harness(
+        protocol_version: u32,
+        chunk_text: Option<&str>,
+    ) -> FirstPromptHarness {
+        use crate::relay::RestClient;
+
+        let capture_dir = tempfile::tempdir().expect("capture tempdir");
+        let capture = capture_dir.path().join("acp-requests.ndjson");
+        let quoted_capture = capture.to_string_lossy().replace('\'', "'\\''");
+        let chunk = chunk_text
+            .map(|text| {
+                let notification = serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "method": "session/update",
+                    "params": {
+                        "sessionId": "sess-spawn",
+                        "update": {
+                            "sessionUpdate": "agent_message_chunk",
+                            "content": {"type": "text", "text": text},
+                        },
+                    },
+                })
+                .to_string()
+                .replace('\'', "'\\''");
+                format!("printf '%s\\n' '{notification}'\n       ")
+            })
+            .unwrap_or_default();
+        // Scripted engine: `session/new` gets a session id, every other
+        // request (the prompts) ends its turn. Request ids are sequential
+        // from 0, matching the client's allocation.
+        let script = format!(
+            r#"count=0
+while IFS= read -r line; do
+  printf '%s\n' "$line" >> '{quoted_capture}'
+  id=$count
+  count=$((count + 1))
+  case "$line" in
+    *'"session/new"'*) printf '%s\n' '{{"jsonrpc":"2.0","id":'"$id"',"result":{{"sessionId":"sess-spawn"}}}}' ;;
+    *) {chunk}printf '%s\n' '{{"jsonrpc":"2.0","id":'"$id"',"result":{{"stopReason":"end_turn"}}}}' ;;
+  esac
+done"#
+        );
+        let acp = AcpClient::spawn("bash", &["-c".to_string(), script], &[], false)
+            .await
+            .expect("spawn first-prompt ACP script");
+        let channel_id = Uuid::new_v4();
+        // Exactly the state a worker has right after spawn/respawn.
+        let agent = OwnedAgent {
+            index: 0,
+            acp,
+            state: SessionState::default(),
+            model_capabilities: None,
+            desired_model: None,
+            model_overridden: false,
+            desired_model_request_id: None,
+            desired_model_pending_ack: false,
+            startup_effort: None,
+            agent_name: "spawn-test-agent".into(),
+            goose_system_prompt_supported: None,
+            protocol_version,
+        };
+
+        // Every relay-side fetch on the new-session path (canvas, huddle
+        // instructions, profile lookup) answers empty at once, so the turn
+        // runs the real `session/new` seam without waiting out the fetch
+        // timeouts a dead base URL would cost.
+        let (rest_base_url, rest_stub) = spawn_empty_query_stub().await;
+        let mut ctx = make_prompt_context_no_owner();
+        ctx.base_prompt = Some("standing-base-prompt".into());
+        ctx.rest_client = RestClient {
+            http: reqwest::Client::new(),
+            base_url: rest_base_url.clone(),
+            keys: ctx.agent_keys.clone(),
+            auth_tag_json: None,
+        };
+        ctx.channel_info = ChannelInfoResolver::new(
+            HashMap::from([(
+                channel_id,
+                crate::relay::ChannelInfo {
+                    name: "dm".into(),
+                    channel_type: "dm".into(),
+                    description: None,
+                },
+            )]),
+            RestClient {
+                http: reqwest::Client::new(),
+                base_url: rest_base_url,
+                keys: ctx.agent_keys.clone(),
+                auth_tag_json: None,
+            },
+        );
+        // Fresh project cache so the turn does not need a relay to resolve
+        // project authority.
+        ctx.channel_info.projects.write().unwrap().insert(
+            channel_id,
+            CachedProjectInfo {
+                fetched_at: std::time::Instant::now(),
+                value: None,
+            },
+        );
+        FirstPromptHarness {
+            agent,
+            ctx: Arc::new(ctx),
+            channel_id,
+            capture,
+            _capture_dir: capture_dir,
+            rest_stub,
+        }
+    }
+
+    /// One signed test event per content string, as one flush batch.
+    fn first_prompt_batch(channel_id: Uuid, contents: &[&str]) -> FlushBatch {
+        FlushBatch {
+            channel_id,
+            scope: conv(channel_id),
+            events: contents
+                .iter()
+                .map(|content| crate::queue::BatchEvent {
+                    event: EventBuilder::new(Kind::Custom(9), *content)
+                        .sign_with_keys(&Keys::generate())
+                        .unwrap(),
+                    prompt_tag: "test".into(),
+                    received_at: std::time::Instant::now(),
+                })
+                .collect(),
+            cancelled_events: vec![],
+            cancel_reason: None,
+        }
+    }
+
+    /// One tracing event, as a test needs to see it: the level it was emitted
+    /// at, its target, and its rendered fields.
+    struct CapturedEvent {
+        level: tracing::Level,
+        target: String,
+        text: String,
+    }
+
+    thread_local! {
+        /// `Some` only while [`capture_events`] is running on this thread.
+        static CAPTURED_EVENTS: std::cell::RefCell<Option<Vec<CapturedEvent>>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    /// Records every event emitted on a thread that opted in, and drops the
+    /// rest. Installed once as the process-wide default, never scoped: tracing
+    /// caches callsite interest process-wide, so a sibling test reaching a
+    /// callsite first with no subscriber installed would pin it to "never" for
+    /// the remainder of the run and the event would never reach a scoped
+    /// subscriber at all.
+    struct ThreadCaptureSubscriber;
+
+    impl tracing::Subscriber for ThreadCaptureSubscriber {
+        fn enabled(&self, _metadata: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+        fn new_span(&self, _span: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+        fn record(&self, _span: &tracing::span::Id, _values: &tracing::span::Record<'_>) {}
+        fn record_follows_from(&self, _span: &tracing::span::Id, _follows: &tracing::span::Id) {}
+        fn event(&self, event: &tracing::Event<'_>) {
+            CAPTURED_EVENTS.with(|slot| {
+                let mut slot = slot.borrow_mut();
+                let Some(events) = slot.as_mut() else {
+                    return;
+                };
+                struct FieldText<'a>(&'a mut String);
+                impl tracing::field::Visit for FieldText<'_> {
+                    fn record_debug(
+                        &mut self,
+                        field: &tracing::field::Field,
+                        value: &dyn std::fmt::Debug,
+                    ) {
+                        use std::fmt::Write;
+                        let _ = write!(self.0, " {}={value:?}", field.name());
+                    }
+                }
+                let mut text = String::new();
+                event.record(&mut FieldText(&mut text));
+                events.push(CapturedEvent {
+                    level: *event.metadata().level(),
+                    target: event.metadata().target().to_string(),
+                    text,
+                });
+            });
+        }
+        fn enter(&self, _span: &tracing::span::Id) {}
+        fn exit(&self, _span: &tracing::span::Id) {}
+    }
+
+    /// Run `f` with this thread's tracing events collected, and return them.
+    async fn capture_events<F: std::future::Future<Output = ()>>(f: F) -> Vec<CapturedEvent> {
+        static INSTALL: std::sync::Once = std::sync::Once::new();
+        INSTALL.call_once(|| {
+            let _ = tracing::subscriber::set_global_default(ThreadCaptureSubscriber);
+            tracing::callsite::rebuild_interest_cache();
+        });
+        CAPTURED_EVENTS.with(|slot| *slot.borrow_mut() = Some(Vec::new()));
+        f.await;
+        CAPTURED_EVENTS.with(|slot| slot.borrow_mut().take().unwrap_or_default())
+    }
+
     /// Regression: the first human message after a (re)spawn must reach the
     /// engine exactly once, in a prompt that carries `<context>`, and the next
     /// message must get its own `<context>` prompt.
@@ -6849,132 +7118,22 @@ done"#
     #[tokio::test]
     async fn spawn_triggering_message_is_delivered_once_with_context_then_next_message_gets_own_prompt(
     ) {
-        use crate::relay::RestClient;
-
-        /// Minimal HTTP stub answering `[]` to every request. Returns its base
-        /// URL and the server task; abort the task when done.
-        async fn spawn_empty_query_stub() -> (String, tokio::task::JoinHandle<()>) {
-            use tokio::io::{AsyncReadExt, AsyncWriteExt};
-            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-                .await
-                .expect("bind REST stub");
-            let base_url = format!("http://{}", listener.local_addr().unwrap());
-            let server = tokio::spawn(async move {
-                while let Ok((mut socket, _)) = listener.accept().await {
-                    let mut request = vec![0; 16 * 1024];
-                    let _ = socket.read(&mut request).await;
-                    let _ = socket
-                        .write_all(
-                            b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n[]",
-                        )
-                        .await;
-                }
-            });
-            (base_url, server)
-        }
-
         for protocol_version in [1u32, 2u32] {
-            let capture = std::env::temp_dir().join(format!(
-                "buzz-acp-spawn-first-prompt-v{protocol_version}-{}.ndjson",
-                Uuid::new_v4()
-            ));
-            let quoted_capture = capture.to_string_lossy().replace('\'', "'\\''");
-            // Scripted engine: `session/new` gets a session id, every other
-            // request (the prompts) ends its turn. Request ids are sequential
-            // from 0, matching the client's allocation.
-            let script = format!(
-                r#"count=0
-while IFS= read -r line; do
-  printf '%s\n' "$line" >> '{quoted_capture}'
-  id=$count
-  count=$((count + 1))
-  case "$line" in
-    *'"session/new"'*) printf '%s\n' '{{"jsonrpc":"2.0","id":'"$id"',"result":{{"sessionId":"sess-spawn"}}}}' ;;
-    *) printf '%s\n' '{{"jsonrpc":"2.0","id":'"$id"',"result":{{"stopReason":"end_turn"}}}}' ;;
-  esac
-done"#
-            );
-            let acp = AcpClient::spawn("bash", &["-c".to_string(), script], &[], false)
-                .await
-                .expect("spawn first-prompt ACP script");
-            let channel_id = Uuid::new_v4();
-            // Exactly the state a worker has right after spawn/respawn.
-            let mut agent = OwnedAgent {
-                index: 0,
-                acp,
-                state: SessionState::default(),
-                model_capabilities: None,
-                desired_model: None,
-                model_overridden: false,
-                desired_model_request_id: None,
-                desired_model_pending_ack: false,
-                startup_effort: None,
-                agent_name: "spawn-test-agent".into(),
-                goose_system_prompt_supported: None,
-                protocol_version,
-            };
-
-            // Every relay-side fetch on the new-session path (canvas, huddle
-            // instructions, profile lookup) answers empty at once, so the turn
-            // runs the real `session/new` seam without waiting out the fetch
-            // timeouts a dead base URL would cost.
-            let (rest_base_url, rest_stub) = spawn_empty_query_stub().await;
-            let mut ctx = make_prompt_context_no_owner();
-            ctx.base_prompt = Some("standing-base-prompt".into());
-            ctx.rest_client = RestClient {
-                http: reqwest::Client::new(),
-                base_url: rest_base_url.clone(),
-                keys: ctx.agent_keys.clone(),
-                auth_tag_json: None,
-            };
-            ctx.channel_info = ChannelInfoResolver::new(
-                HashMap::from([(
-                    channel_id,
-                    crate::relay::ChannelInfo {
-                        name: "dm".into(),
-                        channel_type: "dm".into(),
-                        description: None,
-                    },
-                )]),
-                RestClient {
-                    http: reqwest::Client::new(),
-                    base_url: rest_base_url,
-                    keys: ctx.agent_keys.clone(),
-                    auth_tag_json: None,
-                },
-            );
-            // Fresh project cache so the turn does not need a relay to resolve
-            // project authority.
-            ctx.channel_info.projects.write().unwrap().insert(
+            let FirstPromptHarness {
+                mut agent,
+                ctx,
                 channel_id,
-                CachedProjectInfo {
-                    fetched_at: std::time::Instant::now(),
-                    value: None,
-                },
-            );
-            let ctx = Arc::new(ctx);
+                capture,
+                _capture_dir,
+                rest_stub,
+            } = spawn_first_prompt_harness(protocol_version, None).await;
             let (result_tx, mut result_rx) = mpsc::unbounded_channel();
 
             let message_m = "M-9f3a: what is the fleet status right now?";
             let message_n = "N-2c7d: and who is on call tonight?";
             let message_p = "P-41e0: first message queued during init";
             let message_q = "Q-b8d2: second message queued during init";
-            let batch_of = |contents: &[&str]| FlushBatch {
-                channel_id,
-                scope: conv(channel_id),
-                events: contents
-                    .iter()
-                    .map(|content| crate::queue::BatchEvent {
-                        event: EventBuilder::new(Kind::Custom(9), *content)
-                            .sign_with_keys(&Keys::generate())
-                            .unwrap(),
-                        prompt_tag: "test".into(),
-                        received_at: std::time::Instant::now(),
-                    })
-                    .collect(),
-                cancelled_events: vec![],
-                cancel_reason: None,
-            };
+            let batch_of = |contents: &[&str]| first_prompt_batch(channel_id, contents);
 
             for (turn, contents) in [vec![message_m], vec![message_n], vec![message_p, message_q]]
                 .into_iter()
@@ -7016,7 +7175,6 @@ done"#
                 .lines()
                 .map(|line| serde_json::from_str(line).expect("captured request is JSON"))
                 .collect();
-            std::fs::remove_file(&capture).expect("remove ACP capture");
 
             let methods: Vec<&str> = requests
                 .iter()
@@ -7141,6 +7299,111 @@ done"#
             assert!(!third.contains(message_m) && !third.contains(message_n));
             rest_stub.abort();
         }
+    }
+
+    /// The desktop launches its managed agents with `RUST_LOG=buzz_acp=info`
+    /// (`child_rust_log_filter` in
+    /// `desktop/src-tauri/src/managed_agents/runtime/metadata.rs`) and persists
+    /// the child's stdout and stderr to a per-agent log file, which is only
+    /// rotated at the next launch. That directive admits every `buzz_acp::*`
+    /// target, so the emitted level is the only thing keeping a line off disk.
+    ///
+    /// Message bodies must stay below it: neither the agent's reply chunks
+    /// (`buzz_acp::acp::stream`) nor the slash-command pass-through line, which
+    /// carries the whole message text after the command word, nor the
+    /// `sections` field, whose first entry is the bare command block on a
+    /// pass-through turn.
+    ///
+    /// Falsifiable in both directions: the same turn must still emit both lines
+    /// at debug with their content, so promoting either back to info fails the
+    /// first half and deleting either instead of demoting it fails the second.
+    #[tokio::test]
+    async fn message_bodies_stay_out_of_the_desktop_info_log() {
+        const SECRET_ARGUMENT: &str = "ARG-4b71-secret-slash-argument";
+        const REPLY_CHUNK: &str = "CHUNK-9e02-agent-reply-text";
+
+        let FirstPromptHarness {
+            agent,
+            ctx,
+            channel_id,
+            capture: _capture,
+            _capture_dir,
+            rest_stub,
+        } = spawn_first_prompt_harness(1, Some(REPLY_CHUNK)).await;
+        let batch = first_prompt_batch(channel_id, &[&format!("/deploy {SECRET_ARGUMENT}")]);
+        let (result_tx, mut result_rx) = mpsc::unbounded_channel();
+        let events = capture_events(run_prompt_task(
+            agent,
+            Some(batch),
+            None,
+            Arc::clone(&ctx),
+            result_tx,
+            None,
+            "log-level-turn".into(),
+        ))
+        .await;
+        let mut result = result_rx.recv().await.expect("prompt result");
+        assert!(
+            matches!(result.outcome, PromptOutcome::Ok(StopReason::EndTurn)),
+            "expected end_turn, got {}",
+            describe_outcome(&result.outcome)
+        );
+        result.agent.acp.shutdown().await;
+        rest_stub.abort();
+
+        let render = |events: &[&CapturedEvent]| -> String {
+            events
+                .iter()
+                .map(|event| format!("{} {}:{}", event.level, event.target, event.text))
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        // Everything the desktop filter would write to the log file.
+        let on_disk: Vec<&CapturedEvent> = events
+            .iter()
+            .filter(|event| {
+                event.level <= tracing::Level::INFO && event.target.starts_with("buzz_acp")
+            })
+            .collect();
+        let rendered = render(&on_disk);
+        assert!(
+            on_disk
+                .iter()
+                .any(|event| event.text.contains("prompt context delivery")
+                    && event.text.contains(SLASH_COMMAND_SECTION_LABEL)),
+            "the composition line stays at info and names the pass-through block \
+             instead of quoting it; got:\n{rendered}"
+        );
+        assert!(
+            !rendered.contains(SECRET_ARGUMENT),
+            "no slash-command argument text reaches the log at info; got:\n{rendered}"
+        );
+        assert!(
+            !rendered.contains(REPLY_CHUNK),
+            "no agent reply text reaches the log at info; got:\n{rendered}"
+        );
+
+        let below: Vec<&CapturedEvent> = events
+            .iter()
+            .filter(|event| event.level == tracing::Level::DEBUG)
+            .collect();
+        assert!(
+            below
+                .iter()
+                .any(|event| event.target == "buzz_acp::pool::prompt"
+                    && event.text.contains("slash-command pass-through")
+                    && event.text.contains(SECRET_ARGUMENT)),
+            "the pass-through line still carries the command at debug; got:\n{}",
+            render(&below)
+        );
+        assert!(
+            below
+                .iter()
+                .any(|event| event.target == "buzz_acp::acp::stream"
+                    && event.text.contains(REPLY_CHUNK)),
+            "the stream line still carries the reply at debug; got:\n{}",
+            render(&below)
+        );
     }
 
     #[tokio::test]
