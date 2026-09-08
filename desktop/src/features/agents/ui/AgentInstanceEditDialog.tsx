@@ -73,10 +73,8 @@ import { useRequiredCredentialState } from "./useRequiredCredentialState";
 import { RunOnSummarySection } from "./RunOnSummarySection";
 import { EditAgentRuntimeField } from "./EditAgentRuntimeField";
 import { useHermesProfilePicker } from "./HermesProfileField";
-import {
-  hermesDraftOnHarnessChange,
-  isHermesHarness,
-} from "./hermesProfileSelection";
+import { isHermesHarness } from "./hermesProfileSelection";
+import { useHermesHarnessWatch } from "./useHermesHarnessWatch";
 import {
   MODEL_DISCOVERY_LOADING_VALUE,
   usePersonaModelDiscovery,
@@ -365,45 +363,34 @@ export function AgentInstanceEditDialog({
   // while `HERMES_HOME` would otherwise stay in the env. Watching the harness
   // itself keeps one owner for all of them, and reuses the same transform the
   // definition dialog applies.
-  const hermesDraft = {
-    displayName: name,
-    description: "",
-    avatarUrl: "",
-    systemPrompt,
-    envVars,
-    parallelism,
-  };
-  const previousHarnessRef = React.useRef(harnessSelection);
-  const hermesDraftRef = React.useRef(hermesDraft);
-  hermesDraftRef.current = hermesDraft;
-  // biome-ignore lint/correctness/useExhaustiveDependencies: the draft is read through a ref so an env edit does not re-run the harness watch
-  React.useEffect(() => {
-    const previousHarness = previousHarnessRef.current;
-    previousHarnessRef.current = harnessSelection;
-    if (!open) {
-      return;
-    }
-    const next = hermesDraftOnHarnessChange(
-      hermesDraftRef.current,
-      previousHarness,
-      harnessSelection,
-      { parallelism: String(agent.parallelism) },
-    );
-    if (next === hermesDraftRef.current) {
-      return;
-    }
-    setEnvVars(next.envVars);
-    setParallelism(next.parallelism);
-    if (linkedPersona == null) {
-      setSystemPrompt(next.systemPrompt);
-    }
-  }, [
-    agent.parallelism,
-    harnessSelection.command,
-    harnessSelection.runtimeId,
-    linkedPersona,
-    open,
-  ]);
+  //
+  // `harnessSelection` is derived from the runtime catalog and the persona
+  // list, so it moves on its own while those queries load. The watch only
+  // compares selections once both have stopped loading; see
+  // `useHermesHarnessWatch`.
+  const harnessInputsSettled =
+    !runtimesQuery.isLoading && !personasQuery.isLoading;
+  useHermesHarnessWatch({
+    defaults: { parallelism: String(agent.parallelism) },
+    draft: {
+      displayName: name,
+      description: "",
+      avatarUrl: "",
+      systemPrompt,
+      envVars,
+      parallelism,
+    },
+    enabled: open,
+    harness: harnessSelection,
+    onChange: (next) => {
+      setEnvVars(next.envVars);
+      setParallelism(next.parallelism);
+      if (linkedPersona == null) {
+        setSystemPrompt(next.systemPrompt);
+      }
+    },
+    settled: harnessInputsSettled,
+  });
   const runtimeCatalogStatus = runtimesQuery.isLoading
     ? ("loading" as const)
     : runtimesQuery.isError
