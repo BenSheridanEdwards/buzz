@@ -84,7 +84,16 @@ class _VoiceNoteMicButton extends StatelessWidget {
       message: 'Record voice note',
       child: Listener(
         behavior: HitTestBehavior.opaque,
-        onPointerDown: (event) => onPointerDown(event.pointer, event.position),
+        onPointerDown: (event) {
+          // Only a plain primary press is a hold: a right click, a stylus
+          // barrel press, or a trackpad gesture must not start recording.
+          if (event.buttons != kPrimaryButton) return;
+          if (event.kind == PointerDeviceKind.trackpad ||
+              event.kind == PointerDeviceKind.unknown) {
+            return;
+          }
+          onPointerDown(event.pointer, event.position);
+        },
         child: Container(
           width: _composerTrailingSlotSize,
           height: _composerTrailingSlotSize,

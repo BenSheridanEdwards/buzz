@@ -1,7 +1,8 @@
 part of '../voice_note_composer_recorder.dart';
 
-/// Review step shown when the setting is on: play the note back, then
-/// discard it, record again, or send it.
+/// Review step shown when the setting is on, laid out like the Preview
+/// artboard: a compact `0:12 · Tap to review` row with an X, then trash,
+/// Record again, and Send.
 class _ReviewPanel extends StatelessWidget {
   const _ReviewPanel({
     super.key,
@@ -23,10 +24,11 @@ class _ReviewPanel extends StatelessWidget {
       mainAxisSize: MainAxisSize.min,
       children: [
         if (recording != null)
-          VoiceNoteAttachment.local(
+          VoiceNoteAttachment.review(
             path: recording.file.path,
             duration: recording.duration,
             waveform: recording.waveform,
+            onDismiss: onDiscard,
           ),
         const SizedBox(height: Grid.xxs),
         Row(
@@ -35,7 +37,8 @@ class _ReviewPanel extends StatelessWidget {
               key: const ValueKey('voice-note-recorder-discard'),
               label: 'Discard voice note',
               icon: LucideIcons.trash2,
-              foreground: context.colors.onSurface,
+              size: _recorderPanelControlSize,
+              foreground: context.colors.error,
               background: context.colors.surface,
               onPressed: onDiscard,
             ),
@@ -46,6 +49,7 @@ class _ReviewPanel extends StatelessWidget {
                 label: 'Record again',
                 icon: LucideIcons.rotateCcw,
                 emphasized: false,
+                height: _recorderPanelControlSize,
                 onPressed: onRecordAgain,
               ),
             ),
@@ -55,6 +59,7 @@ class _ReviewPanel extends StatelessWidget {
                 key: const ValueKey('voice-note-recorder-send'),
                 label: 'Send',
                 icon: LucideIcons.arrowUp,
+                height: _recorderPanelControlSize,
                 onPressed: recording == null ? null : onSend,
               ),
             ),

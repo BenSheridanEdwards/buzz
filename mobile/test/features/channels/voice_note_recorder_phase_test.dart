@@ -1,3 +1,5 @@
+import 'dart:ui';
+
 import 'package:buzz/features/channels/voice_note_recorder_phase.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:hooks_riverpod/hooks_riverpod.dart';
@@ -113,5 +115,44 @@ void main() {
     notifier.reset();
     expect(state().phase, VoiceNoteRecorderPhase.idle);
     expect(state().cancelledByGesture, isFalse);
+  });
+
+  test('under RTL the cancel slide travels toward the right edge', () {
+    notifier.begin(
+      pointer: 1,
+      origin: origin,
+      now: pressedAt,
+      textDirection: TextDirection.rtl,
+    );
+    notifier.pointerMoved(1, origin + const Offset(-90, 0));
+    expect(state().cancelProgress, 0);
+    expect(state().cancelTravel, -90);
+
+    notifier.pointerMoved(1, origin + const Offset(60, 0));
+    expect(state().cancelProgress, closeTo(0.5, 0.001));
+    expect(state().phase, VoiceNoteRecorderPhase.holding);
+
+    notifier.pointerMoved(
+      1,
+      origin + const Offset(voiceNoteCancelSlideDistance, 0),
+    );
+    expect(state().phase, VoiceNoteRecorderPhase.idle);
+    expect(state().cancelledByGesture, isTrue);
+  });
+
+  test('release returns to idle only for the generation that owns it', () {
+    notifier.begin(now: pressedAt);
+    final owned = state().generation;
+    notifier.lock();
+
+    notifier.release(owned - 1);
+    expect(state().phase, VoiceNoteRecorderPhase.locked);
+
+    notifier.release(owned);
+    expect(state().phase, VoiceNoteRecorderPhase.idle);
+
+    // Idle already: a late release is a no-op and keeps the generation.
+    notifier.release(owned);
+    expect(state().generation, owned);
   });
 }

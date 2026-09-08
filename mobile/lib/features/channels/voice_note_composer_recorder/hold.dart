@@ -12,6 +12,7 @@ class _HoldRecorderRow extends StatelessWidget {
     required this.isStarted,
     required this.isFinishing,
     required this.lockChipLink,
+    required this.timer,
     required this.onSend,
     required this.onCancel,
   });
@@ -23,6 +24,7 @@ class _HoldRecorderRow extends StatelessWidget {
   final bool isStarted;
   final bool isFinishing;
   final LayerLink lockChipLink;
+  final Widget timer;
   final VoidCallback onSend;
   final VoidCallback onCancel;
 
@@ -35,7 +37,7 @@ class _HoldRecorderRow extends StatelessWidget {
         const SizedBox(width: Grid.half),
         _RecordingDot(isLive: !isFinishing),
         const SizedBox(width: Grid.xxs),
-        _RecorderTimer(elapsed: elapsed),
+        timer,
         const SizedBox(width: Grid.xxs),
         Expanded(
           child: _LiveWaveform(
@@ -51,7 +53,6 @@ class _HoldRecorderRow extends StatelessWidget {
           child: _HoldMicSlot(
             holding: holding,
             isFinishing: isFinishing,
-            cancelProgress: state.cancelProgress,
             onSend: isStarted && !isFinishing ? onSend : null,
           ),
         ),
@@ -60,19 +61,18 @@ class _HoldRecorderRow extends StatelessWidget {
   }
 }
 
-/// Trailing 44 px slot of the hold row. While a finger is down it is the
-/// held mic (not actionable); hands free it becomes the Send control.
+/// Trailing 44 px slot of the hold row. While a finger is down it only
+/// anchors the floating held mic ([_HeldMicFollower]); hands free it becomes
+/// the Send control.
 class _HoldMicSlot extends StatelessWidget {
   const _HoldMicSlot({
     required this.holding,
     required this.isFinishing,
-    required this.cancelProgress,
     required this.onSend,
   });
 
   final bool holding;
   final bool isFinishing;
-  final double cancelProgress;
   final VoidCallback? onSend;
 
   @override
@@ -99,40 +99,77 @@ class _HoldMicSlot extends StatelessWidget {
         onPressed: onSend,
       );
     }
+    return const SizedBox.square(
+      key: ValueKey('voice-note-recorder-held-mic-anchor'),
+      dimension: _recorderControlSize,
+    );
+  }
+}
+
+/// The 64 px held mic with its halo, floated above the pill through the
+/// recorder's overlay portal so the composer surface does not clip it. It is
+/// the single semantics owner of "Recording voice note" and never takes a
+/// second finger: the hold is tracked by the listener above the pill.
+class _HeldMicFollower extends StatelessWidget {
+  const _HeldMicFollower({required this.link, required this.cancelProgress});
+
+  final LayerLink link;
+  final double cancelProgress;
+
+  @override
+  Widget build(BuildContext context) {
     final background = Color.lerp(
       context.colors.primary,
       context.colors.error,
       cancelProgress,
     )!;
-    return Semantics(
-      container: true,
-      label: 'Recording voice note',
-      hint: 'Release to send, slide left to cancel, slide up to lock',
-      excludeSemantics: true,
-      child: SizedBox.square(
-        dimension: _recorderControlSize,
-        child: Center(
-          child: AnimatedScale(
-            key: const ValueKey('voice-note-recorder-held-mic'),
-            scale: 1.12,
-            duration: const Duration(milliseconds: 120),
-            child: Container(
-              width: _recorderControlSize,
-              height: _recorderControlSize,
-              decoration: BoxDecoration(
-                color: background,
-                shape: BoxShape.circle,
-                boxShadow: [
-                  BoxShadow(
-                    color: background.withValues(alpha: 0.18),
-                    spreadRadius: Grid.xxs,
-                  ),
-                ],
+    final reducedMotion = MediaQuery.disableAnimationsOf(context);
+    return Positioned(
+      left: 0,
+      top: 0,
+      child: CompositedTransformFollower(
+        link: link,
+        showWhenUnlinked: false,
+        targetAnchor: Alignment.center,
+        followerAnchor: Alignment.center,
+        child: IgnorePointer(
+          child: Semantics(
+            container: true,
+            label: 'Recording voice note',
+            hint: 'Release to send, slide sideways to cancel, slide up to lock',
+            excludeSemantics: true,
+            child: TweenAnimationBuilder<double>(
+              tween: Tween(
+                begin: reducedMotion
+                    ? 1.0
+                    : _recorderControlSize / _heldMicSize,
+                end: 1,
               ),
-              child: Icon(
-                LucideIcons.mic,
-                size: 20,
-                color: context.colors.onPrimary,
+              duration: reducedMotion
+                  ? Duration.zero
+                  : const Duration(milliseconds: 120),
+              curve: Curves.easeOutCubic,
+              builder: (context, scale, child) =>
+                  Transform.scale(scale: scale, child: child),
+              child: Container(
+                key: const ValueKey('voice-note-recorder-held-mic'),
+                width: _heldMicSize,
+                height: _heldMicSize,
+                decoration: BoxDecoration(
+                  color: background,
+                  shape: BoxShape.circle,
+                  boxShadow: [
+                    BoxShadow(
+                      color: background.withValues(alpha: 0.12),
+                      spreadRadius: _heldMicHalo,
+                    ),
+                  ],
+                ),
+                child: Icon(
+                  LucideIcons.mic,
+                  size: 24,
+                  color: context.colors.onPrimary,
+                ),
               ),
             ),
           ),

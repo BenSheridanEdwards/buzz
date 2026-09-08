@@ -98,7 +98,8 @@ class _FakeVoiceNotePlayer extends VoiceNotePlayerController {
 
   @override
   Future<void> toggle() async {
-    _state = _state.copyWith(isPlaying: !_state.isPlaying);
+    // Playing loads the source, which is what makes the note scrubbable.
+    _state = _state.copyWith(isPlaying: !_state.isPlaying, canSeek: true);
     notifyListeners();
   }
 }

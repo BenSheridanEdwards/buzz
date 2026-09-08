@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:io';
 
 import 'package:buzz/features/channels/channel.dart';
 import 'package:buzz/features/channels/channel_management_provider.dart';
@@ -38,6 +39,13 @@ class FakeVoiceNoteRecorder implements VoiceNoteRecorder {
   int pauseCalls = 0;
   int resumeCalls = 0;
   Object? startError;
+  Object? stopError;
+
+  /// When set, [start] waits for it, like a slow permission prompt.
+  Completer<void>? pendingStart;
+
+  /// When set, [stop] waits for it, like a slow native finalisation.
+  Completer<void>? pendingStop;
 
   @override
   Stream<double> get levels => _levels.stream;
@@ -46,6 +54,7 @@ class FakeVoiceNoteRecorder implements VoiceNoteRecorder {
 
   @override
   Future<void> start() async {
+    await pendingStart?.future;
     if (startError case final error?) throw error;
     started = true;
     _levels.add(0.72);
@@ -64,6 +73,8 @@ class FakeVoiceNoteRecorder implements VoiceNoteRecorder {
   @override
   Future<VoiceNoteRecording> stop() async {
     stopped = true;
+    await pendingStop?.future;
+    if (stopError case final error?) throw error;
     return VoiceNoteRecording(
       file: XFile(path, mimeType: 'audio/mp4'),
       duration: recordedDuration,
@@ -85,12 +96,18 @@ class FakeVoiceNoteRecorder implements VoiceNoteRecorder {
 
 /// Player fake whose state tests can drive directly.
 class FakeVoiceNotePlayer extends VoiceNotePlayerController {
-  FakeVoiceNotePlayer({Duration duration = const Duration(seconds: 24)})
-    : _state = VoiceNotePlaybackState(duration: duration);
+  FakeVoiceNotePlayer({
+    Duration duration = const Duration(seconds: 24),
+    this.loadsLazily = false,
+  }) : _state = VoiceNotePlaybackState(duration: duration);
+
+  /// Like a remote note before its first play: no seekable source yet.
+  final bool loadsLazily;
 
   VoiceNotePlaybackState _state;
   double speed = 1;
   final List<double> speeds = [];
+  final List<Duration> seeks = [];
 
   @override
   VoiceNotePlaybackState get state => _state;
@@ -105,7 +122,10 @@ class FakeVoiceNotePlayer extends VoiceNotePlayerController {
     String path, {
     required Duration fallbackDuration,
   }) async {
-    _state = VoiceNotePlaybackState(duration: fallbackDuration);
+    _state = VoiceNotePlaybackState(
+      duration: fallbackDuration,
+      canSeek: !loadsLazily,
+    );
     notifyListeners();
   }
 
@@ -124,6 +144,8 @@ class FakeVoiceNotePlayer extends VoiceNotePlayerController {
 
   @override
   Future<void> seek(Duration position) async {
+    seeks.add(position);
+    if (!_state.canSeek) return;
     _state = _state.copyWith(position: position);
     notifyListeners();
   }
@@ -136,7 +158,8 @@ class FakeVoiceNotePlayer extends VoiceNotePlayerController {
 
   @override
   Future<void> toggle() async {
-    _state = _state.copyWith(isPlaying: !_state.isPlaying);
+    // Playing loads the source, as the device player does lazily.
+    _state = _state.copyWith(isPlaying: !_state.isPlaying, canSeek: true);
     notifyListeners();
   }
 }
@@ -217,6 +240,7 @@ Widget buildVoiceNoteComposeBar({
   AppLifecycleNotifier Function()? appLifecycle,
   VoiceNoteRecorderPhaseNotifier Function()? phaseNotifier,
   bool disableAnimations = false,
+  TextDirection textDirection = TextDirection.ltr,
 }) {
   return ProviderScope(
     overrides: [
@@ -252,19 +276,27 @@ Widget buildVoiceNoteComposeBar({
         RelayClient(baseUrl: 'http://localhost:3000'),
       ),
       relayConfigProvider.overrideWith(_FakeRelayConfigNotifier.new),
-      if (appLifecycle != null) appLifecycleProvider.overrideWith(appLifecycle),
+      // The real notifier listens to the connectivity plugin, which has no
+      // implementation under test and would surface as a stray exception.
+      appLifecycleProvider.overrideWith(
+        appLifecycle ?? FakeAppLifecycleNotifier.new,
+      ),
       savedPrefsProvider.overrideWithValue(prefs),
       channelsProvider.overrideWith(() => FakeChannelsNotifier(const [])),
     ],
     child: MaterialApp(
       navigatorObservers: [voiceNoteRouteObserver],
       theme: AppTheme.light(),
-      builder: disableAnimations
-          ? (context, child) => MediaQuery(
-              data: MediaQuery.of(context).copyWith(disableAnimations: true),
-              child: child!,
-            )
-          : null,
+      builder: (context, child) {
+        var wrapped = child!;
+        if (disableAnimations) {
+          wrapped = MediaQuery(
+            data: MediaQuery.of(context).copyWith(disableAnimations: true),
+            child: wrapped,
+          );
+        }
+        return Directionality(textDirection: textDirection, child: wrapped);
+      },
       home: Scaffold(
         body: SafeArea(
           child: Align(
@@ -323,3 +355,45 @@ Future<void> tapMic(WidgetTester tester) async {
 /// Counts semantics nodes carrying exactly [label].
 int semanticsNodeCount(WidgetTester tester, String label) =>
     find.bySemanticsLabel(label).evaluate().length;
+
+/// Switches the composer to another community, which changes its draft
+/// identity exactly as leaving for another relay does in production.
+void switchCommunity(WidgetTester tester) {
+  final container = ProviderScope.containerOf(
+    tester.element(find.byKey(const ValueKey('compose-bar'))),
+  );
+  final current = container.read(relayConfigProvider);
+  container
+      .read(relayConfigProvider.notifier)
+      .update(baseUrl: 'http://other.example:3000', nsec: current.nsec);
+}
+
+/// Creates a real recording file so deletion on a removal path is provable.
+/// Real I/O only completes under [WidgetTester.runAsync] in a widget test.
+Future<File> createRecordingFile(WidgetTester tester, String name) async {
+  final file = await tester.runAsync(() async {
+    final directory = await Directory.systemTemp.createTemp('voice-note-ui');
+    addTearDown(() async {
+      if (await directory.exists()) await directory.delete(recursive: true);
+    });
+    final file = File('${directory.path}/$name');
+    await file.writeAsBytes(const [1, 2, 3]);
+    return file;
+  });
+  return file!;
+}
+
+/// Whether [file] still exists, after letting the widget's own best-effort
+/// deletion (real I/O too) run to completion.
+Future<bool> recordingFileExists(WidgetTester tester, File file) async {
+  // Each real I/O hop resumes inside the fake zone, so alternate real waits
+  // with pumps until the exists-then-delete chain has had time to finish.
+  for (var hop = 0; hop < 6; hop++) {
+    await tester.runAsync(
+      () => Future<void>.delayed(const Duration(milliseconds: 20)),
+    );
+    await tester.pump();
+  }
+  final exists = await tester.runAsync(file.exists);
+  return exists!;
+}

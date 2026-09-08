@@ -2,8 +2,13 @@ import 'package:hooks_riverpod/hooks_riverpod.dart';
 
 import '../theme/theme_provider.dart';
 
-/// Shared-preferences key remembering whether transcripts are unfolded.
-const voiceNoteTranscriptOpenPrefsKey = 'voice_note_transcript_open';
+/// Shared-preferences key remembering, per message, whether the user last
+/// left its transcript open or folded.
+const voiceNoteTranscriptChoicesPrefsKey = 'voice_note_transcript_choices';
+
+/// Most remembered transcript choices kept on a device; the oldest fall off
+/// so the list stays bounded however many notes a user opens.
+const voiceNoteTranscriptChoicesLimit = 200;
 
 /// Shared-preferences key for the review-before-sending composer setting.
 const voiceNoteReviewBeforeSendPrefsKey = 'voice_note_review_before_send';
@@ -31,22 +36,67 @@ final voiceNoteReviewSettingProvider =
       VoiceNoteReviewSettingNotifier.new,
     );
 
-/// Last transcript fold choice on this device, or `null` before any choice
-/// so cards can fall back to their channel default.
-class VoiceNoteTranscriptOpenNotifier extends Notifier<bool?> {
+/// Transcript fold choices remembered per message id on this device, in
+/// the order they were made. A message without an entry falls back to its
+/// channel default, so one toggle never folds or unfolds every other card.
+class VoiceNoteTranscriptChoicesNotifier extends Notifier<Map<String, bool>> {
   @override
-  bool? build() =>
-      ref.read(savedPrefsProvider).getBool(voiceNoteTranscriptOpenPrefsKey);
+  Map<String, bool> build() {
+    final saved =
+        ref
+            .read(savedPrefsProvider)
+            .getStringList(voiceNoteTranscriptChoicesPrefsKey) ??
+        const [];
+    return {
+      for (final entry in saved)
+        if (entry.split('=') case [final id, final open] when id.isNotEmpty)
+          id: open == '1',
+    };
+  }
 
-  /// Remembers [open] for every voice-note card on this device.
-  void set(bool open) {
-    state = open;
-    ref.read(savedPrefsProvider).setBool(voiceNoteTranscriptOpenPrefsKey, open);
+  /// Remembered choice for [messageId], or `null` when none was made.
+  bool? choiceFor(String messageId) => state[messageId];
+
+  /// Remembers [open] for [messageId] as one atomic write of the whole list,
+  /// dropping the oldest entries past [voiceNoteTranscriptChoicesLimit].
+  void set(String messageId, {required bool open}) {
+    final next = {...state}
+      ..remove(messageId)
+      ..[messageId] = open;
+    while (next.length > voiceNoteTranscriptChoicesLimit) {
+      next.remove(next.keys.first);
+    }
+    state = next;
+    ref.read(savedPrefsProvider).setStringList(
+      voiceNoteTranscriptChoicesPrefsKey,
+      [
+        for (final entry in next.entries)
+          '${entry.key}=${entry.value ? '1' : '0'}',
+      ],
+    );
   }
 }
 
-/// Provides the remembered transcript fold choice.
-final voiceNoteTranscriptOpenProvider =
-    NotifierProvider<VoiceNoteTranscriptOpenNotifier, bool?>(
-      VoiceNoteTranscriptOpenNotifier.new,
+/// Provides the remembered transcript fold choices keyed by message id.
+final voiceNoteTranscriptChoicesProvider =
+    NotifierProvider<VoiceNoteTranscriptChoicesNotifier, Map<String, bool>>(
+      VoiceNoteTranscriptChoicesNotifier.new,
+    );
+
+/// Playback rate chosen on each voice-note card, keyed by its source, so
+/// scrolling a card off screen and back does not reset the speed pill.
+class VoiceNotePlaybackRatesNotifier extends Notifier<Map<String, double>> {
+  @override
+  Map<String, double> build() => const {};
+
+  /// Remembers [rate] for the card playing [source].
+  void set(String source, double rate) {
+    state = {...state, source: rate};
+  }
+}
+
+/// Provides the per-card playback rates for this session.
+final voiceNotePlaybackRatesProvider =
+    NotifierProvider<VoiceNotePlaybackRatesNotifier, Map<String, double>>(
+      VoiceNotePlaybackRatesNotifier.new,
     );

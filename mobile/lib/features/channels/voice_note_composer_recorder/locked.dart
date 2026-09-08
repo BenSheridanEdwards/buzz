@@ -1,7 +1,7 @@
 part of '../voice_note_composer_recorder.dart';
 
 /// Hands-free recorder: status row, then trash, pause or resume, and a
-/// full-width Send.
+/// full-width Send, all 52 px as in the RecordingLocked artboard.
 class _LockedRecorderPanel extends StatelessWidget {
   const _LockedRecorderPanel({
     super.key,
@@ -10,6 +10,7 @@ class _LockedRecorderPanel extends StatelessWidget {
     required this.samples,
     required this.sampleSequence,
     required this.canSend,
+    required this.timer,
     required this.onDiscard,
     required this.onPause,
     required this.onResume,
@@ -21,6 +22,7 @@ class _LockedRecorderPanel extends StatelessWidget {
   final List<double> samples;
   final int sampleSequence;
   final bool canSend;
+  final Widget timer;
   final VoidCallback onDiscard;
   final VoidCallback onPause;
   final VoidCallback onResume;
@@ -43,7 +45,7 @@ class _LockedRecorderPanel extends StatelessWidget {
             children: [
               _RecordingDot(isLive: !isPaused),
               const SizedBox(width: Grid.xxs),
-              _RecorderTimer(elapsed: elapsed),
+              timer,
               const SizedBox(width: Grid.xxs),
               Expanded(
                 child: _LiveWaveform(
@@ -58,12 +60,17 @@ class _LockedRecorderPanel extends StatelessWidget {
                 color: statusColor,
               ),
               const SizedBox(width: Grid.half),
-              Text(
-                isPaused ? 'Paused' : 'Locked',
-                key: const ValueKey('voice-note-recorder-status'),
-                style: context.textTheme.labelMedium?.copyWith(
-                  color: statusColor,
-                  fontWeight: FontWeight.w500,
+              // A live region so VoiceOver and TalkBack hear the lock and
+              // each pause or resume without the node needing focus.
+              Semantics(
+                liveRegion: true,
+                child: Text(
+                  isPaused ? 'Paused' : 'Locked',
+                  key: const ValueKey('voice-note-recorder-status'),
+                  style: context.textTheme.labelMedium?.copyWith(
+                    color: statusColor,
+                    fontWeight: FontWeight.w500,
+                  ),
                 ),
               ),
             ],
@@ -76,7 +83,8 @@ class _LockedRecorderPanel extends StatelessWidget {
               key: const ValueKey('voice-note-recorder-discard'),
               label: 'Discard voice note',
               icon: LucideIcons.trash2,
-              foreground: context.colors.onSurface,
+              size: _recorderPanelControlSize,
+              foreground: context.colors.error,
               background: context.colors.surface,
               onPressed: onDiscard,
             ),
@@ -89,6 +97,7 @@ class _LockedRecorderPanel extends StatelessWidget {
               ),
               label: isPaused ? 'Resume recording' : 'Pause recording',
               icon: isPaused ? LucideIcons.mic : LucideIcons.pause,
+              size: _recorderPanelControlSize,
               foreground: context.colors.onSurface,
               background: context.colors.surface,
               onPressed: canSend ? (isPaused ? onResume : onPause) : null,
@@ -99,6 +108,7 @@ class _LockedRecorderPanel extends StatelessWidget {
                 key: const ValueKey('voice-note-recorder-send'),
                 label: 'Send',
                 icon: LucideIcons.arrowUp,
+                height: _recorderPanelControlSize,
                 onPressed: canSend ? onSend : null,
               ),
             ),

@@ -1,7 +1,17 @@
 part of '../voice_note_composer_recorder.dart';
 
-/// Diameter of the round recorder controls (mic, Send, trash, pause).
+/// Diameter of the round controls inside the pill (Send while hands free).
 const _recorderControlSize = 44.0;
+
+/// Diameter of the round controls in the locked and review panels, and the
+/// height of their wide Send and Record again pills (RecordingLocked).
+const _recorderPanelControlSize = 52.0;
+
+/// Diameter of the mic while it is held (RecordingHold).
+const _heldMicSize = 64.0;
+
+/// Halo drawn outside the held mic.
+const _heldMicHalo = 10.0;
 
 class _RecordingDot extends StatelessWidget {
   const _RecordingDot({required this.isLive});
@@ -35,21 +45,42 @@ class _RecordingDot extends StatelessWidget {
   }
 }
 
+/// Elapsed-time readout. The visible text ticks five times a second; the
+/// node a screen reader hears is a live region whose label only changes
+/// every [voiceNoteTimerAnnounceInterval], and names the cap when it is
+/// [voiceNoteCapWarning] away, so the timer never re-reads itself per tick.
 class _RecorderTimer extends StatelessWidget {
-  const _RecorderTimer({required this.elapsed});
+  const _RecorderTimer({required this.elapsed, required this.announced});
 
   final Duration elapsed;
+  final Duration announced;
 
   @override
-  Widget build(BuildContext context) => Text(
-    formatVoiceNoteDuration(elapsed),
-    key: const ValueKey('voice-note-recorder-duration'),
-    style: context.textTheme.titleSmall?.copyWith(
-      color: context.colors.onSurface,
-      fontWeight: FontWeight.w600,
-      fontFeatures: const [FontFeature.tabularFigures()],
-    ),
-  );
+  Widget build(BuildContext context) {
+    final nearCap = voiceNoteMaxDuration - elapsed <= voiceNoteCapWarning;
+    final remaining = voiceNoteMaxDuration - announced;
+    final label = announced == Duration.zero
+        ? 'Recording'
+        : remaining <= voiceNoteCapWarning
+        ? 'Recording, ${formatVoiceNoteDuration(announced)}, '
+              '${remaining.inSeconds} seconds before the limit'
+        : 'Recording, ${formatVoiceNoteDuration(announced)}';
+    return Semantics(
+      key: const ValueKey('voice-note-recorder-timer-semantics'),
+      liveRegion: true,
+      label: label,
+      excludeSemantics: true,
+      child: Text(
+        formatVoiceNoteDuration(elapsed),
+        key: const ValueKey('voice-note-recorder-duration'),
+        style: context.textTheme.titleSmall?.copyWith(
+          color: nearCap ? context.colors.error : context.colors.onSurface,
+          fontWeight: FontWeight.w600,
+          fontFeatures: const [FontFeature.tabularFigures()],
+        ),
+      ),
+    );
+  }
 }
 
 class _LiveWaveform extends StatelessWidget {
@@ -100,7 +131,7 @@ class _LiveWaveform extends StatelessWidget {
   }
 }
 
-/// Round 44 px control with exactly one semantics owner for its label.
+/// Round control with exactly one semantics owner for its label.
 class _RecorderRoundButton extends StatelessWidget {
   const _RecorderRoundButton({
     super.key,
@@ -109,6 +140,7 @@ class _RecorderRoundButton extends StatelessWidget {
     required this.foreground,
     required this.background,
     required this.onPressed,
+    this.size = _recorderControlSize,
   });
 
   final String label;
@@ -116,6 +148,7 @@ class _RecorderRoundButton extends StatelessWidget {
   final Color foreground;
   final Color background;
   final VoidCallback? onPressed;
+  final double size;
 
   @override
   Widget build(BuildContext context) {
@@ -130,7 +163,7 @@ class _RecorderRoundButton extends StatelessWidget {
       child: Tooltip(
         message: label,
         child: SizedBox.square(
-          dimension: _recorderControlSize,
+          dimension: size,
           child: Material(
             color: enabled ? background : background.withValues(alpha: 0.5),
             shape: const CircleBorder(),
@@ -159,12 +192,14 @@ class _RecorderWideButton extends StatelessWidget {
     required this.icon,
     required this.onPressed,
     this.emphasized = true,
+    this.height = _recorderControlSize,
   });
 
   final String label;
   final IconData icon;
   final VoidCallback? onPressed;
   final bool emphasized;
+  final double height;
 
   @override
   Widget build(BuildContext context) {
@@ -183,7 +218,7 @@ class _RecorderWideButton extends StatelessWidget {
       onTap: onPressed,
       excludeSemantics: true,
       child: SizedBox(
-        height: _recorderControlSize,
+        height: height,
         child: Material(
           color: enabled ? background : background.withValues(alpha: 0.5),
           borderRadius: BorderRadius.circular(Radii.full),

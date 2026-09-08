@@ -2,27 +2,39 @@ part of '../voice_note_attachment.dart';
 
 /// "Transcript" header that folds and unfolds the transcript body.
 ///
-/// The header is the single semantics owner for the toggle. The fold state
-/// comes from the device-wide remembered choice, falling back to the
-/// channel default (open in DMs, folded elsewhere).
+/// The header is the single semantics owner for the toggle. Every card
+/// starts folded (ReceivedIdle); in a DM the transcript unfolds when
+/// playback starts (Main) unless this message remembers a choice, and a
+/// fold made while playing stays folded (ReceivedCollapsed). Choices are
+/// remembered per message, so one toggle never moves another card.
 class _VoiceNoteTranscriptRow extends ConsumerWidget {
   const _VoiceNoteTranscriptRow({
+    required this.messageId,
     required this.transcript,
-    required this.openByDefault,
+    required this.opensOnPlayback,
+    required this.hasPlayed,
   });
 
+  final String messageId;
   final String transcript;
-  final bool openByDefault;
+  final bool opensOnPlayback;
+  final bool hasPlayed;
 
   @override
   Widget build(BuildContext context, WidgetRef ref) {
-    final remembered = ref.watch(voiceNoteTranscriptOpenProvider);
-    final isOpen = remembered ?? openByDefault;
+    final remembered = ref.watch(
+      voiceNoteTranscriptChoicesProvider.select(
+        (choices) => choices[messageId],
+      ),
+    );
+    final isOpen = remembered ?? (opensOnPlayback && hasPlayed);
     final color = context.colors.onSurfaceVariant;
     final reducedMotion = MediaQuery.disableAnimationsOf(context);
     void toggle() {
       unawaited(HapticFeedback.selectionClick());
-      ref.read(voiceNoteTranscriptOpenProvider.notifier).set(!isOpen);
+      ref
+          .read(voiceNoteTranscriptChoicesProvider.notifier)
+          .set(messageId, open: !isOpen);
     }
 
     return Column(
@@ -47,11 +59,11 @@ class _VoiceNoteTranscriptRow extends ConsumerWidget {
               padding: const EdgeInsets.only(top: Grid.xxs),
               child: Row(
                 children: [
-                  Icon(LucideIcons.fileText, size: 14, color: color),
+                  Icon(LucideIcons.text, size: 14, color: color),
                   const SizedBox(width: Grid.xxs),
                   Expanded(
                     child: Text(
-                      isOpen ? 'Transcript' : 'Show transcript',
+                      isOpen || hasPlayed ? 'Transcript' : 'Show transcript',
                       key: const ValueKey('voice-note-transcript-header'),
                       style: context.textTheme.labelMedium?.copyWith(
                         color: color,

@@ -6,6 +6,7 @@ import 'dart:ui' show FlutterView;
 
 import 'package:camera/camera.dart' as camera;
 import 'package:flutter/foundation.dart';
+import 'package:flutter/gestures.dart' show PointerDeviceKind, kPrimaryButton;
 import 'package:flutter/material.dart';
 import 'package:flutter/physics.dart';
 import 'package:flutter/rendering.dart';

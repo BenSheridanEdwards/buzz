@@ -243,6 +243,7 @@ class _ThreadMessage extends HookConsumerWidget {
                                   tags: message.tags,
                                   voiceNoteSenderName: displayName,
                                   voiceNoteTranscriptOpenByDefault: isDmChannel,
+                                  voiceNoteMessageId: message.id,
                                   baseStyle: messageBodyTextStyle.copyWith(
                                     color: context.colors.onSurface,
                                   ),

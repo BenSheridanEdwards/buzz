@@ -21,9 +21,11 @@ part 'voice_note_attachment/transcript_row.dart';
 
 /// Displays a recorded or remote voice note with playback controls.
 ///
-/// Remote cards title themselves with the sender, show `current / total`
-/// time, cycle playback speed through the mobile rates, and fold a
-/// transcript row whose last state is remembered per device.
+/// The time row follows the design: `0:24 · Voice note` at idle and
+/// `0:16 · Neo · 0:24` once playback has started, with the sender inline.
+/// Remote cards cycle playback speed through the mobile rates (remembered
+/// per card) and fold a transcript row whose choice is remembered per
+/// message.
 class VoiceNoteAttachment extends HookConsumerWidget {
   const VoiceNoteAttachment.local({
     super.key,
@@ -33,9 +35,28 @@ class VoiceNoteAttachment extends HookConsumerWidget {
     this.onRemove,
   }) : source = path,
        isRemote = false,
+       isReview = false,
        senderName = null,
        transcript = null,
-       transcriptOpenByDefault = false;
+       transcriptOpenByDefault = false,
+       messageId = null;
+
+  /// Compact review row from the Preview artboard: `0:12 · Tap to review`
+  /// with an X that discards the take.
+  const VoiceNoteAttachment.review({
+    super.key,
+    required String path,
+    required this.duration,
+    required this.waveform,
+    required VoidCallback onDismiss,
+  }) : source = path,
+       isRemote = false,
+       isReview = true,
+       onRemove = onDismiss,
+       senderName = null,
+       transcript = null,
+       transcriptOpenByDefault = false,
+       messageId = null;
 
   const VoiceNoteAttachment.remote({
     super.key,
@@ -45,24 +66,32 @@ class VoiceNoteAttachment extends HookConsumerWidget {
     this.senderName,
     this.transcript,
     this.transcriptOpenByDefault = false,
+    this.messageId,
   }) : source = url,
        isRemote = true,
+       isReview = false,
        onRemove = null;
 
   final String source;
   final bool isRemote;
+  final bool isReview;
   final Duration duration;
   final List<double> waveform;
   final VoidCallback? onRemove;
 
-  /// Display name shown as the card title on received notes.
+  /// Display name of the sender, shown inline in the time row once playback
+  /// has started.
   final String? senderName;
 
   /// Transcript body from the imeta `alt` tag; the row is hidden when absent.
   final String? transcript;
 
-  /// Fold default used until this device remembers a choice (open in DMs).
+  /// Whether the transcript unfolds when playback starts (true in DMs) for a
+  /// message without a remembered choice. Every card starts folded.
   final bool transcriptOpenByDefault;
+
+  /// Message the note belongs to; keys the remembered transcript choice.
+  final String? messageId;
 
   @override
   Widget build(BuildContext context, WidgetRef ref) {
@@ -70,7 +99,9 @@ class VoiceNoteAttachment extends HookConsumerWidget {
       source,
     ]);
     final playback = useListenable(player);
-    final playbackRate = useState(1.0);
+    final playbackRate = ref.watch(
+      voiceNotePlaybackRatesProvider.select((rates) => rates[source] ?? 1.0),
+    );
     useEffect(() {
       if (isRemote) {
         unawaited(
@@ -84,6 +115,8 @@ class VoiceNoteAttachment extends HookConsumerWidget {
       } else {
         unawaited(player.loadLocal(source, fallbackDuration: duration));
       }
+      // A remounted card resumes the speed it was last set to.
+      if (playbackRate != 1.0) unawaited(player.setSpeed(playbackRate));
       return player.dispose;
     }, [player, source, isRemote, duration]);
 
@@ -96,6 +129,9 @@ class VoiceNoteAttachment extends HookConsumerWidget {
         : (state.position.inMilliseconds / resolvedDuration.inMilliseconds)
               .clamp(0.0, 1.0);
     final progressAnimation = useAnimationController(initialValue: progress);
+    final wasPlaying = useRef(false);
+    final hasPlayed = useState(false);
+    if (state.isPlaying && !hasPlayed.value) hasPlayed.value = true;
 
     void animateProgressFrom(double fraction) {
       final resolved = fraction.clamp(0.0, 1.0);
@@ -105,7 +141,7 @@ class VoiceNoteAttachment extends HookConsumerWidget {
       if (!state.isPlaying || resolvedDuration.inMilliseconds <= 0) return;
       final remainingMilliseconds = math.max(
         1,
-        (resolvedDuration.inMilliseconds * (1 - resolved) / playbackRate.value)
+        (resolvedDuration.inMilliseconds * (1 - resolved) / playbackRate)
             .round(),
       );
       unawaited(
@@ -119,8 +155,14 @@ class VoiceNoteAttachment extends HookConsumerWidget {
 
     useEffect(
       () {
+        // When playback starts the fill re-syncs from the player's real
+        // position, so a scrub the backend ignored cannot leave the waveform
+        // ahead of the audio; mid-play changes (speed, resolved duration)
+        // continue from where the fill already is.
+        final startedNow = state.isPlaying && !wasPlaying.value;
+        wasPlaying.value = state.isPlaying;
         animateProgressFrom(
-          state.isPlaying ? progressAnimation.value : progress,
+          state.isPlaying && !startedNow ? progressAnimation.value : progress,
         );
         return null;
       },
@@ -128,7 +170,7 @@ class VoiceNoteAttachment extends HookConsumerWidget {
         state.isPlaying,
         state.isPlaying ? null : state.position.inMilliseconds,
         resolvedDuration.inMilliseconds,
-        playbackRate.value,
+        playbackRate,
       ],
     );
     final samples = normalizeVoiceNoteWaveform(
@@ -172,27 +214,30 @@ class VoiceNoteAttachment extends HookConsumerWidget {
                   mainAxisAlignment: MainAxisAlignment.center,
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
-                    if (senderName case final title?
-                        when title.trim().isNotEmpty)
-                      _VoiceNoteCardTitle(title: title.trim()),
                     AnimatedBuilder(
                       animation: progressAnimation,
                       builder: (context, _) => VoiceNoteWaveform(
                         samples: samples,
                         progress: progressAnimation.value,
                         height: 24,
-                        onSeek: (fraction) {
-                          animateProgressFrom(fraction);
-                          unawaited(
-                            player.seek(
-                              Duration(
-                                milliseconds:
-                                    (resolvedDuration.inMilliseconds * fraction)
-                                        .round(),
-                              ),
-                            ),
-                          );
-                        },
+                        // Scrubbing needs a loaded source; before the first
+                        // play a remote note has none and the backend would
+                        // ignore the seek while the fill moved anyway.
+                        onSeek: !state.canSeek
+                            ? null
+                            : (fraction) {
+                                animateProgressFrom(fraction);
+                                unawaited(
+                                  player.seek(
+                                    Duration(
+                                      milliseconds:
+                                          (resolvedDuration.inMilliseconds *
+                                                  fraction)
+                                              .round(),
+                                    ),
+                                  ),
+                                );
+                              },
                       ),
                     ),
                     Row(
@@ -202,19 +247,28 @@ class VoiceNoteAttachment extends HookConsumerWidget {
                             state: state,
                             position: state.position,
                             total: resolvedDuration,
+                            senderName: senderName,
+                            idleLabel: isReview
+                                ? 'Tap to review'
+                                : 'Voice note',
+                            onIdleTap: isReview
+                                ? () => unawaited(player.toggle())
+                                : null,
                           ),
                         ),
                         if (isRemote)
                           _VoiceNotePlaybackRateButton(
                             key: const ValueKey('voice-note-playback-rate'),
-                            rate: playbackRate.value,
+                            rate: playbackRate,
                             onPressed: () {
                               unawaited(HapticFeedback.selectionClick());
                               final next = nextVoiceNotePlaybackRate(
-                                playbackRate.value,
+                                playbackRate,
                                 rates: voiceNoteMobilePlaybackRates,
                               );
-                              playbackRate.value = next;
+                              ref
+                                  .read(voiceNotePlaybackRatesProvider.notifier)
+                                  .set(source, next);
                               unawaited(player.setSpeed(next));
                             },
                           ),
@@ -225,28 +279,19 @@ class VoiceNoteAttachment extends HookConsumerWidget {
               ),
               if (onRemove != null) ...[
                 const SizedBox(width: Grid.xxs),
-                SizedBox.square(
-                  dimension: 40,
-                  child: IconButton(
-                    key: const ValueKey('composer-voice-note-remove'),
-                    tooltip: 'Remove voice note',
-                    onPressed: onRemove,
-                    style: IconButton.styleFrom(
-                      minimumSize: const Size.square(40),
-                      maximumSize: const Size.square(40),
-                      padding: EdgeInsets.zero,
-                      tapTargetSize: MaterialTapTargetSize.shrinkWrap,
-                    ),
-                    icon: const Icon(LucideIcons.x, size: 18),
-                  ),
+                _VoiceNoteRemoveButton(
+                  isReview: isReview,
+                  onPressed: onRemove!,
                 ),
               ],
             ],
           ),
           if (hasTranscript)
             _VoiceNoteTranscriptRow(
+              messageId: messageId ?? source,
               transcript: transcriptBody,
-              openByDefault: transcriptOpenByDefault,
+              opensOnPlayback: transcriptOpenByDefault,
+              hasPlayed: hasPlayed.value,
             ),
         ],
       ),

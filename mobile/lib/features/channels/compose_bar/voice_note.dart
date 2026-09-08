@@ -82,7 +82,10 @@ _ComposerVoiceNote _useComposerVoiceNote({
         isPreparing.value = false;
         isRecording.value = false;
       case VoiceNoteRecorderPhase.finishing when !isRecording.value:
-        // Released before the recorder mounted: nothing was captured.
+        // Released before the recorder mounted (the keyboard was still
+        // hiding): nothing was captured, so say why instead of vanishing.
+        uploadError.value = voiceNoteHoldToRecordHint;
+        isPreparing.value = false;
         phaseNotifier.reset();
       case VoiceNoteRecorderPhase.holding:
       case VoiceNoteRecorderPhase.locked:
@@ -100,18 +103,20 @@ _ComposerVoiceNote _useComposerVoiceNote({
   }
 
   bool start() {
+    // Validate before touching the composer, so a refused start keeps the
+    // keyboard, the expanded editor, and the attachment surface as they were.
     if (attachments.value.isNotEmpty) {
       uploadError.value = 'A voice note must be the only attachment.';
+      return false;
+    }
+    if (ref.read(huddleSessionProvider).isInSession) {
+      uploadError.value = 'Leave the Huddle before recording a voice note.';
       return false;
     }
     attachmentSurface.value = _AttachmentSurface.closed;
     showFormatting.value = false;
     isComposerExpanded.value = false;
     _dismissComposerKeyboard(focusNode);
-    if (ref.read(huddleSessionProvider).isInSession) {
-      uploadError.value = 'Leave the Huddle before recording a voice note.';
-      return false;
-    }
     uploadError.value = null;
     draftRevision.value += 1;
     isPreparing.value = true;
@@ -122,7 +127,11 @@ _ComposerVoiceNote _useComposerVoiceNote({
   void beginHold({int? pointer, Offset origin = Offset.zero}) {
     if (ref.read(voiceNoteRecorderPhaseProvider).isActive) return;
     if (!start()) return;
-    phaseNotifier.begin(pointer: pointer, origin: origin);
+    phaseNotifier.begin(
+      pointer: pointer,
+      origin: origin,
+      textDirection: Directionality.of(context),
+    );
   }
 
   void cancel() {

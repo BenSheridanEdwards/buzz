@@ -1,4 +1,4 @@
-import 'dart:ui' show Offset;
+import 'dart:ui' show Offset, TextDirection;
 
 import 'package:clock/clock.dart';
 import 'package:flutter/foundation.dart';
@@ -15,6 +15,10 @@ const voiceNoteTapHoldThreshold = Duration(milliseconds: 250);
 
 /// Pointer travel below which a short press is still a tap.
 const voiceNoteTapSlop = 12.0;
+
+/// Shortest capture the composer keeps; anything under it is discarded with
+/// the hold-to-record hint instead of attaching a note shorter than a tick.
+const voiceNoteMinDuration = Duration(seconds: 1);
 
 /// Where the composer recorder is in its hold, lock, and review lifecycle.
 enum VoiceNoteRecorderPhase {
@@ -48,6 +52,7 @@ class VoiceNoteRecorderState {
     this.heldSince,
     this.generation = 0,
     this.cancelledByGesture = false,
+    this.textDirection = TextDirection.ltr,
   });
 
   /// Current lifecycle phase.
@@ -71,6 +76,10 @@ class VoiceNoteRecorderState {
   /// Whether the most recent return to idle came from a slide-to-cancel.
   final bool cancelledByGesture;
 
+  /// Reading direction of the composer when the hold began; the cancel slide
+  /// travels toward the start edge, so it mirrors under RTL.
+  final TextDirection textDirection;
+
   /// Whether a finger is currently holding the mic.
   bool get hasPointer => pointer != null;
 
@@ -86,9 +95,14 @@ class VoiceNoteRecorderState {
   /// Finger displacement from where the hold started.
   Offset get dragOffset => position - origin;
 
+  /// Finger travel toward the start edge (leftward in LTR, rightward in
+  /// RTL), in logical pixels; negative while moving the other way.
+  double get cancelTravel =>
+      textDirection == TextDirection.rtl ? dragOffset.dx : -dragOffset.dx;
+
   /// Progress toward the cancel threshold, from 0 to 1.
   double get cancelProgress =>
-      (-dragOffset.dx / voiceNoteCancelSlideDistance).clamp(0.0, 1.0);
+      (cancelTravel / voiceNoteCancelSlideDistance).clamp(0.0, 1.0);
 
   /// Progress toward the lock threshold, from 0 to 1.
   double get lockProgress =>
@@ -104,6 +118,7 @@ class VoiceNoteRecorderState {
     bool clearHeldSince = false,
     int? generation,
     bool? cancelledByGesture,
+    TextDirection? textDirection,
   }) => VoiceNoteRecorderState(
     phase: phase ?? this.phase,
     pointer: clearPointer ? null : (pointer ?? this.pointer),
@@ -112,6 +127,7 @@ class VoiceNoteRecorderState {
     heldSince: clearHeldSince ? null : (heldSince ?? this.heldSince),
     generation: generation ?? this.generation,
     cancelledByGesture: cancelledByGesture ?? this.cancelledByGesture,
+    textDirection: textDirection ?? this.textDirection,
   );
 }
 
@@ -127,7 +143,13 @@ class VoiceNoteRecorderPhaseNotifier extends Notifier<VoiceNoteRecorderState> {
 
   /// Starts a hold. With a [pointer] the mic is being pressed; without one
   /// the recording is hands free from the start (tap or keyboard path).
-  void begin({int? pointer, Offset origin = Offset.zero, DateTime? now}) {
+  /// [textDirection] decides which way the cancel slide travels.
+  void begin({
+    int? pointer,
+    Offset origin = Offset.zero,
+    DateTime? now,
+    TextDirection textDirection = TextDirection.ltr,
+  }) {
     if (state.phase != VoiceNoteRecorderPhase.idle) return;
     state = VoiceNoteRecorderState(
       phase: VoiceNoteRecorderPhase.holding,
@@ -136,6 +158,7 @@ class VoiceNoteRecorderPhaseNotifier extends Notifier<VoiceNoteRecorderState> {
       position: origin,
       heldSince: now ?? clock.now(),
       generation: state.generation + 1,
+      textDirection: textDirection,
     );
   }
 
@@ -237,6 +260,15 @@ class VoiceNoteRecorderPhaseNotifier extends Notifier<VoiceNoteRecorderState> {
       phase: VoiceNoteRecorderPhase.locked,
       generation: state.generation + 1,
     );
+  }
+
+  /// Returns to idle when the recorder that owns [generation] goes away
+  /// while its phase is still active (the page was popped mid-recording), so
+  /// the next composer's mic is not stuck behind a phase nobody owns.
+  void release(int generation) {
+    if (!ref.mounted) return;
+    if (!state.isActive || state.generation != generation) return;
+    reset();
   }
 
   /// Returns to idle from any phase; [cancelledByGesture] marks a slide.
