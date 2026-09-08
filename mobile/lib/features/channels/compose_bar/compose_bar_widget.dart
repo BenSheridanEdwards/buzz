@@ -466,8 +466,14 @@ class ComposeBar extends HookConsumerWidget {
       }
       final submittedDraftRevision = draftRevision.value;
       // Resolved before any await: see
-      // `_reportSendCancelledByCommunitySwitch`.
+      // `_reportSendCancelledByCommunitySwitch`. The container outlives this
+      // widget, so a relay audio rejection arriving after the composer
+      // unmounts can still drop the stale NIP-11 verdict.
       final messenger = ScaffoldMessenger.maybeOf(context);
+      final providerContainer = ProviderScope.containerOf(
+        context,
+        listen: false,
+      );
 
       // Extract pubkeys for mentions present in the final text.
       final selectedMentions = <MentionCandidate>[
@@ -545,6 +551,18 @@ class ComposeBar extends HookConsumerWidget {
         final queueGeneration = uploadGeneration.value;
         final cancellation = UploadCancellationToken();
         final uploadService = ref.read(mediaUploadServiceProvider);
+        // Kick off the relay's NIP-11 audio verdict (cached per relay) before
+        // the first await so the provider is read while this ref is live.
+        final relayAudioProvider =
+            queuedAttachments.any(
+              (attachment) =>
+                  attachment.kind == _PendingAttachmentKind.voiceNote,
+            )
+            ? relayAudioSupportProvider(ref.read(relayConfigProvider).baseUrl)
+            : null;
+        final relayAudioSupport = relayAudioProvider == null
+            ? null
+            : ref.read(relayAudioProvider.future);
         activeUploadCancellation.value = cancellation;
         final delivery = onSend;
         unawaited(() async {
@@ -556,6 +574,10 @@ class ComposeBar extends HookConsumerWidget {
               final descriptor = await _uploadPendingAttachment(
                 uploadService,
                 attachment,
+                relayAudioSupport: relayAudioSupport,
+                onRelayAudioRejected: relayAudioProvider == null
+                    ? null
+                    : () => providerContainer.invalidate(relayAudioProvider),
                 onProgress: (progress) {
                   if (context.mounted) {
                     uploadProgress.value =

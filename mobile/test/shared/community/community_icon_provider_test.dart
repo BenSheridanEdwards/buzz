@@ -1,4 +1,5 @@
 import 'package:buzz/shared/community/community_icon_provider.dart';
+import 'package:buzz/shared/relay/relay_info_document.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:hooks_riverpod/hooks_riverpod.dart';
 import 'package:http/http.dart' as http;
@@ -38,6 +39,29 @@ void main() {
       communityIconProvider('https://relay.example.com').future,
     );
 
+    expect(icon, isNull);
+  });
+
+  test('returns null when the NIP-11 body exceeds the read bound', () async {
+    var served = 0;
+    final client = http_testing.MockClient((_) async {
+      served++;
+      final padding = 'x' * (relayInfoMaxBodyBytes + 1);
+      return http.Response(
+        '{"icon":"https://relay.example.com/icon.png","description":"$padding"}',
+        200,
+      );
+    });
+    final container = ProviderContainer(
+      overrides: [communityIconHttpClientProvider.overrideWithValue(client)],
+    );
+    addTearDown(container.dispose);
+
+    final icon = await container.read(
+      communityIconProvider('https://relay.example.com').future,
+    );
+
+    expect(served, 1);
     expect(icon, isNull);
   });
 

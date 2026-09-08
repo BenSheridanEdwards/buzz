@@ -74,8 +74,26 @@ typedef SanitizeImageBytes =
 typedef TranscodeImageToJpeg = Future<Uint8List> Function(Uint8List bytes);
 typedef TranscodeVideoToMp4 = Future<String> Function(String filePath);
 
-/// Packages a recorded voice-note file into its upload container.
-typedef PackageVoiceNoteForUpload = Future<String> Function(String filePath);
+/// Container a recorded voice note is packaged into before upload.
+enum VoiceNoteContainer {
+  /// The H.264/AAC MP4 envelope every relay accepts as `video/mp4`.
+  mp4('mp4', 'video/mp4'),
+
+  /// Bare AAC audio (`audio/mp4`, `.m4a`) for relays advertising `buzz-audio`.
+  m4a('m4a', 'audio/mp4');
+
+  const VoiceNoteContainer(this.wireName, this.mimeType);
+
+  /// Value passed to the native packager and used as the file extension.
+  final String wireName;
+
+  /// MIME type the packaged file is uploaded and tagged with.
+  final String mimeType;
+}
+
+/// Packages a recorded voice-note file into [container] for upload.
+typedef PackageVoiceNoteForUpload =
+    Future<String> Function(String filePath, VoiceNoteContainer container);
 
 /// Generates poster-frame bytes for the video at [filePath], when available.
 typedef GenerateVideoPoster = Future<Uint8List?> Function(String filePath);
@@ -86,6 +104,21 @@ class MediaPolicyUploadException implements Exception {
 
   @override
   String toString() => _mediaPolicyUploadMessage;
+}
+
+/// The relay refused a bare `audio/mp4` upload with 415 or 422.
+///
+/// Raised only on the `buzz-audio` path: the relay's NIP-11 verdict was
+/// stale (the operator disabled audio uploads, or a rollback dropped the
+/// extension), so the caller invalidates it and resends the envelope.
+class RelayAudioRejectedException implements Exception {
+  final int statusCode;
+  final String body;
+
+  const RelayAudioRejectedException(this.statusCode, this.body);
+
+  @override
+  String toString() => 'relay rejected audio upload ($statusCode): $body';
 }
 
 /// Cancels a single user-initiated media upload without closing the shared
@@ -226,8 +259,8 @@ class BlobDescriptor {
       RegExp(r'[\\\[\]]'),
       (match) => '\\${match[0]}',
     );
-    if (type.startsWith('audio/')) return '![audio]($url)';
     if (_isPackagedVoiceNote(type, filename)) return '[$label]($url)';
+    if (type.startsWith('audio/')) return '![audio]($url)';
     if (type.startsWith('video/')) return '![video]($url)';
     if (type.startsWith('image/')) return '![image]($url)';
     return '[$label]($url)';
@@ -464,10 +497,22 @@ class MediaUploadService {
     return uploadVideo(pickedVideo);
   }
 
-  /// Packages a recorded AAC voice note in the canonical MP4 envelope.
+  /// Packages and uploads a recorded AAC voice note.
+  ///
+  /// With [relayAcceptsAudio] the note is sent as bare AAC audio
+  /// (`audio/mp4`, `voice-note-<id>.m4a`); otherwise it is wrapped in the
+  /// canonical MP4 envelope (`video/mp4`, `voice-note-<id>.mp4`) that relays
+  /// without the `buzz-audio` extension accept.
+  ///
+  /// A 415 or 422 on the audio upload means the relay's advertised verdict is
+  /// stale: [onAudioRejected] fires so the caller can drop the cached verdict,
+  /// and the note is packaged again and resent as the envelope in the same
+  /// call, so one wrong guess never strands the user on a retry loop.
   Future<BlobDescriptor> uploadVoiceNote(
     XFile voiceNote, {
     required Duration duration,
+    bool relayAcceptsAudio = false,
+    VoidCallback? onAudioRejected,
     ValueChanged<double>? onProgress,
     UploadCancellationToken? cancellationToken,
   }) async {
@@ -476,9 +521,42 @@ class MediaUploadService {
     if (!_allowedAudioMimeTypes.contains(mimeType)) {
       throw Exception('unsupported voice note type: $mimeType');
     }
+    if (relayAcceptsAudio) {
+      try {
+        return await _uploadPackagedVoiceNote(
+          voiceNote,
+          VoiceNoteContainer.m4a,
+          duration: duration,
+          onProgress: onProgress,
+          cancellationToken: cancellationToken,
+        );
+      } on RelayAudioRejectedException {
+        onAudioRejected?.call();
+        _throwIfCancelled(cancellationToken);
+      }
+    }
+    return _uploadPackagedVoiceNote(
+      voiceNote,
+      VoiceNoteContainer.mp4,
+      duration: duration,
+      onProgress: onProgress,
+      cancellationToken: cancellationToken,
+    );
+  }
+
+  Future<BlobDescriptor> _uploadPackagedVoiceNote(
+    XFile voiceNote,
+    VoiceNoteContainer container, {
+    required Duration duration,
+    ValueChanged<double>? onProgress,
+    UploadCancellationToken? cancellationToken,
+  }) async {
     String? packagedPath;
     try {
-      packagedPath = await _packageVoiceNoteForUpload(voiceNote.path);
+      packagedPath = await _packageVoiceNoteForUpload(
+        voiceNote.path,
+        container,
+      );
       _throwIfCancelled(cancellationToken);
       final bytes = await File(packagedPath).readAsBytes();
       if (bytes.isEmpty) throw Exception('Voice note is empty.');
@@ -487,12 +565,13 @@ class MediaUploadService {
       }
       final descriptor = await _uploadPreparedBytes(
         bytes,
-        mimeType: 'video/mp4',
+        mimeType: container.mimeType,
+        allowAudio: container == VoiceNoteContainer.m4a,
         onProgress: onProgress,
         cancellationToken: cancellationToken,
       );
       return descriptor.withVoiceNoteMetadata(
-        filename: _voiceNoteMp4Filename(voiceNote.name),
+        filename: _voiceNoteFilename(voiceNote.name, container),
         fallbackDurationSeconds: duration.inMilliseconds / 1000,
       );
     } finally {
@@ -577,11 +656,13 @@ class MediaUploadService {
     Uint8List bytes, {
     required String mimeType,
     bool allowGenericFile = false,
+    bool allowAudio = false,
     ValueChanged<double>? onProgress,
     UploadCancellationToken? cancellationToken,
   }) async {
     _throwIfCancelled(cancellationToken);
     if (!allowGenericFile &&
+        !(allowAudio && _allowedAudioMimeTypes.contains(mimeType)) &&
         !_allowedImageMimeTypes.contains(mimeType) &&
         !_allowedVideoMimeTypes.contains(mimeType)) {
       throw Exception('unsupported file type: $mimeType');
@@ -608,10 +689,14 @@ class MediaUploadService {
       );
     }
     if (response.statusCode < 200 || response.statusCode >= 300) {
-      if (_allowedImageMimeTypes.contains(mimeType) &&
-          (response.statusCode == HttpStatus.unsupportedMediaType ||
-              response.statusCode == HttpStatus.unprocessableEntity)) {
+      final policyRejection =
+          response.statusCode == HttpStatus.unsupportedMediaType ||
+          response.statusCode == HttpStatus.unprocessableEntity;
+      if (policyRejection && _allowedImageMimeTypes.contains(mimeType)) {
         throw const MediaPolicyUploadException();
+      }
+      if (policyRejection && allowAudio) {
+        throw RelayAudioRejectedException(response.statusCode, response.body);
       }
       throw Exception(
         'upload failed (${response.statusCode}): ${response.body}',
@@ -790,21 +875,28 @@ String _safeAttachmentFilename(String filename) {
   return safeBasename.isEmpty ? 'file' : safeBasename;
 }
 
-String _voiceNoteMp4Filename(String filename) {
+String _voiceNoteFilename(String filename, VoiceNoteContainer container) {
   final safe = _safeAttachmentFilename(filename);
   final withoutExtension = safe.replaceFirst(RegExp(r'\.[^.]*$'), '');
   final stem = withoutExtension.toLowerCase().startsWith('voice-note-')
       ? withoutExtension
       : 'voice-note-$withoutExtension';
-  return '$stem.mp4';
+  return '$stem.${container.wireName}';
 }
 
+/// Whether [mimeType] and [filename] describe a voice note Buzz packaged in
+/// either container: the MP4 envelope or bare `audio/mp4` on `buzz-audio`
+/// relays. Both render as a `[voice-note-<id>.<ext>](url)` link.
 bool _isPackagedVoiceNote(String mimeType, String? filename) {
   final normalized = filename?.toLowerCase();
-  return mimeType == 'video/mp4' &&
-      normalized != null &&
-      normalized.startsWith('voice-note-') &&
-      normalized.endsWith('.mp4');
+  if (normalized == null || !normalized.startsWith('voice-note-')) {
+    return false;
+  }
+  return VoiceNoteContainer.values.any(
+    (container) =>
+        mimeType == container.mimeType &&
+        normalized.endsWith('.${container.wireName}'),
+  );
 }
 
 Stream<List<int>> _uploadByteStream(

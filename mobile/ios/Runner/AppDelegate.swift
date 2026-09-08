@@ -626,17 +626,36 @@ import os.log
       }
       transcodeVideoToMp4(sourcePath: sourcePath, result: result)
     case "packageVoiceNoteForUpload":
-      guard let sourcePath = call.arguments as? String else {
+      // Accepts `{path, container}`; a bare path keeps the MP4 envelope.
+      let payload = call.arguments as? [String: Any]
+      guard let sourcePath = (payload?["path"] ?? call.arguments) as? String else {
         result(
           FlutterError(
             code: "invalid_arguments",
-            message: "Expected source file path as String.",
+            message: "Expected source file path and container.",
             details: nil
           )
         )
         return
       }
-      VoiceNotePackager.package(sourcePath: sourcePath, result: result)
+      var container = VoiceNotePackager.Container.mp4Envelope
+      if let payload {
+        guard
+          let wireName = payload["container"] as? String,
+          let requested = VoiceNotePackager.Container(rawValue: wireName)
+        else {
+          result(
+            FlutterError(
+              code: "invalid_arguments",
+              message: "Expected container to be \"mp4\" or \"m4a\".",
+              details: nil
+            )
+          )
+          return
+        }
+        container = requested
+      }
+      VoiceNotePackager.package(sourcePath: sourcePath, container: container, result: result)
     case "generateVideoPoster":
       guard let sourcePath = call.arguments as? String else {
         result(

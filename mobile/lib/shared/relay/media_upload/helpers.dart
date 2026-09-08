@@ -73,21 +73,37 @@ Future<String> _transcodePickedVideoToMp4(String filePath) async {
   return result;
 }
 
-Future<String> _packagePickedVoiceNoteForUpload(String filePath) async {
+/// Builds the platform-channel payload for `packageVoiceNoteForUpload`.
+Map<String, String> voiceNotePackagingArguments(
+  String filePath,
+  VoiceNoteContainer container,
+) => {'path': filePath, 'container': container.wireName};
+
+Future<String> _packagePickedVoiceNoteForUpload(
+  String filePath,
+  VoiceNoteContainer container,
+) async {
   final result = await _mediaUploadPlatformChannel.invokeMethod<String>(
     _packageVoiceNoteForUploadMethod,
-    filePath,
+    voiceNotePackagingArguments(filePath, container),
   );
   if (result == null || result.isEmpty) {
     throw Exception('Failed to prepare voice note for upload.');
   }
   if (defaultTargetPlatform == TargetPlatform.android) {
+    // MediaMuxer writes moov last, so relocate it on both paths. The bare
+    // audio path also drops the moov-level metadata MediaMuxer always adds.
     final source = File(result);
     final destination = File(
-      '$result.faststart-${DateTime.now().microsecondsSinceEpoch}.mp4',
+      '$result.faststart-${DateTime.now().microsecondsSinceEpoch}'
+      '.${container.wireName}',
     );
     try {
-      await rewriteMp4ForFastStart(source, destination);
+      await rewriteMp4ForFastStart(
+        source,
+        destination,
+        stripMoovMetadata: container == VoiceNoteContainer.m4a,
+      );
       await source.delete();
       return destination.path;
     } catch (_) {
