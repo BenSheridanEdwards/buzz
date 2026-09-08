@@ -227,6 +227,57 @@ fn production_delete_orchestration_restores_bestie_when_agent_save_fails() {
     .unwrap_or_else(|error| panic!("read restored assignment: {error}")));
 }
 
+/// Deleting an agent clears its relay-membership sidecar row, and only its
+/// own: the row is derived state keyed by a pubkey, so leaving it behind
+/// hands the next reader of `relay-membership.json` a membership record for
+/// an agent that no longer exists, and grows the file without bound.
+/// `run_managed_agent_deletion` owns this so no removal path can forget it.
+#[test]
+fn production_delete_orchestration_clears_the_relay_membership_sidecar() {
+    use crate::managed_agents::{
+        load_relay_memberships, record_relay_membership, relay_membership_for,
+        ManagedAgentRelayMembership, RelayMembershipState,
+    };
+
+    let dir = tempfile::tempdir().unwrap_or_else(|error| panic!("temp dir: {error}"));
+    let doomed = "a".repeat(64);
+    let survivor = "b".repeat(64);
+    const RELAY: &str = "ws://localhost:3000";
+    for pubkey in [&doomed, &survivor] {
+        record_relay_membership(
+            dir.path(),
+            pubkey,
+            RELAY,
+            Some(ManagedAgentRelayMembership {
+                state: RelayMembershipState::NotMember,
+                checked_at: "t".to_string(),
+                detail: None,
+            }),
+        )
+        .unwrap_or_else(|error| panic!("seed membership: {error}"));
+    }
+
+    let mut record = bare_agent_record(None, None, None);
+    record.pubkey.clone_from(&doomed);
+    let mut records = vec![record];
+    run_managed_agent_deletion(dir.path(), &doomed, &mut records, |records| {
+        records.retain(|record| record.pubkey != doomed);
+        Ok::<(), String>(())
+    })
+    .unwrap_or_else(|error| panic!("deletion: {error}"));
+
+    let store = load_relay_memberships(dir.path());
+    assert_eq!(
+        relay_membership_for(&store, &doomed, RELAY),
+        None,
+        "the deleted agent's derived membership row must go with its record"
+    );
+    assert!(
+        relay_membership_for(&store, &survivor, RELAY).is_some(),
+        "another agent's row must survive"
+    );
+}
+
 /// Deploy resolver falls back to global when both definition and record have none.
 #[test]
 fn deploy_resolver_falls_back_to_global_when_definition_and_record_have_none() {

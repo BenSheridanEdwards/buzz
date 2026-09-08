@@ -128,7 +128,6 @@ export function ManagedAgentRow({
               <StatusBlock
                 friendlyError={friendlyError}
                 isWorking={isWorking}
-                membershipLabel={membershipNotice?.badge ?? null}
                 presenceLoaded={presenceLoaded}
                 presenceStatus={presenceStatus}
                 processDetail={processDetail}
@@ -152,7 +151,6 @@ export function ManagedAgentRow({
               <StatusBlock
                 friendlyError={friendlyError}
                 isWorking={isWorking}
-                membershipLabel={membershipNotice?.badge ?? null}
                 presenceLoaded={presenceLoaded}
                 presenceStatus={presenceStatus}
                 processDetail={processDetail}
@@ -367,10 +365,14 @@ function WorkingBadge({
   );
 }
 
+/**
+ * Deliberately carries no relay-membership line: `RelayMembershipBlock`
+ * below is the single owner of that label in this row. Rendering it here too
+ * read the same sentence twice to a screen reader walking the card.
+ */
 function StatusBlock({
   friendlyError,
   isWorking,
-  membershipLabel,
   presenceLoaded,
   presenceStatus,
   processDetail,
@@ -378,8 +380,6 @@ function StatusBlock({
 }: {
   friendlyError: ReturnType<typeof friendlyAgentLastError>;
   isWorking: boolean;
-  /** Relay-membership badge text, when the agent cannot publish yet. */
-  membershipLabel: string | null;
   presenceLoaded: boolean;
   presenceStatus: PresenceStatus | undefined;
   processDetail: string;
@@ -406,14 +406,6 @@ function StatusBlock({
           data-testid="managed-agent-last-error"
         >
           {friendlyError.copy}
-        </p>
-      ) : null}
-      {membershipLabel ? (
-        <p
-          className="text-xs text-amber-600 dark:text-amber-400"
-          data-testid="managed-agent-relay-membership-label"
-        >
-          {membershipLabel}
         </p>
       ) : null}
     </div>

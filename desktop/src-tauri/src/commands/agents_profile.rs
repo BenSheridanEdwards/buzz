@@ -330,15 +330,16 @@ async fn ensure_relay_membership_before_publish(
 ) {
     use crate::managed_agents::{
         load_relay_memberships, managed_agents_base_dir, preflight_managed_agent_relay_membership,
-        relay_membership_for, RelayMembershipState,
+        should_preflight_membership,
     };
 
-    let verified_member = managed_agents_base_dir(app)
+    // `should_preflight_membership` owns the rule and is table-tested; an
+    // unreadable store falls through to checking, never to assuming.
+    let needs_check = managed_agents_base_dir(app)
         .map(|base_dir| load_relay_memberships(&base_dir))
-        .ok()
-        .and_then(|store| relay_membership_for(&store, agent_pubkey, relay_url))
-        .is_some_and(|membership| membership.state == RelayMembershipState::Member);
-    if verified_member {
+        .map(|store| should_preflight_membership(&store, agent_pubkey, relay_url))
+        .unwrap_or(true);
+    if !needs_check {
         return;
     }
     if let Err(error) =

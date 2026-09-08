@@ -128,9 +128,15 @@ pub(super) async fn start_local_agent_pairs_with_preflight(
             &global_for_preflight,
         );
     ensure_relay_mesh_for_record(app, mesh_model_id.as_deref(), false).await?;
-    for relay_url in relay_urls {
-        preflight_relay_membership_for_start(app, state, pubkey, relay_url).await;
-    }
+    // Concurrent across relays: each check is bounded on its own (three round
+    // trips at 20s), so a mesh of N relays must not make the user wait N x
+    // that before the agent starts.
+    futures_util::future::join_all(
+        relay_urls
+            .iter()
+            .map(|relay_url| preflight_relay_membership_for_start(app, state, pubkey, relay_url)),
+    )
+    .await;
 
     {
         let _store_guard = state
@@ -227,12 +233,19 @@ pub(super) async fn start_local_agent_with_preflight(
             &global,
         );
     ensure_relay_mesh_for_record(app, mesh_model_id.as_deref(), allow_fresh_create_start).await?;
-    // Membership preflight on the relay the caller scoped (or the current
-    // workspace). Runs BEFORE the scope bind below, like the mesh preflight,
-    // so the bind still covers every await on this path.
-    let membership_relay = expected_relay_url
-        .map(str::to_string)
-        .unwrap_or_else(|| crate::relay::relay_ws_url_with_override(state));
+    // Membership preflight on the relay this spawn will actually use. Routed
+    // through `effective_agent_relay_url` (the one choke point all agent
+    // relay resolution flows through) against the relay the caller scoped
+    // (or the current workspace), so the preflight, the spawn, and the create
+    // path can never disagree about which pair was checked. Runs BEFORE the
+    // scope bind, like the mesh preflight, so the bind still covers every
+    // await on this path.
+    let membership_relay = crate::relay::effective_agent_relay_url(
+        &record_snapshot.relay_url,
+        &expected_relay_url
+            .map(str::to_string)
+            .unwrap_or_else(|| crate::relay::relay_ws_url_with_override(state)),
+    );
     preflight_relay_membership_for_start(app, state, pubkey, &membership_relay).await;
 
     // The mesh preflight above is the suspension window Projects callbacks
@@ -751,15 +764,24 @@ pub async fn create_managed_agent(
     // start and before its kind:0 goes out. When this identity cannot add it,
     // the sidecar records `NotMember` and the Agents view shows the npub to
     // hand to the community owner; creation itself still succeeds.
-    let membership_relay = crate::relay::effective_agent_relay_url(
-        &resolved_relay_url,
-        &relay_ws_url_with_override(&state),
-    );
-    preflight_relay_membership_for_start(&app, &state, &pubkey, &membership_relay).await;
+    //
+    // Skipped when Phase 3b is about to spawn: `start_local_agent_with_preflight`
+    // runs the same check against the same resolved relay a few hundred
+    // milliseconds later, and doing it twice costs two NIP-11 reads, two
+    // rate-limited `/query` calls, and, on a relay that never published a
+    // kind:13534, a second 9030 POST.
+    let spawns_after_create = input.spawn_after_create && input.backend == BackendKind::Local;
+    if !spawns_after_create {
+        let membership_relay = crate::relay::effective_agent_relay_url(
+            &resolved_relay_url,
+            &relay_ws_url_with_override(&state),
+        );
+        preflight_relay_membership_for_start(&app, &state, &pubkey, &membership_relay).await;
+    }
 
     // ── Phase 3b: local spawn (async preflight outside store lock) ───────────
     let mut spawn_error = None;
-    let agent = if input.spawn_after_create && input.backend == BackendKind::Local {
+    let agent = if spawns_after_create {
         match start_local_agent_with_preflight(&app, &state, &pubkey, true, None, None, None).await
         {
             Ok(agent) => agent,
@@ -1116,7 +1138,25 @@ fn run_managed_agent_deletion<T>(
             .iter()
             .any(|record| record.pubkey.eq_ignore_ascii_case(pending_pubkey))
     })?;
-    with_agent_assignments_cleared(base_dir, pubkey, || delete(records))
+    let result = with_agent_assignments_cleared(base_dir, pubkey, || delete(records))?;
+    forget_managed_agent_derived_state(base_dir, pubkey);
+    Ok(result)
+}
+
+/// Drop the derived, per-agent state that lives outside `managed-agents.json`
+/// once the record itself is gone.
+///
+/// Owned by one helper because there is more than one removal path (the
+/// single-agent delete and the persona cascade) and every one of them must
+/// clear the same sidecars. A left-behind `relay-membership.json` row is keyed
+/// by a pubkey with no record, so it is harmless today and would be trusted by
+/// the next reader of that file; it also grows without bound. Failures are
+/// logged, not propagated: the record has already left disk and a stale
+/// derived row must not fail the deletion the user asked for.
+pub(super) fn forget_managed_agent_derived_state(base_dir: &std::path::Path, pubkey: &str) {
+    if let Err(error) = crate::managed_agents::clear_relay_membership(base_dir, pubkey) {
+        eprintln!("buzz-desktop: failed to clear relay membership for {pubkey}: {error}");
+    }
 }
 
 #[tauri::command]
@@ -1185,10 +1225,8 @@ pub async fn delete_managed_agent(
                 save_managed_agents(&app, records)
             })?;
             crate::managed_agents::delete_agent_key(&pubkey);
-            // Derived relay-membership metadata goes with the record.
-            if let Err(error) = crate::managed_agents::clear_relay_membership(&base_dir, &pubkey) {
-                eprintln!("buzz-desktop: failed to clear relay membership for {pubkey}: {error}");
-            }
+            // Derived relay-membership metadata was cleared inside
+            // `run_managed_agent_deletion`, which owns it for every path.
             // Tombstone after confirmed removal (inside lock; every published
             // agent tombstones). The NIP-IA kind:9035 archive request — which
             // stops the identity appearing in member pickers and autocomplete —

@@ -86,6 +86,55 @@ pub fn backfill_persona_snapshots(app: &tauri::AppHandle) -> Result<(), String> 
     Ok(())
 }
 
+/// Register every pair the sidecar has not already verified as a member,
+/// concurrently. Each check is bounded on its own (three round trips at 20s
+/// each), so the whole pass is bounded by the slowest agent rather than by
+/// their sum. A failure is persisted as `Unknown` by the preflight and only
+/// logged here: a relay that cannot be reached now is retried on the next
+/// start and by the profile reconcile, and the spawn must not be blocked on
+/// it.
+async fn preflight_relay_membership_for_restore(
+    app: &tauri::AppHandle,
+    state: &AppState,
+    agents_to_start: &[super::ManagedAgentRecord],
+) {
+    let workspace_relay = crate::relay::relay_ws_url_with_override(state);
+    let memberships = super::load_relay_memberships(&match managed_agents_base_dir(app) {
+        Ok(base_dir) => base_dir,
+        Err(error) => {
+            eprintln!("buzz-desktop: relay membership preflight skipped on restore: {error}");
+            return;
+        }
+    });
+
+    let pending: Vec<(String, String)> = agents_to_start
+        .iter()
+        .map(|record| {
+            (
+                record.pubkey.clone(),
+                crate::relay::effective_agent_relay_url(&record.relay_url, &workspace_relay),
+            )
+        })
+        .filter(|(pubkey, relay_url)| {
+            super::should_preflight_membership(&memberships, pubkey, relay_url)
+        })
+        .collect();
+    if pending.is_empty() {
+        return;
+    }
+
+    let checks = pending.iter().map(|(pubkey, relay_url)| async move {
+        if let Err(error) =
+            super::preflight_managed_agent_relay_membership(app, state, pubkey, relay_url).await
+        {
+            eprintln!(
+                "buzz-desktop: relay membership preflight failed for agent {pubkey} on {relay_url}: {error}"
+            );
+        }
+    });
+    futures_util::future::join_all(checks).await;
+}
+
 /// Restore managed agents that were running before the app was closed.
 ///
 /// Split into three phases to minimise lock contention with the frontend:
@@ -281,6 +330,16 @@ pub async fn restore_managed_agents_on_launch(
     if agents_to_start.is_empty() {
         return Ok(());
     }
+
+    // ── Relay membership (async, before the spawn) ──────────────────────────
+    // A closed relay refuses every publish from a pubkey it does not list, so
+    // an agent created before this registration existed would otherwise wake
+    // up, connect, and have its first reply refused before the profile
+    // reconcile at the end of this function ever ran. Doing it here, in the
+    // last async stretch before Phase B takes the transition lock and spawns,
+    // costs a legacy agent nothing but the check itself, and costs an
+    // already-registered agent nothing at all.
+    preflight_relay_membership_for_restore(app, &state, &agents_to_start).await;
 
     // Serialize spawning and runtime registration with shutdown cleanup. The
     // shutdown flag is rechecked after taking the lock so shutdown either

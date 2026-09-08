@@ -4,7 +4,7 @@ use crate::{
     app_state::AppState,
     managed_agents::{
         current_instance_id, delete_agent_key, load_managed_agents, load_personas, load_teams,
-        save_managed_agents, save_personas, stop_managed_agent_process,
+        managed_agents_base_dir, save_managed_agents, save_personas, stop_managed_agent_process,
         sync_managed_agent_processes, try_regenerate_nest, validate_persona_activation_change,
         validate_persona_deletion, AgentDefinition, ManagedAgentRecord,
     },
@@ -268,10 +268,15 @@ pub async fn delete_persona(id: String, app: AppHandle) -> Result<(), String> {
             save_personas(&app, &personas)?;
 
             // Side effects — strictly after records leave disk.
+            let base_dir = managed_agents_base_dir(&app)?;
             for pk in &cascade {
                 state.clear_agent_session_caches(pk);
                 // Remove nsec from keyring after the record is gone.
                 delete_agent_key(pk);
+                // Same derived-state cleanup the single-agent delete gets
+                // through `run_managed_agent_deletion`: a cascaded agent must
+                // not leave a relay-membership row behind either.
+                super::agents::forget_managed_agent_derived_state(&base_dir, pk);
                 // Tombstone + NIP-IA kind:9035 archive enqueue atomically; the
                 // archive's `persona_id` is derived from the retained 30177 head.
                 super::agents::tombstone_managed_agent_pending(&app, &state, pk);

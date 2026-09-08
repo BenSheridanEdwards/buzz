@@ -282,7 +282,65 @@ fn extract_retry_in_hint(body: &str) -> Option<u64> {
     digits.parse::<u64>().ok()
 }
 
+/// The relay's own reason for refusing a request, parsed once from the JSON
+/// body it answered with.
+///
+/// The relay writes two different fields: `error` is the machine-readable
+/// reason a caller can branch on (`relay_membership_required` from the HTTP
+/// bridge's membership gate, `invalid: actor not authorized: ...` from
+/// `handlers/relay_admin.rs`), and `message` is the human sentence it
+/// sometimes adds. Callers that must classify a refusal read `code`; callers
+/// that show it to a user read `message()`. Neither re-parses a rendered
+/// string.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RelayRefusal {
+    /// The body's `error` field, verbatim.
+    pub code: Option<String>,
+    /// The body's `message` field, verbatim.
+    pub detail: Option<String>,
+}
+
+impl RelayRefusal {
+    /// The text to show a user: the human `message` when the relay sent one,
+    /// else the machine reason.
+    pub fn message(&self) -> String {
+        self.detail
+            .clone()
+            .or_else(|| self.code.clone())
+            .unwrap_or_default()
+    }
+
+    /// Everything the relay said, lowercased, for classification.
+    pub fn haystack(&self) -> String {
+        format!(
+            "{} {}",
+            self.code.as_deref().unwrap_or(""),
+            self.detail.as_deref().unwrap_or("")
+        )
+        .to_ascii_lowercase()
+    }
+}
+
+/// A non-2xx relay response, read once: the caller-facing string every
+/// existing call site already used, plus the relay's structured refusal when
+/// the answer was a client-side refusal it is safe to act on.
+#[derive(Debug, Clone)]
+pub struct RelayErrorDetails {
+    /// Exactly what [`relay_error_message`] returns.
+    pub error: String,
+    /// Present only for a 4xx (never 429) whose body parsed as JSON with an
+    /// `error` or `message` field. A 429, a 5xx, an intercepted page and a
+    /// body that is not structured JSON all leave this `None`, so a caller
+    /// can never mistake an outage for the relay's definitive answer.
+    pub refusal: Option<RelayRefusal>,
+}
+
 pub async fn relay_error_message(response: reqwest::Response) -> String {
+    relay_error_details(response).await.error
+}
+
+/// [`relay_error_message`] that also keeps the relay's structured refusal.
+pub async fn relay_error_details(response: reqwest::Response) -> RelayErrorDetails {
     let status = response.status();
 
     // Check for intercepted/proxy responses before reading the body.
@@ -295,7 +353,10 @@ pub async fn relay_error_message(response: reqwest::Response) -> String {
         .to_string();
 
     if let Some(msg) = classify_intercepted_response(&final_host, &content_type) {
-        return msg;
+        return RelayErrorDetails {
+            error: msg,
+            refusal: None,
+        };
     }
 
     // Real relay error: extract the structured message field if available.
@@ -309,7 +370,10 @@ pub async fn relay_error_message(response: reqwest::Response) -> String {
         Ok(body) => body,
         Err(e) => {
             if let Some(timeout) = classify_body_timeout(&e) {
-                return timeout;
+                return RelayErrorDetails {
+                    error: timeout,
+                    refusal: None,
+                };
             }
             String::new()
         }
@@ -330,24 +394,47 @@ pub async fn relay_error_message(response: reqwest::Response) -> String {
         // gate from receiving an uncapped hint from an untrusted relay.
         let capped_hint = hint.map(|s| s.min(crate::relay_admission::MAX_HINT_SECONDS));
         crate::relay_admission::activate_rate_limit(capped_hint);
-        if let Some(secs) = capped_hint {
-            return format!("relay rate-limited: retry in {secs}s");
-        }
-        return "relay rate-limited: quota exceeded".to_string();
+        let error = match capped_hint {
+            Some(secs) => format!("relay rate-limited: retry in {secs}s"),
+            None => "relay rate-limited: quota exceeded".to_string(),
+        };
+        // Deliberately no `refusal`: a quota window says nothing about the
+        // request itself, so no caller may treat it as the relay's answer.
+        return RelayErrorDetails {
+            error,
+            refusal: None,
+        };
     }
 
     if let Ok(value) = serde_json::from_str::<serde_json::Value>(&body) {
-        if let Some(message) = value.get("message").and_then(serde_json::Value::as_str) {
-            return format!("relay returned {status}: {message}");
-        }
-
-        if let Some(error) = value.get("error").and_then(serde_json::Value::as_str) {
-            return format!("relay returned {status}: {error}");
+        let code = value
+            .get("error")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string);
+        let detail = value
+            .get("message")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string);
+        if code.is_some() || detail.is_some() {
+            // Message first in the rendered string, unchanged: it is the
+            // sentence written for a human when the relay sends both.
+            let rendered = detail.as_deref().or(code.as_deref()).unwrap_or_default();
+            return RelayErrorDetails {
+                error: format!("relay returned {status}: {rendered}"),
+                // Only a client-side refusal is the relay's definitive answer
+                // about this request. A 5xx is an outage and must stay one.
+                refusal: status
+                    .is_client_error()
+                    .then_some(RelayRefusal { code, detail }),
+            };
         }
     }
 
     // Non-JSON, non-HTML body: emit status only — no raw body in the UI.
-    format!("relay returned {status}")
+    RelayErrorDetails {
+        error: format!("relay returned {status}"),
+        refusal: None,
+    }
 }
 
 // ── HTTP bridge: POST /query ────────────────────────────────────────────────
@@ -372,11 +459,35 @@ pub async fn query_relay_at(
     api_base_url: &str,
     filters: &[serde_json::Value],
 ) -> Result<Vec<nostr::Event>, String> {
+    query_relay_details_at(state, api_base_url, filters)
+        .await
+        .map_err(|details| details.error)
+}
+
+/// [`query_relay_at`] that keeps the relay's structured refusal.
+///
+/// A closed relay enforces membership on `/query` before it looks at the
+/// filters (`api/bridge.rs`, `query_events_authed`), so a 403 here is the
+/// relay's answer about the *querying identity*, not a transport failure.
+/// The membership preflight needs that distinction; every other caller wants
+/// the flat string and uses [`query_relay_at`].
+pub async fn query_relay_details_at(
+    state: &AppState,
+    api_base_url: &str,
+    filters: &[serde_json::Value],
+) -> Result<Vec<nostr::Event>, RelayErrorDetails> {
     crate::relay_admission::wait_for_rate_limit().await;
     let url = format!("{}/query", api_base_url);
-    let body_bytes =
-        serde_json::to_vec(filters).map_err(|e| format!("filter serialization failed: {e}"))?;
-    let auth = build_nip98_auth_header(&Method::POST, &url, &body_bytes, state)?;
+    let body_bytes = serde_json::to_vec(filters).map_err(|e| RelayErrorDetails {
+        error: format!("filter serialization failed: {e}"),
+        refusal: None,
+    })?;
+    let auth = build_nip98_auth_header(&Method::POST, &url, &body_bytes, state).map_err(|e| {
+        RelayErrorDetails {
+            error: e,
+            refusal: None,
+        }
+    })?;
     send_query_request(
         &state.http_client,
         &url,
@@ -409,6 +520,7 @@ pub async fn query_relay_at_with_keys(
         QUERY_REQUEST_TIMEOUT,
     )
     .await
+    .map_err(|details| details.error)
 }
 
 /// Issue an authenticated `POST /query` and parse the response, applying the
@@ -426,7 +538,7 @@ async fn send_query_request(
     auth_tag: Option<&str>,
     body_bytes: Vec<u8>,
     timeout: std::time::Duration,
-) -> Result<Vec<nostr::Event>, String> {
+) -> Result<Vec<nostr::Event>, RelayErrorDetails> {
     let mut request = http_client
         .post(url)
         .header("Authorization", auth)
@@ -439,11 +551,19 @@ async fn send_query_request(
         .body(body_bytes)
         .send()
         .await
-        .map_err(|e| classify_request_error(&e))?;
+        .map_err(|e| RelayErrorDetails {
+            error: classify_request_error(&e),
+            refusal: None,
+        })?;
     if !response.status().is_success() {
-        return Err(relay_error_message(response).await);
+        return Err(relay_error_details(response).await);
     }
-    parse_json_response(response).await
+    parse_json_response(response)
+        .await
+        .map_err(|error| RelayErrorDetails {
+            error,
+            refusal: None,
+        })
 }
 
 // ── Command response parsing ────────────────────────────────────────────────
@@ -537,8 +657,9 @@ pub async fn sync_managed_agent_profile(
     }
     // kind:0 is absolute state on the relay, so EVERY managed-agent profile
     // publish must carry the handle or the relay clears it. The existing
-    // handle is read back first so reconciles keep whatever the relay already
-    // attributes to this agent (see `nip05::stable_existing_handle`).
+    // handle is read back first so reconciles prefer whatever the agent
+    // already carries, subject to the relay confirming it still attributes
+    // that handle to this agent (see `nip05::resolve_managed_agent_nip05`).
     let agent_pubkey = agent_keys.public_key().to_hex();
     let existing = query_agent_profile(state, relay_url, &agent_pubkey)
         .await?

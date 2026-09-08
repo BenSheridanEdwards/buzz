@@ -65,6 +65,43 @@ pub enum RelayMembershipOutcome {
         actor_role: Option<String>,
         relay_message: Option<String>,
     },
+    /// The relay refused the command for a reason that is not about who may
+    /// edit the roster: a `created_at` outside its 120s window (a laptop
+    /// after sleep, a VM with clock drift), a banned actor, a NIP-98 failure.
+    /// The refusal proves nothing about membership, so it is persisted as
+    /// `Unknown` with the relay's own words and no operator command, and the
+    /// next start retries.
+    Refused { relay_message: String },
+}
+
+/// Is a relay refusal about THIS identity's authority over the roster?
+///
+/// The relay says so in exactly two ways, and they are the only two refusals
+/// that justify telling the user to go find an operator:
+/// `actor not authorized` from `handlers/relay_admin.rs`, and
+/// `relay_membership_required` from the HTTP bridge's membership gate
+/// (`api/mod.rs`, `enforce_relay_membership`). Everything else the same 4xx
+/// door emits (clock skew, a ban, a NIP-98 failure) refuses the command
+/// without saying anything about roles.
+pub fn refusal_is_about_authority(refusal: &crate::relay::RelayRefusal) -> bool {
+    let said = refusal.haystack();
+    said.contains("actor not authorized") || said.contains("relay_membership_required")
+}
+
+/// Turn a relay refusal into the outcome it justifies.
+fn outcome_for_refusal(
+    actor_role: Option<String>,
+    refusal: &crate::relay::RelayRefusal,
+) -> RelayMembershipOutcome {
+    if refusal_is_about_authority(refusal) {
+        return RelayMembershipOutcome::NotAuthorized {
+            actor_role,
+            relay_message: Some(refusal.message()),
+        };
+    }
+    RelayMembershipOutcome::Refused {
+        relay_message: refusal.message(),
+    }
 }
 
 /// What the preflight should do given the roster it read. Pure so the
@@ -122,7 +159,9 @@ fn roster_from_event(event: &nostr::Event) -> BTreeMap<String, String> {
 /// Reads the NIP-11 document, then the NIP-43 roster as the workspace
 /// identity, and submits a kind:9030 when that identity is an admin or
 /// owner. Errors are relay/network failures; a permission gap is a
-/// successful `NotAuthorized` outcome, not an error.
+/// successful `NotAuthorized` outcome, not an error, and a refusal that is
+/// not about permissions is a `Refused` outcome that says so instead of
+/// borrowing the permission copy.
 pub async fn ensure_managed_agent_relay_membership(
     state: &AppState,
     relay_ws_url: &str,
@@ -143,9 +182,15 @@ pub async fn ensure_managed_agent_relay_membership(
     let actor_pubkey = owner_keys.public_key().to_hex();
     let agent_pubkey = agent_pubkey.to_ascii_lowercase();
 
-    let events = tokio::time::timeout(
+    // The roster read is the first thing a closed relay refuses: the bridge
+    // enforces membership on `/query` before it looks at the filters, so a
+    // 403 here is the relay's answer about THIS identity, not a transport
+    // failure. A desktop identity that is not on the roster at all reaches
+    // exactly this door, and the answer belongs in the card as `NotMember`
+    // with the operator command, not as an unexplained `Unknown`.
+    let roster_read = tokio::time::timeout(
         MEMBERSHIP_QUERY_TIMEOUT,
-        crate::relay::query_relay_at(
+        crate::relay::query_relay_details_at(
             state,
             &http_base,
             &[serde_json::json!({
@@ -155,7 +200,16 @@ pub async fn ensure_managed_agent_relay_membership(
         ),
     )
     .await
-    .map_err(|_| "timed out reading the relay membership list".to_string())??;
+    .map_err(|_| "timed out reading the relay membership list".to_string())?;
+    let events = match roster_read {
+        Ok(events) => events,
+        Err(details) => {
+            let Some(refusal) = details.refusal else {
+                return Err(details.error);
+            };
+            return Ok(outcome_for_refusal(None, &refusal));
+        }
+    };
     let roster = events.first().map(roster_from_event).unwrap_or_default();
 
     match membership_action(
@@ -185,18 +239,15 @@ pub async fn ensure_managed_agent_relay_membership(
             .map_err(|_| "timed out adding the agent to the relay".to_string())??;
             match verdict {
                 crate::relay::SubmitVerdict::Accepted(_) => Ok(RelayMembershipOutcome::Registered),
-                // A structured refusal is the relay's definitive answer on
-                // THIS identity's authority (the relay checks its own roster,
-                // so an unpublished or stale kind:13534 cannot mislead it).
-                // It is a `NotAuthorized` outcome, not a transport error: the
-                // card shows the relay's message next to the operator
-                // command, and the next start retries anyway. Outages stay
-                // `Err` and are persisted as `Unknown` by the caller.
-                crate::relay::SubmitVerdict::Refused { relay_message, .. } => {
-                    Ok(RelayMembershipOutcome::NotAuthorized {
-                        actor_role,
-                        relay_message: Some(relay_message),
-                    })
+                // A structured refusal is the relay's definitive answer about
+                // THIS command (the relay checks its own roster, so an
+                // unpublished or stale kind:13534 cannot mislead it), but the
+                // same 4xx door carries refusals that have nothing to do with
+                // roles. Only an authorization refusal earns the "you are not
+                // an admin" copy and the operator command; anything else is
+                // kept verbatim as `Unknown`. Outages stay `Err`.
+                crate::relay::SubmitVerdict::Refused { refusal, .. } => {
+                    Ok(outcome_for_refusal(actor_role, &refusal))
                 }
             }
         }
@@ -318,6 +369,17 @@ pub fn not_member_detail(actor_role: Option<&str>, relay_message: Option<&str>) 
     }
 }
 
+/// Copy shown for a refusal that says nothing about roles. No operator
+/// command follows it: adding the agent by hand would not fix a skewed
+/// clock, and the next start retries the real check.
+pub fn refused_detail(relay_message: &str) -> String {
+    let why = "Buzz could not register this agent on the relay, and the relay did not say it was a permission problem.";
+    match relay_message.trim() {
+        "" => why.to_string(),
+        message => format!("{why} Relay said: {message}"),
+    }
+}
+
 /// Map an outcome onto the persisted state. `None` clears the entry.
 pub fn membership_record_for_outcome(
     outcome: &RelayMembershipOutcome,
@@ -343,7 +405,49 @@ pub fn membership_record_for_outcome(
                 relay_message.as_deref(),
             )),
         }),
+        RelayMembershipOutcome::Refused { relay_message } => Some(ManagedAgentRelayMembership {
+            state: RelayMembershipState::Unknown,
+            checked_at,
+            detail: Some(refused_detail(relay_message)),
+        }),
     }
+}
+
+/// Map the whole result of one check onto the persisted state.
+///
+/// Extracted from [`preflight_managed_agent_relay_membership`] so the
+/// `Err -> Unknown` rule is reachable without a `tauri::AppHandle`: a relay
+/// or network failure must never leave the last verified state on disk, or
+/// the card would keep claiming a membership this check did not confirm.
+pub fn membership_record_for_result(
+    result: &Result<RelayMembershipOutcome, String>,
+    checked_at: String,
+) -> Option<ManagedAgentRelayMembership> {
+    match result {
+        Ok(outcome) => membership_record_for_outcome(outcome, checked_at),
+        Err(error) => Some(ManagedAgentRelayMembership {
+            state: RelayMembershipState::Unknown,
+            checked_at,
+            detail: Some(error.clone()),
+        }),
+    }
+}
+
+/// Should this pair be checked against the relay again?
+///
+/// Only a sidecar record that positively says `Member` skips the check: that
+/// is the one state the relay already confirmed and that cannot silently
+/// become false while the agent runs (a demotion is an operator action that
+/// the next start re-checks anyway). `NotMember`, `Unknown` and no record at
+/// all all retry, which is what makes the start path the retry seam for an
+/// agent the operator has since admitted.
+pub fn should_preflight_membership(
+    store: &RelayMembershipStore,
+    agent_pubkey: &str,
+    relay_ws_url: &str,
+) -> bool {
+    !relay_membership_for(store, agent_pubkey, relay_ws_url)
+        .is_some_and(|membership| membership.state == RelayMembershipState::Member)
 }
 
 /// Run the registration for one pair and persist the result. A relay or
@@ -358,15 +462,7 @@ pub async fn preflight_managed_agent_relay_membership(
 ) -> Result<RelayMembershipOutcome, String> {
     let base_dir = super::managed_agents_base_dir(app)?;
     let outcome = ensure_managed_agent_relay_membership(state, relay_ws_url, agent_pubkey).await;
-    let now = crate::util::now_iso();
-    let record = match &outcome {
-        Ok(outcome) => membership_record_for_outcome(outcome, now),
-        Err(error) => Some(ManagedAgentRelayMembership {
-            state: RelayMembershipState::Unknown,
-            checked_at: now,
-            detail: Some(error.clone()),
-        }),
-    };
+    let record = membership_record_for_result(&outcome, crate::util::now_iso());
     {
         let _store_guard = state
             .managed_agents_store_lock
@@ -515,6 +611,116 @@ mod tests {
         );
     }
 
+    /// Only the relay's two authorization refusals earn the "not an admin"
+    /// copy and the operator command. Every other refusal the same 4xx door
+    /// carries is a different problem with a different remedy.
+    #[test]
+    fn refusal_classification_table() {
+        let cases = [
+            (
+                "invalid: actor not authorized: must be admin or owner",
+                true,
+            ),
+            ("relay_membership_required", true),
+            ("Actor Not Authorized", true),
+            (
+                "invalid: event timestamp out of range: created_at=1, now=2, delta=-1s (max ±120s)",
+                false,
+            ),
+            ("invalid: actor is banned", false),
+            ("invalid nip-98 authorization", false),
+            ("invalid: unknown kind", false),
+            ("", false),
+        ];
+        for (code, expected) in cases {
+            let refusal = crate::relay::RelayRefusal {
+                code: Some(code.to_string()),
+                detail: None,
+            };
+            assert_eq!(
+                refusal_is_about_authority(&refusal),
+                expected,
+                "code={code:?}"
+            );
+        }
+        // The bridge sends the machine reason and a human sentence; either
+        // half naming the refusal is enough.
+        assert!(refusal_is_about_authority(&crate::relay::RelayRefusal {
+            code: Some("relay_membership_required".into()),
+            detail: Some("You must be a relay member to access this relay".into()),
+        }));
+    }
+
+    /// The `Err -> Unknown` rule: a check that could not be completed must
+    /// overwrite whatever the sidecar held, never leave a stale `Member`
+    /// behind for the card to keep asserting.
+    #[test]
+    fn a_failed_check_persists_unknown_with_the_failure() {
+        let record = membership_record_for_result(
+            &Err("relay unreachable: request timed out".to_string()),
+            "t".into(),
+        )
+        .expect("a failure must still be recorded");
+        assert_eq!(record.state, RelayMembershipState::Unknown);
+        assert_eq!(
+            record.detail.as_deref(),
+            Some("relay unreachable: request timed out")
+        );
+        // An open relay still clears the entry through the same seam.
+        assert_eq!(
+            membership_record_for_result(&Ok(RelayMembershipOutcome::OpenRelay), "t".into()),
+            None
+        );
+        assert_eq!(
+            membership_record_for_result(&Ok(RelayMembershipOutcome::Registered), "t".into())
+                .map(|record| record.state),
+            Some(RelayMembershipState::Member)
+        );
+    }
+
+    /// The start/reconcile skip guard: only a verified `Member` skips the
+    /// check. Every other state retries, which is the only way an agent the
+    /// operator has since admitted ever leaves the `NotMember` card.
+    #[test]
+    fn only_a_verified_member_skips_the_preflight() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path();
+        const RELAY: &str = "ws://localhost:3000";
+
+        assert!(
+            should_preflight_membership(&load_relay_memberships(base), AGENT, RELAY),
+            "no record yet must check"
+        );
+        for (state, expected) in [
+            (RelayMembershipState::Member, false),
+            (RelayMembershipState::NotMember, true),
+            (RelayMembershipState::Unknown, true),
+        ] {
+            record_relay_membership(
+                base,
+                AGENT,
+                RELAY,
+                Some(ManagedAgentRelayMembership {
+                    state,
+                    checked_at: "t".into(),
+                    detail: None,
+                }),
+            )
+            .unwrap();
+            assert_eq!(
+                should_preflight_membership(&load_relay_memberships(base), AGENT, RELAY),
+                expected,
+                "state={state:?}"
+            );
+        }
+        // A `Member` record on one relay says nothing about another.
+        assert!(should_preflight_membership(
+            &load_relay_memberships(base),
+            AGENT,
+            "wss://other.example"
+        ));
+    }
+
     // Gated off Windows like the other stub-relay tests: `build_app_state()`
     // pulls native DLLs unavailable in the Windows CI runner.
     #[cfg(not(target_os = "windows"))]
@@ -531,6 +737,9 @@ mod tests {
             /// When set, `/events` answers HTTP 500 to everything (relay
             /// outage mid-request).
             events_outage: Arc<Mutex<bool>>,
+            /// When set, `/events` refuses every kind:9030 with this 400 JSON
+            /// `error`, whatever the sender's role.
+            events_refusal: Arc<Mutex<Option<String>>>,
         }
 
         /// The relay's own refusal for an unauthorized kind:9030, as the HTTP
@@ -539,24 +748,77 @@ mod tests {
         /// the reason coming from `handlers/relay_admin.rs`.
         const RELAY_NOT_AUTHORIZED: &str = "invalid: actor not authorized: must be admin or owner";
 
+        /// The relay's refusal of a command whose `created_at` is outside its
+        /// 120s window (`handlers/relay_admin.rs`). Same 400 JSON door as the
+        /// authorization refusal, entirely different meaning.
+        const RELAY_CLOCK_SKEW: &str =
+            "invalid: event timestamp out of range: created_at=1, now=2, delta=-1s (max ±120s)";
+
+        /// The bridge's membership refusal on a closed relay, verbatim from
+        /// `api/mod.rs`, `enforce_relay_membership`: HTTP 403 with both a
+        /// machine `error` and a human `message`.
+        fn membership_required_body() -> String {
+            serde_json::json!({
+                "error": "relay_membership_required",
+                "message": "You must be a relay member to access this relay"
+            })
+            .to_string()
+        }
+
+        /// Sender pubkey of a NIP-98 `Authorization: Nostr <base64 event>`
+        /// header, lowercased. The stub reads it for the same reason the
+        /// relay does: to decide whether this caller may read at all.
+        fn nip98_sender(headers: &axum::http::HeaderMap) -> String {
+            use base64::Engine as _;
+
+            let Some(encoded) = headers
+                .get(axum::http::header::AUTHORIZATION)
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| value.strip_prefix("Nostr "))
+            else {
+                return String::new();
+            };
+            base64::engine::general_purpose::STANDARD
+                .decode(encoded.trim())
+                .ok()
+                .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+                .and_then(|event| {
+                    event
+                        .get("pubkey")
+                        .and_then(|value| value.as_str())
+                        .map(str::to_ascii_lowercase)
+                })
+                .unwrap_or_default()
+        }
+
         /// Stub relay: `/info` advertises NIP-43 when `closed`; `/query`
-        /// answers the kind:13534 filter with a relay-signed roster (or
-        /// nothing when `publish_roster` is false, like a relay whose members
-        /// were seeded out of band and never announced); `/events` records
-        /// what was posted and enforces the relay's kind:9030 rule against
-        /// `authority` (the roster the relay itself holds): only an admin or
-        /// owner may add, and the reply is the bridge's refusal otherwise.
+        /// enforces membership before it looks at the filters, exactly as the
+        /// bridge does (`api/bridge.rs`, `query_events_authed`), then answers
+        /// the kind:13534 filter with a relay-signed roster (or nothing when
+        /// `publish_roster` is false, like a relay whose members were seeded
+        /// out of band and never announced); `/events` records what was
+        /// posted and enforces the relay's kind:9030 rule against `authority`
+        /// (the roster the relay itself holds): only an admin or owner may
+        /// add, and the reply is the bridge's refusal otherwise.
+        ///
+        /// `authority` is the relay's own roster, so a key absent from it is
+        /// a stranger to this relay and gets the 403 a real closed relay
+        /// gives it. The stub must not be more permissive than the gate the
+        /// production code is supposed to survive.
         async fn spawn_stub_relay_with(
             closed: bool,
             authority: Vec<(String, &'static str)>,
             publish_roster: bool,
         ) -> StubRelay {
             use axum::{
-                http::header::CONTENT_TYPE, http::StatusCode, routing::get, routing::post, Router,
+                http::header::CONTENT_TYPE, http::HeaderMap, http::StatusCode, routing::get,
+                routing::post, Router,
             };
 
             let events_outage = Arc::new(Mutex::new(false));
             let outage = events_outage.clone();
+            let events_refusal: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+            let refusal = events_refusal.clone();
 
             let relay_keys = nostr::Keys::generate();
             let roster_event = {
@@ -580,6 +842,10 @@ mod tests {
                 .filter(|(_, role)| *role == "admin" || *role == "owner")
                 .map(|(pubkey, _)| pubkey.to_ascii_lowercase())
                 .collect();
+            let relay_roster: Vec<String> = authority
+                .iter()
+                .map(|(pubkey, _)| pubkey.to_ascii_lowercase())
+                .collect();
             let app = Router::new()
                 .route(
                     "/info",
@@ -595,9 +861,18 @@ mod tests {
                 )
                 .route(
                     "/query",
-                    post(move |body: String| {
+                    post(move |headers: HeaderMap, body: String| {
                         let roster_event = roster_event.clone();
+                        let relay_roster = relay_roster.clone();
                         async move {
+                            let json = [(CONTENT_TYPE, "application/json")];
+                            // Membership first, before the filters are even
+                            // parsed: this is the door a desktop identity
+                            // that is not on the roster hits on a closed
+                            // relay.
+                            if closed && !relay_roster.contains(&nip98_sender(&headers)) {
+                                return (StatusCode::FORBIDDEN, json, membership_required_body());
+                            }
                             let filters: serde_json::Value =
                                 serde_json::from_str(&body).unwrap_or_default();
                             let wants_roster = filters
@@ -607,9 +882,9 @@ mod tests {
                                 .and_then(|k| k.as_array())
                                 .is_some_and(|k| k.iter().any(|v| v.as_u64() == Some(13534)));
                             if wants_roster && publish_roster {
-                                (StatusCode::OK, format!("[{roster_event}]"))
+                                (StatusCode::OK, json, format!("[{roster_event}]"))
                             } else {
-                                (StatusCode::OK, "[]".to_string())
+                                (StatusCode::OK, json, "[]".to_string())
                             }
                         }
                     }),
@@ -620,6 +895,7 @@ mod tests {
                         let seen = seen.clone();
                         let stewards = stewards.clone();
                         let outage = outage.clone();
+                        let refusal = refusal.clone();
                         async move {
                             let json = [(CONTENT_TYPE, "application/json")];
                             if *outage.lock().unwrap() {
@@ -645,6 +921,15 @@ mod tests {
                             let is_admin_command =
                                 event.get("kind").and_then(|v| v.as_u64()) == Some(9030);
                             seen.lock().unwrap().push(event);
+                            if is_admin_command {
+                                if let Some(reason) = refusal.lock().unwrap().clone() {
+                                    return (
+                                        StatusCode::BAD_REQUEST,
+                                        json,
+                                        serde_json::json!({ "error": reason }).to_string(),
+                                    );
+                                }
+                            }
                             if is_admin_command && !stewards.contains(&sender) {
                                 return (
                                     StatusCode::BAD_REQUEST,
@@ -677,6 +962,7 @@ mod tests {
                 ws_url: format!("ws://{addr}"),
                 posted,
                 events_outage,
+                events_refusal,
             }
         }
 
@@ -751,25 +1037,46 @@ mod tests {
             assert!(relay.posted.lock().unwrap().is_empty());
         }
 
-        /// A key the published roster does not list is not proven powerless
-        /// (the roster copy may be stale), so the add is attempted and the
-        /// relay's refusal becomes the outcome, verbatim, for the card.
+        /// A desktop identity the closed relay does not list at all never
+        /// gets as far as the roster: the bridge refuses its `/query` with
+        /// `relay_membership_required`. That 403 is the relay's answer about
+        /// this identity, so the card says "not a member" with the operator
+        /// command instead of an unexplained "unverified".
         #[tokio::test]
-        async fn stranger_is_refused_by_the_relay_and_the_refusal_is_kept() {
+        async fn stranger_is_refused_at_the_roster_read_and_the_refusal_is_kept() {
             let stranger = nostr::Keys::generate();
             let relay = spawn_stub_relay(true, vec![(OTHER.to_string(), "owner")]).await;
             let state = state_with_identity(&stranger);
             let outcome = ensure_managed_agent_relay_membership(&state, &relay.ws_url, AGENT)
                 .await
                 .unwrap();
+            let RelayMembershipOutcome::NotAuthorized {
+                actor_role,
+                relay_message,
+            } = outcome
+            else {
+                panic!("a 403 on the roster read is the relay's answer: {outcome:?}");
+            };
+            assert_eq!(actor_role, None);
             assert_eq!(
-                outcome,
-                RelayMembershipOutcome::NotAuthorized {
-                    actor_role: None,
-                    relay_message: Some(RELAY_NOT_AUTHORIZED.to_string()),
-                }
+                relay_message.as_deref(),
+                Some("You must be a relay member to access this relay")
             );
-            assert_eq!(relay.posted.lock().unwrap().len(), 1, "one refused attempt");
+            assert!(
+                relay.posted.lock().unwrap().is_empty(),
+                "a refused read must not be followed by a doomed 9030"
+            );
+            assert_eq!(
+                membership_record_for_outcome(
+                    &RelayMembershipOutcome::NotAuthorized {
+                        actor_role: None,
+                        relay_message
+                    },
+                    "t".into()
+                )
+                .map(|record| record.state),
+                Some(RelayMembershipState::NotMember)
+            );
         }
 
         /// Relay seeded by `buzz-admin add-member --role admin` that never
@@ -788,6 +1095,65 @@ mod tests {
                 .unwrap();
             assert_eq!(outcome, RelayMembershipOutcome::Registered);
             assert_eq!(relay.posted.lock().unwrap().len(), 1);
+        }
+
+        /// A relay member whose relay never published a roster event: the
+        /// read succeeds (it is a member) and says nothing, so the add is
+        /// attempted and the relay refuses it on authority. That refusal is
+        /// the one that earns the "you are not an admin" copy.
+        #[tokio::test]
+        async fn member_without_a_published_roster_is_refused_on_authority() {
+            let member = nostr::Keys::generate();
+            let relay =
+                spawn_stub_relay_with(true, vec![(member.public_key().to_hex(), "member")], false)
+                    .await;
+            let state = state_with_identity(&member);
+            let outcome = ensure_managed_agent_relay_membership(&state, &relay.ws_url, AGENT)
+                .await
+                .unwrap();
+            assert_eq!(
+                outcome,
+                RelayMembershipOutcome::NotAuthorized {
+                    actor_role: None,
+                    relay_message: Some(RELAY_NOT_AUTHORIZED.to_string()),
+                }
+            );
+            assert_eq!(relay.posted.lock().unwrap().len(), 1, "one refused attempt");
+        }
+
+        /// The relay refused the 9030 for a reason that has nothing to do
+        /// with roles: an admin whose laptop woke up with a skewed clock is
+        /// outside the relay's 120s window. Telling them they are not an
+        /// admin, and handing them an `add-member` command that would not fix
+        /// it, is wrong copy for a wrong diagnosis. It persists as `Unknown`
+        /// with the relay's own words and retries on the next start.
+        #[tokio::test]
+        async fn a_refusal_that_is_not_about_authority_is_not_notmember() {
+            let admin = nostr::Keys::generate();
+            let relay = spawn_stub_relay(true, vec![(admin.public_key().to_hex(), "admin")]).await;
+            *relay.events_refusal.lock().unwrap() = Some(RELAY_CLOCK_SKEW.to_string());
+            let state = state_with_identity(&admin);
+            let outcome = ensure_managed_agent_relay_membership(&state, &relay.ws_url, AGENT)
+                .await
+                .unwrap();
+            assert_eq!(
+                outcome,
+                RelayMembershipOutcome::Refused {
+                    relay_message: RELAY_CLOCK_SKEW.to_string(),
+                }
+            );
+            let record = membership_record_for_outcome(&outcome, "t".into()).unwrap();
+            assert_eq!(
+                record.state,
+                RelayMembershipState::Unknown,
+                "a non-authorization refusal must not claim a role problem"
+            );
+            let detail = record.detail.unwrap();
+            assert!(detail.contains("event timestamp out of range"), "{detail}");
+            assert!(
+                !detail.contains("not one of its admins"),
+                "wrong diagnosis in the card: {detail}"
+            );
         }
 
         #[tokio::test]

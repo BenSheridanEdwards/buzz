@@ -99,6 +99,9 @@ nostr = { version = "0.44", features = ["nip44", "nip49"] }
 getrandom = "0.2"
 zeroize = "1"
 percent-encoding = "2"
+# NFKD folding for NIP-05 handle derivation, so an accented display name
+# slugifies to its letters instead of losing them.
+unicode-normalization = "0.1"
 reqwest = { version = "0.13", features = ["json", "query", "stream", "blocking"] }
 rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "std"] }
 url = "2"

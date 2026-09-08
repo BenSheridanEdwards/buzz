@@ -1,12 +1,12 @@
 import { invoke as tauriInvoke } from "@tauri-apps/api/core";
 import {
-  fromRawRelayMembership,
-  type RawRelayMembership,
-} from "@/features/agents/lib/relayMembership";
-import {
   activateRateLimit,
   parseRateLimitHint,
 } from "@/shared/api/relayRateLimitGate";
+import {
+  fromRawRelayMembership,
+  type RawRelayMembership,
+} from "@/shared/api/relayMembershipTypes";
 import {
   fromRawInstallRuntimeResult,
   type RawInstallRuntimeResult,

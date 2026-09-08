@@ -2,29 +2,6 @@ import type { ManagedAgentRelayMembership } from "@/shared/api/types";
 import { safeNpub } from "@/shared/lib/nostrUtils";
 
 /**
- * Raw shape emitted by the Rust `ManagedAgentRelayMembership`
- * (`managed_agents/relay_membership.rs`). Kept here, next to the mapper, so
- * the seam between the sidecar store and the card is one file.
- */
-export type RawRelayMembership = {
-  state: "member" | "not_member" | "unknown";
-  checked_at: string;
-  detail?: string | null;
-};
-
-/** Map the Rust sidecar record onto the camelCase client type. */
-export function fromRawRelayMembership(
-  raw: RawRelayMembership | null | undefined,
-): ManagedAgentRelayMembership | null {
-  if (!raw) return null;
-  return {
-    state: raw.state,
-    checkedAt: raw.checked_at,
-    detail: raw.detail ?? null,
-  };
-}
-
-/**
  * Placeholder the operator replaces with their relay container name. Shown
  * verbatim so the command is copy-paste-then-edit, never silently wrong.
  */

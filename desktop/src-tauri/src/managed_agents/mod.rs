@@ -99,8 +99,11 @@ pub(crate) use readiness::{
 };
 pub use relay_membership::{
     clear_relay_membership, load_relay_memberships, preflight_managed_agent_relay_membership,
-    relay_membership_for, ManagedAgentRelayMembership, RelayMembershipState, RelayMembershipStore,
+    relay_membership_for, should_preflight_membership, ManagedAgentRelayMembership,
+    RelayMembershipStore,
 };
+#[cfg(test)]
+pub use relay_membership::{record_relay_membership, RelayMembershipState};
 pub use relay_mesh::*;
 pub use repos::{
     effective_repos_dir, ensure_repos_symlink, resolve_repos_at_boot, validate_repos_dir,

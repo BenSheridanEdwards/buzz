@@ -304,7 +304,10 @@ async fn stalled_query_request_times_out_with_classified_error() {
          if this guard fires, the production .timeout(...) was lost",
     );
 
-    let err = result.expect_err("a stalled /query must surface an error, not succeed");
+    let err = result
+        .expect_err("a stalled /query must surface an error, not succeed")
+        .error;
+
     assert_eq!(
         err, "relay unreachable: request timed out",
         "a timed-out /query must surface the stable classified string"
@@ -364,7 +367,10 @@ async fn stalled_response_body_times_out_with_classified_error() {
          consumption and resolve within 5s",
     );
 
-    let err = result.expect_err("a stalled response body must surface an error, not succeed");
+    let err = result
+        .expect_err("a stalled response body must surface an error, not succeed")
+        .error;
+
     assert_eq!(
         err, "relay unreachable: request timed out",
         "a body-stall timeout must surface the classified timeout string, not the \
@@ -425,7 +431,10 @@ async fn stalled_error_response_body_times_out_with_classified_error() {
          consumption and resolve within 5s",
     );
 
-    let err = result.expect_err("a stalled error-response body must surface an error, not succeed");
+    let err = result
+        .expect_err("a stalled error-response body must surface an error, not succeed")
+        .error;
+
     assert_eq!(
         err, "relay unreachable: request timed out",
         "a non-2xx body-stall timeout must surface the classified timeout string, not the \
@@ -479,7 +488,10 @@ async fn non_stalled_error_response_yields_status_message() {
     .await
     .expect("a promptly-served 500 must resolve well within 5s");
 
-    let err = result.expect_err("a 500 must surface an error, not succeed");
+    let err = result
+        .expect_err("a 500 must surface an error, not succeed")
+        .error;
+
     assert_eq!(
         err, "relay returned 500 Internal Server Error",
         "a non-stalled 500 must keep its status classification, not be reclassified as a timeout"
@@ -662,4 +674,116 @@ fn profile_event_rejects_invalid_auth_tag() {
         result.unwrap_err().contains("verification failed"),
         "error message should mention verification failure"
     );
+}
+
+// ── relay_error_details: the relay's own refusal, parsed once ─────────────
+//
+// Callers that must classify a refusal (the managed-agent membership
+// preflight) read the body's fields, never a rendered string split on ": ".
+// A change to how `relay_error_message` renders must not silently change
+// what those callers branch on.
+
+/// Answer one request with `status`, `body`, and a JSON content type.
+async fn serve_once(status: &'static str, body: String) -> String {
+    use std::io::{Read as _, Write as _};
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    std::thread::spawn(move || {
+        if let Ok((mut stream, _)) = listener.accept() {
+            let mut buf = [0u8; 4096];
+            let _ = stream.read(&mut buf);
+            let len = body.len();
+            let response = format!(
+                "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {len}\r\nConnection: close\r\n\r\n{body}"
+            );
+            let _ = stream.write_all(response.as_bytes());
+            let _ = stream.flush();
+        }
+    });
+    format!("http://{addr}/")
+}
+
+#[tokio::test]
+async fn a_4xx_json_body_keeps_the_relays_own_error_and_message() {
+    // The bridge's membership refusal: a machine reason AND a human sentence.
+    let url = serve_once(
+        "403 Forbidden",
+        r#"{"error":"relay_membership_required","message":"You must be a relay member to access this relay"}"#
+            .to_string(),
+    )
+    .await;
+    let response = reqwest::Client::new().get(&url).send().await.unwrap();
+    let details = super::relay_error_details(response).await;
+
+    let refusal = details.refusal.expect("a 4xx JSON body is a refusal");
+    assert_eq!(refusal.code.as_deref(), Some("relay_membership_required"));
+    assert_eq!(
+        refusal.message(),
+        "You must be a relay member to access this relay",
+        "the human sentence is what a card shows"
+    );
+    assert!(
+        refusal.haystack().contains("relay_membership_required"),
+        "the machine reason must stay reachable for classification"
+    );
+    // The rendered string is unchanged for every existing caller.
+    assert_eq!(
+        details.error,
+        "relay returned 403 Forbidden: You must be a relay member to access this relay"
+    );
+}
+
+#[tokio::test]
+async fn an_error_only_body_reports_that_error_as_both() {
+    // How `api_error` renders every ingest rejection: `error`, no `message`.
+    let url = serve_once(
+        "400 Bad Request",
+        r#"{"error":"invalid: actor not authorized: must be admin or owner"}"#.to_string(),
+    )
+    .await;
+    let response = reqwest::Client::new().get(&url).send().await.unwrap();
+    let details = super::relay_error_details(response).await;
+
+    let refusal = details.refusal.expect("a 4xx JSON body is a refusal");
+    assert_eq!(
+        refusal.message(),
+        "invalid: actor not authorized: must be admin or owner",
+        "with no human sentence the machine reason is the message"
+    );
+    assert_eq!(refusal.detail, None);
+}
+
+#[tokio::test]
+async fn an_outage_is_never_a_refusal() {
+    use crate::relay_admission::{reset_rate_limit_gate, TEST_SERIAL};
+
+    // A 5xx says nothing about the request.
+    let url = serve_once(
+        "500 Internal Server Error",
+        r#"{"error":"internal server error"}"#.to_string(),
+    )
+    .await;
+    let response = reqwest::Client::new().get(&url).send().await.unwrap();
+    let details = super::relay_error_details(response).await;
+    assert!(
+        details.refusal.is_none(),
+        "a 5xx must never be read as the relay's answer: {details:?}"
+    );
+
+    // Neither does a quota window, even though 429 is a 4xx.
+    let _serial = TEST_SERIAL.lock().await;
+    reset_rate_limit_gate();
+    let url = serve_once(
+        "429 Too Many Requests",
+        r#"{"error":"rate-limited: quota exceeded; retry in 4s"}"#.to_string(),
+    )
+    .await;
+    let response = reqwest::Client::new().get(&url).send().await.unwrap();
+    let details = super::relay_error_details(response).await;
+    assert!(
+        details.refusal.is_none(),
+        "a 429 must never be read as the relay's answer: {details:?}"
+    );
+    reset_rate_limit_gate();
 }
