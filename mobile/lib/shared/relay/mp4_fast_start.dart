@@ -33,11 +33,49 @@ final class _Mp4Box {
   });
 }
 
+/// Maps a byte position in the source file to its position in the output.
+///
+/// The output keeps every non-`moov` box in source order and inserts the
+/// (possibly shrunk) `moov` directly before the first `mdat`, so a position
+/// loses the old `moov` if it came after it and gains the new `moov` if it is
+/// at or past the first `mdat`. The top-level boxes tile the file exactly, so
+/// this holds for any byte, not only box starts.
+final class _Relocation {
+  final _Mp4Box moov;
+  final int firstMdatOffset;
+  final int newMoovSize;
+  final int fileLength;
+
+  const _Relocation({
+    required this.moov,
+    required this.firstMdatOffset,
+    required this.newMoovSize,
+    required this.fileLength,
+  });
+
+  int relocate(int position) {
+    if (position < 0 || position >= fileLength) {
+      throw const FormatException('chunk offset points outside the MP4');
+    }
+    if (position >= moov.offset && position < moov.offset + moov.size) {
+      throw const FormatException('chunk offset points into the moov box');
+    }
+    var relocated = position;
+    if (position > moov.offset) relocated -= moov.size;
+    if (position >= firstMdatOffset) relocated += newMoovSize;
+    return relocated;
+  }
+}
+
 /// Rewrites [source] to [destination] with `moov` before the first `mdat`.
 ///
-/// Only chunk offsets into the region moved by the relocation are adjusted.
-/// The files must be distinct, and malformed or excessively nested inputs fail
-/// closed rather than producing a partially valid upload.
+/// Every `stco`/`co64` entry is remapped through the relocation: the bytes
+/// between the first `mdat` and `moov` shift by the new `moov` size, and the
+/// bytes after the original `moov` shift by the change in its size, which is
+/// zero unless [stripMoovMetadata] dropped boxes. A chunk offset that points
+/// into `moov` itself or past the end of the file is rejected. The files must
+/// be distinct, and malformed or excessively nested inputs fail closed rather
+/// than producing a partially valid upload.
 ///
 /// With [stripMoovMetadata], `meta` and `udta` boxes directly under `moov` are
 /// dropped as well. Android's `MediaMuxer` has no switch for the metadata it
@@ -81,18 +119,20 @@ Future<void> rewriteMp4ForFastStart(
     if (stripMoovMetadata) {
       moovBytes = _withoutMoovMetadata(moovBytes, moov.headerSize);
     }
-    if (moov.offset > firstMdat.offset) {
-      _patchChunkOffsets(
-        moovBytes,
-        moov.headerSize,
-        moovBytes.length,
-        firstMdat.offset,
-        moov.offset,
-        moovBytes.length,
-        0,
-        [0],
-      );
-    }
+    final relocation = _Relocation(
+      moov: moov,
+      firstMdatOffset: firstMdat.offset,
+      newMoovSize: moovBytes.length,
+      fileLength: await input.length(),
+    );
+    _patchChunkOffsets(
+      moovBytes,
+      moov.headerSize,
+      moovBytes.length,
+      relocation,
+      0,
+      [0],
+    );
 
     final output = await destination.open(mode: FileMode.write);
     try {
@@ -239,9 +279,7 @@ void _patchChunkOffsets(
   Uint8List bytes,
   int start,
   int end,
-  int movedRegionStart,
-  int movedRegionEnd,
-  int delta,
+  _Relocation relocation,
   int depth,
   List<int> boxesSeen,
 ) {
@@ -258,33 +296,17 @@ void _patchChunkOffsets(
     final boxEnd = offset + box.size;
     switch (box.type) {
       case 'stco':
-        _patchStco(
-          bytes,
-          offset + box.headerSize,
-          boxEnd,
-          movedRegionStart,
-          movedRegionEnd,
-          delta,
-        );
+        _patchStco(bytes, offset + box.headerSize, boxEnd, relocation);
         break;
       case 'co64':
-        _patchCo64(
-          bytes,
-          offset + box.headerSize,
-          boxEnd,
-          movedRegionStart,
-          movedRegionEnd,
-          delta,
-        );
+        _patchCo64(bytes, offset + box.headerSize, boxEnd, relocation);
         break;
       case final type when _containerTypes.contains(type):
         _patchChunkOffsets(
           bytes,
           offset + box.headerSize,
           boxEnd,
-          movedRegionStart,
-          movedRegionEnd,
-          delta,
+          relocation,
           depth + 1,
           boxesSeen,
         );
@@ -329,14 +351,7 @@ _Mp4Box _readMemoryBoxHeader(Uint8List bytes, int offset, int end) {
   );
 }
 
-void _patchStco(
-  Uint8List bytes,
-  int start,
-  int end,
-  int movedRegionStart,
-  int movedRegionEnd,
-  int delta,
-) {
+void _patchStco(Uint8List bytes, int start, int end, _Relocation relocation) {
   if (end - start < 8) throw const FormatException('truncated stco box');
   final count = _readUint32(bytes, start + 4);
   if (count > (end - start - 8) ~/ 4) {
@@ -345,25 +360,15 @@ void _patchStco(
   final data = ByteData.sublistView(bytes);
   for (var index = 0; index < count; index++) {
     final entry = start + 8 + index * 4;
-    final value = data.getUint32(entry, Endian.big);
-    if (value >= movedRegionStart && value < movedRegionEnd) {
-      final adjusted = value + delta;
-      if (adjusted > _uint32Max) {
-        throw const FormatException('stco offset overflow');
-      }
-      data.setUint32(entry, adjusted, Endian.big);
+    final adjusted = relocation.relocate(data.getUint32(entry, Endian.big));
+    if (adjusted > _uint32Max) {
+      throw const FormatException('stco offset overflow');
     }
+    data.setUint32(entry, adjusted, Endian.big);
   }
 }
 
-void _patchCo64(
-  Uint8List bytes,
-  int start,
-  int end,
-  int movedRegionStart,
-  int movedRegionEnd,
-  int delta,
-) {
+void _patchCo64(Uint8List bytes, int start, int end, _Relocation relocation) {
   if (end - start < 8) throw const FormatException('truncated co64 box');
   final count = _readUint32(bytes, start + 4);
   if (count > (end - start - 8) ~/ 8) {
@@ -372,14 +377,11 @@ void _patchCo64(
   final data = ByteData.sublistView(bytes);
   for (var index = 0; index < count; index++) {
     final entry = start + 8 + index * 8;
-    final value = data.getUint64(entry, Endian.big);
-    if (value >= movedRegionStart && value < movedRegionEnd) {
-      final adjusted = value + delta;
-      if (adjusted > _uint64Max) {
-        throw const FormatException('co64 offset overflow');
-      }
-      data.setUint64(entry, adjusted, Endian.big);
+    final adjusted = relocation.relocate(data.getUint64(entry, Endian.big));
+    if (adjusted > _uint64Max) {
+      throw const FormatException('co64 offset overflow');
     }
+    data.setUint64(entry, adjusted, Endian.big);
   }
 }
 

@@ -193,13 +193,15 @@ Widget _buildComposeBar({
   VoiceNoteRecorder Function()? voiceNoteRecorderFactory,
   VoiceNotePlayerController Function()? voiceNotePlayerFactory,
   bool relayAcceptsAudio = false,
+  http.Client? relayInfoClient,
 }) {
   return ProviderScope(
     overrides: [
       customEmojiListProvider.overrideWithValue(customEmoji),
       mediaUploadServiceProvider.overrideWithValue(uploadService),
       relayAudioSupportHttpClientProvider.overrideWithValue(
-        _fakeRelayInfoClient(relayAcceptsAudio: relayAcceptsAudio),
+        relayInfoClient ??
+            _fakeRelayInfoClient(relayAcceptsAudio: relayAcceptsAudio),
       ),
       if (voiceNoteRecorderFactory != null)
         voiceNoteRecorderFactoryProvider.overrideWithValue(
@@ -415,6 +417,11 @@ class _FakeVoiceNoteUploadService extends MediaUploadService {
   Completer<BlobDescriptor>? pendingVoiceNoteUpload;
   XFile? file;
 
+  /// When set, the relay "rejects" the bare audio: the production
+  /// [MediaUploadService.uploadVoiceNote] contract is to fire
+  /// `onAudioRejected` and finish the upload as the envelope.
+  bool rejectsAudio = false;
+
   @override
   Future<XFile?> pickAttachmentFile() async => file;
 
@@ -423,6 +430,7 @@ class _FakeVoiceNoteUploadService extends MediaUploadService {
     XFile voiceNote, {
     required Duration duration,
     bool relayAcceptsAudio = false,
+    VoidCallback? onAudioRejected,
     ValueChanged<double>? onProgress,
     UploadCancellationToken? cancellationToken,
   }) async {
@@ -432,6 +440,10 @@ class _FakeVoiceNoteUploadService extends MediaUploadService {
       waveform: const [],
     );
     uploadedWithRelayAudio = relayAcceptsAudio;
+    if (relayAcceptsAudio && rejectsAudio) {
+      onAudioRejected?.call();
+      relayAcceptsAudio = false;
+    }
     final pending = pendingVoiceNoteUpload;
     if (pending != null) return pending.future;
     onProgress?.call(1);
@@ -4889,6 +4901,140 @@ void main() {
         ]),
       );
     });
+
+    testWidgets('only voice notes wait on the relay audio capability read', (
+      tester,
+    ) async {
+      // A NIP-11 read that never answers must not hold up an image send.
+      var relayInfoRequests = 0;
+      final hangingRelayInfo = http_testing.MockClient((request) {
+        relayInfoRequests++;
+        return Completer<http.Response>().future;
+      });
+      final uploadService = MediaUploadService(
+        baseUrl: 'https://relay.example',
+        nsec: nostr.Keys.generate().nsec,
+        httpClient: http_testing.MockClient((request) async {
+          return http.Response(
+            jsonEncode({
+              'url': 'https://relay.example/media/test.png',
+              'sha256':
+                  '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef',
+              'size': 16,
+              'type': 'image/png',
+              'uploaded': 1,
+            }),
+            200,
+          );
+        }),
+        pickGalleryVideo: () async => null,
+        pickGalleryImage: () async =>
+            XFile.fromData(_pngBytes, name: 'tiny.png'),
+      );
+      String? sentContent;
+      await tester.pumpWidget(
+        _buildComposeBar(
+          uploadService: uploadService,
+          relayInfoClient: hangingRelayInfo,
+          onSend:
+              (
+                content,
+                mentionPubkeys, {
+                mediaTags = const <List<String>>[],
+              }) async {
+                sentContent = content;
+              },
+        ),
+      );
+
+      await _openSystemPhotoPicker(tester);
+      await tester.pumpAndSettle();
+      await _expandComposer(tester);
+      await tester.tap(find.byIcon(LucideIcons.arrowUp));
+      await tester.pump();
+      await tester.pumpAndSettle();
+
+      expect(sentContent, '\n![image](https://relay.example/media/test.png)');
+      expect(relayInfoRequests, 0, reason: 'no voice note, no NIP-11 read');
+    });
+
+    for (final relayRejectsAudio in [true, false]) {
+      testWidgets('a relay that refuses bare audio drops its cached verdict '
+          '(rejects: $relayRejectsAudio)', (tester) async {
+        var relayInfoRequests = 0;
+        final relayInfo = http_testing.MockClient((request) async {
+          relayInfoRequests++;
+          return http.Response(
+            jsonEncode({
+              'supported_extensions': ['buzz-audio'],
+            }),
+            200,
+          );
+        });
+        final recorder = _FakeVoiceNoteRecorder();
+        final uploadService = _FakeVoiceNoteUploadService()
+          ..rejectsAudio = relayRejectsAudio;
+        String? sentContent;
+        await tester.pumpWidget(
+          _buildComposeBar(
+            uploadService: uploadService,
+            relayInfoClient: relayInfo,
+            voiceNoteRecorderFactory: () => recorder,
+            voiceNotePlayerFactory: _FakeVoiceNotePlayer.new,
+            onSend:
+                (
+                  content,
+                  mentionPubkeys, {
+                  mediaTags = const <List<String>>[],
+                }) async {
+                  sentContent = content;
+                },
+          ),
+        );
+
+        await _expandComposer(tester);
+        await _openAttachmentMenu(tester);
+        await tester.tap(find.text('Voice note'));
+        await tester.pumpAndSettle();
+        await tester.tap(
+          find.byKey(const ValueKey('voice-note-recorder-stop')),
+        );
+        await tester.pumpAndSettle();
+        await tester.tap(
+          find
+              .ancestor(
+                of: find.byIcon(LucideIcons.arrowUp),
+                matching: find.byType(IconButton),
+              )
+              .hitTestable(),
+        );
+        await tester.pumpAndSettle();
+
+        expect(relayInfoRequests, 1);
+        expect(uploadService.uploadedWithRelayAudio, isTrue);
+        final extension = relayRejectsAudio ? 'mp4' : 'm4a';
+        expect(
+          sentContent,
+          '\n[voice-note-test.$extension]'
+          '(https://relay.example/media/voice-note.$extension)',
+          reason: 'a rejected audio upload is resent as the envelope',
+        );
+
+        // The next verdict read re-fetches NIP-11 only after a rejection;
+        // otherwise the five minute cache still holds.
+        final container = ProviderScope.containerOf(
+          tester.element(find.byTooltip('Add attachment').first),
+          listen: false,
+        );
+        expect(
+          await container.read(
+            relayAudioSupportProvider('http://localhost:3000').future,
+          ),
+          isTrue,
+        );
+        expect(relayInfoRequests, relayRejectsAudio ? 2 : 1);
+      });
+    }
 
     testWidgets('community switch cancels pending voice-note startup', (
       tester,

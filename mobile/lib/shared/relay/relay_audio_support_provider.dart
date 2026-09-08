@@ -1,21 +1,23 @@
 import 'dart:async';
-import 'dart:convert';
 
 import 'package:hooks_riverpod/hooks_riverpod.dart';
 import 'package:http/http.dart' as http;
 
+import 'relay_info_document.dart';
 import 'relay_info_uri.dart';
 
 /// NIP-11 `supported_extensions` entry a relay advertises when it accepts
 /// metadata-free `audio/mpeg` and `audio/mp4` uploads and serves them inline.
 const relayAudioExtension = 'buzz-audio';
 
-/// How long a failed NIP-11 read is trusted before the relay is asked again.
+/// How long any verdict (supported, unsupported, or unreadable) is trusted
+/// before the relay's NIP-11 document is read again.
 ///
-/// A relay that answered is cached for the session; only failures (timeout,
-/// non-2xx, malformed document) are retried, so a transient outage does not
-/// pin the session to the MP4 envelope. Mirrors the desktop's bounded cache.
-const relayAudioSupportRetryDelay = Duration(minutes: 5);
+/// Matches the desktop's `AUDIO_CAPABILITY_TTL`, so an operator toggling the
+/// extension takes effect on both clients within five minutes without a
+/// restart. A relay that rejects an `audio/mp4` upload is invalidated at once
+/// by the sender (see `MediaUploadService.uploadVoiceNote`).
+const relayAudioSupportTtl = Duration(minutes: 5);
 
 /// Supplies the HTTP client used for NIP-11 audio capability reads.
 ///
@@ -28,10 +30,9 @@ final relayAudioSupportHttpClientProvider = Provider<http.Client>((ref) {
 
 /// Whether the relay at the given URL advertises [relayAudioExtension].
 ///
-/// Reads the relay's public NIP-11 document once per relay URL per session.
-/// Any fetch or parse failure resolves to `false` so callers fall back to the
-/// MP4 voice-note envelope every relay accepts; the failed verdict is retried
-/// after [relayAudioSupportRetryDelay].
+/// Reads the relay's public NIP-11 document at most once per relay URL per
+/// [relayAudioSupportTtl]. Any fetch or parse failure resolves to `false` so
+/// callers fall back to the MP4 voice-note envelope every relay accepts.
 final relayAudioSupportProvider = FutureProvider.family<bool, String>((
   ref,
   relayUrl,
@@ -39,34 +40,14 @@ final relayAudioSupportProvider = FutureProvider.family<bool, String>((
   final uri = relayInfoUri(relayUrl);
   if (uri == null) return false;
 
-  final verdict = await _readRelayAudioSupport(
+  final expiry = Timer(relayAudioSupportTtl, ref.invalidateSelf);
+  ref.onDispose(expiry.cancel);
+  final document = await readRelayInfoDocument(
     ref.read(relayAudioSupportHttpClientProvider),
     uri,
   );
-  if (verdict == null) {
-    final retry = Timer(relayAudioSupportRetryDelay, ref.invalidateSelf);
-    ref.onDispose(retry.cancel);
-    return false;
-  }
-  return verdict;
+  return document != null && relayInfoAdvertisesAudio(document);
 });
-
-/// Returns the relay's verdict, or `null` when it could not be read.
-Future<bool?> _readRelayAudioSupport(http.Client client, Uri uri) async {
-  try {
-    final response = await client
-        .get(uri, headers: const {'Accept': 'application/nostr+json'})
-        .timeout(const Duration(seconds: 5));
-    if (response.statusCode < 200 || response.statusCode >= 300) {
-      return null;
-    }
-    final document = jsonDecode(response.body);
-    if (document is! Map<String, dynamic>) return null;
-    return relayInfoAdvertisesAudio(document);
-  } catch (_) {
-    return null;
-  }
-}
 
 /// Whether a decoded NIP-11 document lists [relayAudioExtension] in
 /// `supported_extensions`. A missing or malformed list reads as `false`.

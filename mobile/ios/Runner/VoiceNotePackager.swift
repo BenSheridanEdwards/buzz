@@ -282,31 +282,73 @@ enum VoiceNotePackager {
 
     /// Exports the recording as bare AAC audio for relays that accept `audio/mp4`.
     ///
-    /// The composition carries only the audio track and the `.m4a` output type keeps the
-    /// container an ISO `M4A ` brand rather than QuickTime. `metadata = []` plus the sharing
-    /// filter stop AVFoundation from writing any `udta`/`meta` box, which the relay rejects.
+    /// The AAC samples are passed through untouched with `AVAssetReader` and an
+    /// `AVAssetWriter` of file type `.mp4`: no second lossy encode, and the writer emits
+    /// `ftyp` (`mp42`), `moov` and `mdat` only. `AVAssetExportPresetAppleM4A` and the `.m4a`
+    /// writer both add an iTunes gapless `udta/meta/ilst` atom that `metadata = []` cannot
+    /// suppress and the relay rejects. The Dart side keeps the `.m4a` name and `audio/mp4`.
     private static func exportVoiceNoteAudio(
         sourceURL: URL,
         result: @escaping FlutterResult
     ) {
         let sourceAsset = AVURLAsset(url: sourceURL)
-        let composition = AVMutableComposition()
+        let outputURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString)
+            .appendingPathExtension("m4a")
+        let reader: AVAssetReader
+        let readerOutput: AVAssetReaderTrackOutput
+        let writer: AVAssetWriter
+        let writerInput: AVAssetWriterInput
         do {
-            guard
-                let sourceAudio = sourceAsset.tracks(withMediaType: .audio).first,
-                let destinationAudio = composition.addMutableTrack(
-                    withMediaType: .audio,
-                    preferredTrackID: kCMPersistentTrackID_Invalid
-                )
-            else {
+            guard let sourceAudio = sourceAsset.tracks(withMediaType: .audio).first else {
                 throw NSError(
                     domain: "BuzzVoiceNote",
                     code: 6,
                     userInfo: [NSLocalizedDescriptionKey: "Unable to assemble the voice note audio."]
                 )
             }
-            try destinationAudio.insertTimeRange(sourceAudio.timeRange, of: sourceAudio, at: .zero)
+            let formatHint = sourceAudio.formatDescriptions.first.map { $0 as! CMFormatDescription }
+            reader = try AVAssetReader(asset: sourceAsset)
+            readerOutput = AVAssetReaderTrackOutput(track: sourceAudio, outputSettings: nil)
+            readerOutput.alwaysCopiesSampleData = false
+            writer = try AVAssetWriter(outputURL: outputURL, fileType: .mp4)
+            writer.metadata = []
+            writer.shouldOptimizeForNetworkUse = true
+            writerInput = AVAssetWriterInput(
+                mediaType: .audio,
+                outputSettings: nil,
+                sourceFormatHint: formatHint
+            )
+            writerInput.expectsMediaDataInRealTime = false
+            guard reader.canAdd(readerOutput), writer.canAdd(writerInput) else {
+                throw NSError(
+                    domain: "BuzzVoiceNote",
+                    code: 7,
+                    userInfo: [NSLocalizedDescriptionKey: "Unable to pass the voice note audio through."]
+                )
+            }
+            reader.add(readerOutput)
+            writer.add(writerInput)
+            guard reader.startReading() else {
+                throw reader.error
+                    ?? NSError(
+                        domain: "BuzzVoiceNote",
+                        code: 8,
+                        userInfo: [NSLocalizedDescriptionKey: "Unable to read the voice note audio."]
+                    )
+            }
+            guard writer.startWriting() else {
+                reader.cancelReading()
+                throw writer.error
+                    ?? NSError(
+                        domain: "BuzzVoiceNote",
+                        code: 2,
+                        userInfo: [NSLocalizedDescriptionKey: "Unable to start the voice note audio."]
+                    )
+            }
+            writer.startSession(atSourceTime: .zero)
         } catch {
+            try? FileManager.default.removeItem(at: outputURL)
             result(
                 FlutterError(
                     code: "transcode_failed",
@@ -317,28 +359,88 @@ enum VoiceNotePackager {
             return
         }
 
-        guard let exportSession = AVAssetExportSession(
-            asset: composition,
-            presetName: AVAssetExportPresetAppleM4A
-        ) else {
+        let completionQueue = DispatchQueue(label: "xyz.block.buzz.voice-note-audio")
+        let completion = VoiceNoteExportCompletion(outputURL: outputURL, videoURL: nil)
+        func fail(_ error: Error?) {
+            completion.exportDidFinish(
+                succeeded: false,
+                deliver: {
+                    result(
+                        FlutterError(
+                            code: "transcode_failed",
+                            message: "Voice note packaging failed.",
+                            details: error?.localizedDescription
+                        )
+                    )
+                }
+            )
+        }
+        completionQueue.asyncAfter(deadline: .now() + exportTimeout) {
+            completion.timeout(
+                cancel: {
+                    reader.cancelReading()
+                    writer.cancelWriting()
+                },
+                deliver: {
+                    result(
+                        FlutterError(
+                            code: "transcode_failed",
+                            message: "Voice note packaging timed out.",
+                            details: nil
+                        )
+                    )
+                }
+            )
+        }
+        writerInput.requestMediaDataWhenReady(on: completionQueue) {
+            while writerInput.isReadyForMoreMediaData {
+                guard writer.status == .writing else { return }
+                guard let sample = readerOutput.copyNextSampleBuffer() else {
+                    writerInput.markAsFinished()
+                    guard reader.status == .completed else {
+                        writer.cancelWriting()
+                        fail(reader.error)
+                        return
+                    }
+                    writer.finishWriting {
+                        completionQueue.async {
+                            guard writer.status == .completed else {
+                                fail(writer.error)
+                                return
+                            }
+                            completion.exportDidFinish(
+                                succeeded: true,
+                                deliver: { deliverCanonicalized(outputURL: outputURL, result: result) }
+                            )
+                        }
+                    }
+                    return
+                }
+                guard writerInput.append(sample) else {
+                    reader.cancelReading()
+                    writer.cancelWriting()
+                    fail(writer.error)
+                    return
+                }
+            }
+        }
+    }
+
+    /// Neutralizes `sdtp` in a finished export and hands its path to Flutter.
+    private static func deliverCanonicalized(outputURL: URL, result: @escaping FlutterResult) {
+        do {
+            try MP4Canonicalizer.neutralizeSampleDependencyBoxes(at: outputURL)
+            result(outputURL.path)
+        } catch {
+            try? FileManager.default.removeItem(at: outputURL)
             result(
                 FlutterError(
                     code: "transcode_failed",
-                    message: "Unable to create voice note export session.",
-                    details: nil
+                    message: "Unable to canonicalize voice note.",
+                    details: error.localizedDescription
                 )
             )
-            return
         }
-        let outputURL = FileManager.default.temporaryDirectory
-            .appendingPathComponent(UUID().uuidString)
-            .appendingPathExtension("m4a")
-        exportSession.outputURL = outputURL
-        exportSession.outputFileType = .m4a
-        exportSession.shouldOptimizeForNetworkUse = true
-        exportSession.metadata = []
-        exportSession.metadataItemFilter = AVMetadataItemFilter.forSharing()
-        runExport(exportSession, outputURL: outputURL, videoURL: nil, result: result)
     }
 
     /// Runs a configured export with a timeout, canonicalizes the output and delivers the
@@ -375,19 +477,7 @@ enum VoiceNotePackager {
                     deliver: {
                         switch exportSession.status {
                         case .completed:
-                            do {
-                                try MP4Canonicalizer.neutralizeSampleDependencyBoxes(at: outputURL)
-                                result(outputURL.path)
-                            } catch {
-                                try? FileManager.default.removeItem(at: outputURL)
-                                result(
-                                    FlutterError(
-                                        code: "transcode_failed",
-                                        message: "Unable to canonicalize voice note.",
-                                        details: error.localizedDescription
-                                    )
-                                )
-                            }
+                            deliverCanonicalized(outputURL: outputURL, result: result)
                         default:
                             result(
                                 FlutterError(

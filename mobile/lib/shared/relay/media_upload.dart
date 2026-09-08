@@ -106,6 +106,21 @@ class MediaPolicyUploadException implements Exception {
   String toString() => _mediaPolicyUploadMessage;
 }
 
+/// The relay refused a bare `audio/mp4` upload with 415 or 422.
+///
+/// Raised only on the `buzz-audio` path: the relay's NIP-11 verdict was
+/// stale (the operator disabled audio uploads, or a rollback dropped the
+/// extension), so the caller invalidates it and resends the envelope.
+class RelayAudioRejectedException implements Exception {
+  final int statusCode;
+  final String body;
+
+  const RelayAudioRejectedException(this.statusCode, this.body);
+
+  @override
+  String toString() => 'relay rejected audio upload ($statusCode): $body';
+}
+
 /// Cancels a single user-initiated media upload without closing the shared
 /// HTTP client used by later uploads.
 class UploadCancellationToken {
@@ -488,10 +503,16 @@ class MediaUploadService {
   /// (`audio/mp4`, `voice-note-<id>.m4a`); otherwise it is wrapped in the
   /// canonical MP4 envelope (`video/mp4`, `voice-note-<id>.mp4`) that relays
   /// without the `buzz-audio` extension accept.
+  ///
+  /// A 415 or 422 on the audio upload means the relay's advertised verdict is
+  /// stale: [onAudioRejected] fires so the caller can drop the cached verdict,
+  /// and the note is packaged again and resent as the envelope in the same
+  /// call, so one wrong guess never strands the user on a retry loop.
   Future<BlobDescriptor> uploadVoiceNote(
     XFile voiceNote, {
     required Duration duration,
     bool relayAcceptsAudio = false,
+    VoidCallback? onAudioRejected,
     ValueChanged<double>? onProgress,
     UploadCancellationToken? cancellationToken,
   }) async {
@@ -500,9 +521,36 @@ class MediaUploadService {
     if (!_allowedAudioMimeTypes.contains(mimeType)) {
       throw Exception('unsupported voice note type: $mimeType');
     }
-    final container = relayAcceptsAudio
-        ? VoiceNoteContainer.m4a
-        : VoiceNoteContainer.mp4;
+    if (relayAcceptsAudio) {
+      try {
+        return await _uploadPackagedVoiceNote(
+          voiceNote,
+          VoiceNoteContainer.m4a,
+          duration: duration,
+          onProgress: onProgress,
+          cancellationToken: cancellationToken,
+        );
+      } on RelayAudioRejectedException {
+        onAudioRejected?.call();
+        _throwIfCancelled(cancellationToken);
+      }
+    }
+    return _uploadPackagedVoiceNote(
+      voiceNote,
+      VoiceNoteContainer.mp4,
+      duration: duration,
+      onProgress: onProgress,
+      cancellationToken: cancellationToken,
+    );
+  }
+
+  Future<BlobDescriptor> _uploadPackagedVoiceNote(
+    XFile voiceNote,
+    VoiceNoteContainer container, {
+    required Duration duration,
+    ValueChanged<double>? onProgress,
+    UploadCancellationToken? cancellationToken,
+  }) async {
     String? packagedPath;
     try {
       packagedPath = await _packageVoiceNoteForUpload(
@@ -641,10 +689,14 @@ class MediaUploadService {
       );
     }
     if (response.statusCode < 200 || response.statusCode >= 300) {
-      if (_allowedImageMimeTypes.contains(mimeType) &&
-          (response.statusCode == HttpStatus.unsupportedMediaType ||
-              response.statusCode == HttpStatus.unprocessableEntity)) {
+      final policyRejection =
+          response.statusCode == HttpStatus.unsupportedMediaType ||
+          response.statusCode == HttpStatus.unprocessableEntity;
+      if (policyRejection && _allowedImageMimeTypes.contains(mimeType)) {
         throw const MediaPolicyUploadException();
+      }
+      if (policyRejection && allowAudio) {
+        throw RelayAudioRejectedException(response.statusCode, response.body);
       }
       throw Exception(
         'upload failed (${response.statusCode}): ${response.body}',
