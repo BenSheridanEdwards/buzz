@@ -11,6 +11,29 @@ export type UploadMediaBytes = (
   filename?: string,
 ) => Promise<BlobDescriptor>;
 
+/**
+ * A persona edit whose avatar the relay will actually accept.
+ *
+ * Create already uploads a base64 data URL to relay media and stores the https
+ * URL. Edit must do the same: `update_persona` copies the persona's
+ * `avatar_url` into every linked instance and republishes their kind:0
+ * `picture`, and the relay rejects any event content over 256 KiB — a rejected
+ * persona head then sits in the sync queue and is retried every 30 s forever.
+ * An avatar picked from a Hermes profile is exactly such a data URL.
+ *
+ * An input that carries no `avatarUrl` at all is returned untouched: absent
+ * means "leave the stored avatar alone", which is not the same as clearing it.
+ */
+export async function personaInputWithResolvedAvatar<
+  T extends { avatarUrl?: string },
+>(input: T, upload?: UploadMediaBytes): Promise<T> {
+  if (input.avatarUrl === undefined) {
+    return input;
+  }
+  const avatarUrl = await resolveManagedAgentAvatarUrl(input.avatarUrl, upload);
+  return avatarUrl === input.avatarUrl ? input : { ...input, avatarUrl };
+}
+
 export async function resolveManagedAgentAvatarUrl(
   avatarUrl: string | null | undefined,
   upload: UploadMediaBytes = defaultUploadMediaBytes,

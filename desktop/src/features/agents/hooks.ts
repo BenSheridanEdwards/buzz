@@ -17,6 +17,7 @@ import {
 } from "@/features/channels/hooks";
 import { updateCachedChannelMemberDisplayName } from "@/features/channels/channelMemberProfileCache";
 import { evictUsersBatchEntries } from "@/features/profile/hooks";
+import { personaInputWithResolvedAvatar } from "./ui/managedAgentAvatar";
 import {
   useAppFocused,
   useFocusedRefetchInterval,
@@ -519,7 +520,8 @@ export function useUpdatePersonaMutation() {
   const queryClient = useQueryClient();
 
   return useMutation({
-    mutationFn: (input: UpdatePersonaInput) => updatePersona(input),
+    mutationFn: async (input: UpdatePersonaInput) =>
+      updatePersona(await personaInputWithResolvedAvatar(input)),
     onSettled: async (_data, _error, variables) => {
       // Evict per-pubkey users-batch-entry caches for agents linked to this
       // persona so the subsequent batch invalidation refetches fresh profiles
