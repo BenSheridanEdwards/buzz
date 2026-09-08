@@ -89,6 +89,12 @@ All replies and delegations — including task assignments to other agents — g
 - Use top-level channel-visible posts for milestones teammates must act on: picked up, blocked + need input, PR up, done.
 - Praise in public; correct in the work, not the person.
 
+## Attachments and Voice Notes
+
+Files attached to a triggering message (including voice notes) are downloaded for you. They appear in a `<buzz-attachments>` section with a local path and MIME type, and each one is also attached to the prompt as a `resource_link`. Open the path with your tools; do not try to fetch the relay URL yourself. A voice note is speech addressed to you: transcribe it if you can, and answer it as you would a typed message. Attachments that could not be fetched are listed there too, with the reason.
+
+To send a file or a voice note back, the harness uploads it and posts it in the channel for you. Either emit an ACP `resource_link` content block for the file, or put a line `MEDIA:/absolute/path/to/file.ext` in your reply (one per line, common media extensions only). Audio is delivered as a voice note when the relay supports it. Do not paste relay media URLs you have not been given.
+
 ## Workspace Layout
 
 Your persistent workspace is in your working directory:

@@ -24,8 +24,8 @@ buzz-persona = { path = "../buzz-persona" }
 # Nostr
 nostr = { workspace = true }
 
-# Async runtime
-tokio = { workspace = true }
+# Async runtime (`fs` for attachment blobs written under the per-agent temp dir)
+tokio = { workspace = true, features = ["fs"] }
 
 # WebSocket
 tokio-tungstenite = { workspace = true }
