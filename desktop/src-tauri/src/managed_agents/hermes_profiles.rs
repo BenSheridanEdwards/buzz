@@ -19,15 +19,23 @@ const MAX_SOUL_READ_BYTES: u64 = 64 * 1024;
 
 /// Largest avatar data URL handed to the picker.
 ///
-/// A picked avatar becomes the persona's `avatar_url`, which fans out into the
-/// linked agents' kind:0 `picture` and the persona catalog head. The catalog
-/// accepts inline raster avatars up to 256 KiB
-/// (`MAX_INLINE_RASTER_AVATAR_LENGTH` in `persona_catalog.rs`) and the relay
-/// rejects any event content over 256 KiB, so anything larger cannot be stored
-/// inline anywhere downstream. The Desktop uploads a picked avatar to relay
-/// media before saving, but the data URL still crosses IPC and lives in the
-/// form draft, so it is bounded here too.
-const MAX_AVATAR_DATA_URL_BYTES: usize = 256 * 1024;
+/// This is a **transport** bound, not a storage bound, and the difference
+/// matters. A picked avatar never reaches `avatar_url` as a data URL: every
+/// persona write path runs it through `personaInputWithResolvedAvatar` /
+/// `resolveManagedAgentAvatarUrl`, which uploads it to relay media and stores
+/// the https URL, and the edit path now fails the save rather than storing
+/// anything if that upload fails. So the 256 KiB the persona catalog accepts
+/// inline (`MAX_INLINE_RASTER_AVATAR_LENGTH` in `persona_catalog.rs`) and the
+/// 256 KiB the relay accepts as event content constrain the *stored* value,
+/// which is a short https URL — not this data URL, which exists only long
+/// enough to cross IPC, sit in the form draft, and reach `upload_media_bytes`.
+///
+/// Sizing this to 256 KiB measured the wrong thing: it silently dropped five
+/// of the eighteen avatars under a real `~/.hermes` (190 to 271 KB JPEGs) and
+/// the picker had nothing to say about why. 2 MiB bounds the payload — with
+/// [`MAX_PROFILES`] it is what caps the IPC message — while admitting every
+/// avatar Hermes actually writes.
+const MAX_AVATAR_DATA_URL_BYTES: usize = 2 * 1024 * 1024;
 
 /// Raw avatar bytes that still fit under [`MAX_AVATAR_DATA_URL_BYTES`] once
 /// base64 expands them by 4/3 and the `data:image/jpeg;base64,` header is
@@ -98,21 +106,28 @@ pub fn default_hermes_home_dir() -> Option<PathBuf> {
 /// Any other failure to read it propagates so the picker can say the scan
 /// failed instead of claiming there are no profiles.
 pub fn list_hermes_profiles_for_home(home: &Path) -> std::io::Result<Vec<HermesProfile>> {
-    let mut profiles = scan_hermes_profiles(&home.join("profiles"))?;
-    if let Some(home_profile) = hermes_home_profile(home) {
-        // The home is the fallback selection, so it leads the list rather than
-        // sorting in among the named profiles.
-        profiles.insert(0, home_profile);
-        profiles.truncate(MAX_PROFILES);
-    }
-    Ok(profiles)
+    list_hermes_profiles_for_home_with(home, MAX_PROFILES, &mut read_avatar_data_url)
 }
 
-/// The Hermes home itself as a picker entry, when it holds a `SOUL.md` or a
-/// `config.yaml`. Returns `None` for a home that only contains `profiles/`.
-pub fn hermes_home_profile(home: &Path) -> Option<HermesProfile> {
-    let meta = read_profile_meta(home, ProfileKind::Home)?;
-    Some(meta.into_profile())
+/// [`list_hermes_profiles_for_home`] with the cap and the avatar reader
+/// injected, so a test can count the reads the cap is supposed to prevent.
+fn list_hermes_profiles_for_home_with(
+    home: &Path,
+    budget: usize,
+    read_avatar: &mut dyn FnMut(&Path) -> Option<String>,
+) -> std::io::Result<Vec<HermesProfile>> {
+    let home_meta = read_profile_meta(home, ProfileKind::Home);
+    // The home entry occupies one of the capped slots, so the scan is given a
+    // budget one smaller rather than reading a full `budget` avatars and then
+    // dropping one of them again.
+    let scan_budget = budget - usize::from(home_meta.is_some());
+    let mut profiles = scan_hermes_profiles_with(&home.join("profiles"), scan_budget, read_avatar)?;
+    if let Some(home_meta) = home_meta {
+        // The home is the fallback selection, so it leads the list rather than
+        // sorting in among the named profiles.
+        profiles.insert(0, home_meta.into_profile_with(read_avatar));
+    }
+    Ok(profiles)
 }
 
 /// Scan `root` for Hermes profiles.
@@ -120,13 +135,41 @@ pub fn hermes_home_profile(home: &Path) -> Option<HermesProfile> {
 /// A directory counts as a profile when it holds a `SOUL.md` or a
 /// `config.yaml`; anything else (caches, stray files, dot-directories) is
 /// skipped. Results are sorted by display name, then slug, and capped at
-/// [`MAX_PROFILES`] before any avatar is read.
+/// `budget` before any avatar is read.
 ///
 /// A missing root yields an empty list. Every other `read_dir` failure — an
 /// unreadable root, a root that is a plain file — is returned as an error:
 /// reporting "no profiles found" for a directory we could not read would be a
 /// terminal failure dressed up as an authoritative empty answer.
-pub fn scan_hermes_profiles(root: &Path) -> std::io::Result<Vec<HermesProfile>> {
+///
+/// The cap and the avatar reader are parameters because that is what makes
+/// "truncate before reading avatars" a testable claim: with the reader inlined,
+/// moving the truncate to after the map changes the read count and nothing
+/// else, and every assertion on the returned list holds either way.
+fn scan_hermes_profiles_with(
+    root: &Path,
+    budget: usize,
+    read_avatar: &mut dyn FnMut(&Path) -> Option<String>,
+) -> std::io::Result<Vec<HermesProfile>> {
+    let mut metas = scan_profile_metas(root)?;
+    metas.sort_by(|a, b| {
+        a.name
+            .to_lowercase()
+            .cmp(&b.name.to_lowercase())
+            .then_with(|| a.slug.cmp(&b.slug))
+    });
+    // Truncate before touching avatars: the cap must bound the disk reads and
+    // the encoded payload, not just the length of the returned list.
+    metas.truncate(budget);
+    Ok(metas
+        .into_iter()
+        .map(|meta| meta.into_profile_with(read_avatar))
+        .collect())
+}
+
+/// Every profile directory under `root`, unsorted and uncapped, with no avatar
+/// read yet.
+fn scan_profile_metas(root: &Path) -> std::io::Result<Vec<ProfileMeta>> {
     let entries = match std::fs::read_dir(root) {
         Ok(entries) => entries,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
@@ -142,21 +185,18 @@ pub fn scan_hermes_profiles(root: &Path) -> std::io::Result<Vec<HermesProfile>> 
                 }
             }
             Err(error) => {
-                tracing::warn!("hermes_profiles: skipping unreadable entry in {root:?}: {error}");
+                // `eprintln!` rather than `tracing::warn!`: this crate depends
+                // on `tracing` but installs no subscriber, so a `warn!` here
+                // produces no output at all. The rest of the crate logs this
+                // way (see `env_vars.rs`).
+                eprintln!(
+                    "buzz-desktop: hermes_profiles: skipping unreadable entry in {}: {error}",
+                    root.display()
+                );
             }
         }
     }
-
-    metas.sort_by(|a, b| {
-        a.name
-            .to_lowercase()
-            .cmp(&b.name.to_lowercase())
-            .then_with(|| a.slug.cmp(&b.slug))
-    });
-    // Truncate before touching avatars: the cap must bound the disk reads and
-    // the encoded payload, not just the length of the returned list.
-    metas.truncate(MAX_PROFILES);
-    Ok(metas.into_iter().map(ProfileMeta::into_profile).collect())
+    Ok(metas)
 }
 
 /// Whether a candidate directory is the Hermes home or one of its children.
@@ -180,8 +220,11 @@ struct ProfileMeta {
 }
 
 impl ProfileMeta {
-    fn into_profile(self) -> HermesProfile {
-        let avatar_data_url = read_avatar_data_url(&self.dir);
+    fn into_profile_with(
+        self,
+        read_avatar: &mut dyn FnMut(&Path) -> Option<String>,
+    ) -> HermesProfile {
+        let avatar_data_url = read_avatar(&self.dir);
         HermesProfile {
             slug: self.slug,
             name: self.name,
@@ -207,7 +250,10 @@ fn read_profile_meta(dir: &Path, kind: ProfileKind) -> Option<ProfileMeta> {
         // is simply not a profile. Say so once, so support has something to
         // look at when a profile "disappears" from the picker.
         if let Err(error) = std::fs::read_dir(dir) {
-            tracing::warn!("hermes_profiles: skipping unreadable profile dir {dir:?}: {error}");
+            eprintln!(
+                "buzz-desktop: hermes_profiles: skipping unreadable profile dir {}: {error}",
+                dir.display()
+            );
         }
         return None;
     }
@@ -301,15 +347,25 @@ fn atx_heading(line: &str) -> Option<&str> {
 
 /// Display name parsed from a SOUL document.
 ///
-/// The first Markdown heading wins after a `SOUL.md`/`SOUL` label and any
-/// dash or colon separator are stripped (a `SOUL.md`, dash, `Bond` heading
-/// yields `Bond`).
-/// A bare `# SOUL` heading carries no name, so the first `You are <Name>`
-/// sentence is tried next (`You are **Formula**.` yields `Formula`).
+/// The document's **title** wins: the first non-empty line outside any code
+/// fence, and only when that line is an ATX heading, after a `SOUL.md`/`SOUL`
+/// label and any dash or colon separator are stripped (a `SOUL.md`, dash,
+/// `Bond` title yields `Bond`).
+/// A bare `# SOUL` title carries no name, and a document that opens with prose
+/// has no title at all, so the first `You are <Name>` sentence is tried next
+/// (`You are **Formula**.` yields `Formula`).
 /// Returns `None` when neither form produces a usable name.
+///
+/// Only the *title* counts, never any heading anywhere. A SOUL that opens with
+/// `You are Jeeves.` and carries `## Iron law` further down is named Jeeves,
+/// not "Iron law" — three of the eighteen real profiles are shaped exactly
+/// that way, and a section heading became the persona `display_name`, the
+/// instance name and the published kind:0 `name`.
 pub fn soul_display_name(soul: &str) -> Option<String> {
-    let heading = soul_lines(soul).find_map(atx_heading);
-    if let Some(name) = heading.and_then(name_from_heading) {
+    let title = soul_lines(soul)
+        .find(|line| !line.is_empty())
+        .and_then(atx_heading);
+    if let Some(name) = title.and_then(name_from_heading) {
         return Some(name);
     }
     soul_lines(soul).find_map(name_from_you_are_line)
@@ -459,15 +515,20 @@ mod tests {
         std::fs::write(dir.join(name), contents).expect("write");
     }
 
+    /// The production scan at its production cap, reading real avatars.
+    fn scan_profiles(root: &Path) -> std::io::Result<Vec<HermesProfile>> {
+        scan_hermes_profiles_with(root, MAX_PROFILES, &mut read_avatar_data_url)
+    }
+
     fn scan(root: &Path) -> Vec<HermesProfile> {
-        scan_hermes_profiles(root).expect("scan")
+        scan_profiles(root).expect("scan")
     }
 
     #[test]
     fn missing_root_yields_empty_list() {
         let temp = tempfile::tempdir().expect("tempdir");
         let missing = temp.path().join("does-not-exist");
-        assert!(scan_hermes_profiles(&missing).expect("scan").is_empty());
+        assert!(scan_profiles(&missing).expect("scan").is_empty());
     }
 
     #[test]
@@ -477,7 +538,7 @@ mod tests {
         // case does not depend on POSIX permission bits.
         let file_root = temp.path().join("root-is-a-file");
         std::fs::write(&file_root, b"not a directory").expect("write");
-        assert!(scan_hermes_profiles(&file_root).is_err());
+        assert!(scan_profiles(&file_root).is_err());
     }
 
     #[cfg(unix)]
@@ -490,7 +551,7 @@ mod tests {
         std::fs::create_dir_all(&root).expect("mkdir");
         std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o000)).expect("chmod");
         let readable = std::fs::read_dir(&root).is_ok();
-        let result = scan_hermes_profiles(&root);
+        let result = scan_profiles(&root);
         // Restore before asserting so the tempdir can always be cleaned up.
         std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).expect("chmod");
         // Running as root defeats the permission bits; the assertion only means
@@ -594,6 +655,62 @@ mod tests {
     }
 
     #[test]
+    fn reads_exactly_one_avatar_per_returned_profile() {
+        // The assertions in the test above hold whether the truncate runs
+        // before or after the avatars are read — the returned list is
+        // identical either way, and only the disk work differs. This counts
+        // the reads, so moving the truncate back turns it red.
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path();
+        for index in 0..(MAX_PROFILES + 10) {
+            let dir = root.join(format!("p{index:03}"));
+            write(&dir, "SOUL.md", format!("# P{index:03}\n").as_bytes());
+            write(&dir, "avatar.png", &[0x89, 0x50, 0x4E, 0x47]);
+        }
+
+        let mut reads = 0usize;
+        let profiles = scan_hermes_profiles_with(root, MAX_PROFILES, &mut |dir| {
+            reads += 1;
+            read_avatar_data_url(dir)
+        })
+        .expect("scan");
+
+        assert_eq!(profiles.len(), MAX_PROFILES);
+        assert_eq!(
+            reads, MAX_PROFILES,
+            "the cap must bound the avatar reads, not just the returned list"
+        );
+    }
+
+    #[test]
+    fn the_home_entry_spends_one_of_the_capped_avatar_reads() {
+        // `list_hermes_profiles_for_home` inserts the home in front of the
+        // scanned profiles and the whole list is capped at MAX_PROFILES, so a
+        // scan given the full cap would read MAX_PROFILES + 1 avatars to
+        // return MAX_PROFILES entries. The budget is passed down instead.
+        let temp = tempfile::tempdir().expect("tempdir");
+        let home = temp.path().join(".hermes");
+        write(&home, "SOUL.md", b"# Home\n");
+        write(&home, "avatar.png", &[0x89, 0x50, 0x4E, 0x47]);
+        for index in 0..(MAX_PROFILES + 10) {
+            let dir = home.join("profiles").join(format!("p{index:03}"));
+            write(&dir, "SOUL.md", format!("# P{index:03}\n").as_bytes());
+            write(&dir, "avatar.png", &[0x89, 0x50, 0x4E, 0x47]);
+        }
+
+        let mut reads = 0usize;
+        let profiles = list_hermes_profiles_for_home_with(&home, MAX_PROFILES, &mut |dir| {
+            reads += 1;
+            read_avatar_data_url(dir)
+        })
+        .expect("list");
+
+        assert_eq!(profiles.len(), MAX_PROFILES);
+        assert_eq!(profiles[0].name, "Home");
+        assert_eq!(reads, MAX_PROFILES);
+    }
+
+    #[test]
     fn oversized_avatar_is_not_inlined() {
         let temp = tempfile::tempdir().expect("tempdir");
         let root = temp.path();
@@ -607,9 +724,9 @@ mod tests {
     }
 
     #[test]
-    fn inlined_avatar_fits_the_downstream_event_limit() {
-        // 256 KiB of raw JPEG-ish bytes encodes to ~350 KB, which the relay
-        // rejects; the picker must not offer it at all.
+    fn inlined_avatar_fits_the_ipc_transport_budget() {
+        // Raw bytes at the data URL budget encode to 4/3 of it, past the cap;
+        // the picker must not offer that at all.
         let temp = tempfile::tempdir().expect("tempdir");
         let root = temp.path();
         let dir = root.join("chunky");
@@ -617,7 +734,7 @@ mod tests {
         write(&dir, "avatar.jpg", &vec![0xAB; MAX_AVATAR_DATA_URL_BYTES]);
         assert_eq!(scan(root)[0].avatar_data_url, None);
 
-        // The largest avatar that IS inlined still fits the 256 KiB budget.
+        // The largest avatar that IS inlined still fits the transport budget.
         let ok = root.join("slim");
         write(&ok, "SOUL.md", b"# Slim\n");
         write(
@@ -635,6 +752,26 @@ mod tests {
             data_url.len() <= MAX_AVATAR_DATA_URL_BYTES,
             "data URL of {} bytes exceeds the {MAX_AVATAR_DATA_URL_BYTES} byte budget",
             data_url.len()
+        );
+    }
+
+    #[test]
+    fn a_real_sized_profile_avatar_is_still_offered() {
+        // The five largest avatars under a real `~/.hermes` are 190 to 271 KB
+        // JPEGs. The previous cap — the 256 KiB the *stored* value is bounded
+        // by — dropped them all, silently. A picked avatar is uploaded before
+        // it is stored, so it is the IPC payload that needs bounding here.
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path();
+        let dir = root.join("irene");
+        write(&dir, "SOUL.md", b"# SOUL.md - Irene\n");
+        write(&dir, "avatar.jpg", &vec![0xAB; 271_614]);
+
+        let profile = &scan(root)[0];
+        assert_eq!(profile.name, "Irene");
+        assert!(
+            profile.avatar_data_url.is_some(),
+            "a 271 KB profile avatar must reach the picker"
         );
     }
 
@@ -708,8 +845,26 @@ mod tests {
             ("## Soulless\n", Some("Soulless")),
             ("no heading at all\n", None),
             ("", None),
-            // A hashtag is not an ATX heading: `#` needs a space after it.
-            ("#hashtag first\n\n# Soul of Bond\n", Some("Soul of Bond")),
+            // A hashtag is not an ATX heading: `#` needs a space after it. It
+            // is also the document's first line, so there is no title at all.
+            ("#hashtag first\n\n# Soul of Bond\n", None),
+            // Only the title counts. These three are the real shapes of
+            // jeeves, iris and jarvis under `~/.hermes/profiles`: prose first,
+            // section headings below. Taking any heading anywhere named them
+            // "Iron law (never without Chief's explicit yes)", "Your
+            // relationship with Ben" and "Core Mission".
+            (
+                "You are Jeeves.\n\n## Iron law (never without Chief's explicit yes)\n",
+                Some("Jeeves"),
+            ),
+            (
+                "You are Iris.\n\n## Your relationship with Ben\n",
+                Some("Iris"),
+            ),
+            ("You are Jarvis.\n\n# Core Mission\n", Some("Jarvis")),
+            // A heading that is not the title and no `You are` line: the
+            // caller falls back to the slug rather than to a section name.
+            ("Some opening prose.\n\n# Core Mission\n", None),
             // The label is only a label when a separator follows it.
             ("# SOUL.md \u{2014} Soul of Bond\n", Some("Soul of Bond")),
             ("# SOUL.md \u{2014} Soul of Bond\n", Some("Soul of Bond")),
