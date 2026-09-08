@@ -266,12 +266,21 @@ pub fn sha256_hex(bytes: &[u8]) -> String {
     hex::encode(Sha256::digest(bytes))
 }
 
-fn http_client(timeout: Duration) -> Result<reqwest::Client, BlossomError> {
-    reqwest::Client::builder()
-        .redirect(reqwest::redirect::Policy::none())
-        .timeout(timeout)
-        .connect_timeout(Duration::from_secs(10))
-        .build()
+/// One no-redirect client shared by every blob request in the process, so a
+/// reply with four uploads does not pay four connection pools and TLS setups.
+/// Per-request timeouts are set on the request builders.
+fn http_client() -> Result<reqwest::Client, BlossomError> {
+    static CLIENT: std::sync::OnceLock<Result<reqwest::Client, String>> =
+        std::sync::OnceLock::new();
+    CLIENT
+        .get_or_init(|| {
+            reqwest::Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
+                .connect_timeout(Duration::from_secs(10))
+                .build()
+                .map_err(|e| e.to_string())
+        })
+        .clone()
         .map_err(|e| BlossomError::Http(format!("failed to build HTTP client: {e}")))
 }
 
@@ -303,9 +312,10 @@ pub async fn download_blob(
         expected_sha256,
         Some(&origin.server_tag()),
     )?;
-    let client = http_client(DOWNLOAD_TIMEOUT)?;
+    let client = http_client()?;
     let mut request = client
         .get(url.clone())
+        .timeout(DOWNLOAD_TIMEOUT)
         .header("Authorization", auth)
         .header("Accept-Encoding", "identity");
     if let Some(tag) = &rest.auth_tag_json {
@@ -379,7 +389,7 @@ pub async fn upload_blob(
     mime: &str,
 ) -> Result<BlobDescriptor, BlossomError> {
     let sha256 = sha256_hex(&bytes);
-    let client = http_client(UPLOAD_TIMEOUT)?;
+    let client = http_client()?;
     let mut last = None;
     for path in ["/upload", "/media/upload"] {
         let auth = sign_blossom_auth(
@@ -390,6 +400,7 @@ pub async fn upload_blob(
         )?;
         let mut request = client
             .put(format!("{}{path}", rest.base_url))
+            .timeout(UPLOAD_TIMEOUT)
             .header("Authorization", auth)
             .header("Content-Type", mime)
             .header("X-SHA-256", &sha256);

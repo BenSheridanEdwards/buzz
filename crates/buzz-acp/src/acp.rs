@@ -589,6 +589,11 @@ impl AcpClient {
         self.observer.clone()
     }
 
+    /// The observer context of the current turn.
+    pub(crate) fn observer_context(&self) -> &ObserverContext {
+        &self.observer_context
+    }
+
     /// Return the pool slot index for this agent process.
     pub(crate) fn observer_agent_index(&self) -> Option<usize> {
         self.observer_agent_index

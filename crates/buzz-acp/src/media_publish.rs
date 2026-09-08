@@ -15,8 +15,16 @@
 //! delivered as native audio on `buzz-audio` relays, as the MP4 envelope when
 //! the relay refuses audio and ffmpeg is available, and as a generic file
 //! otherwise; the log says which.
+//!
+//! A reply names a path; it does not get to read one. Every path is
+//! canonicalised and accepted only when the file it resolves to sits under
+//! the turn's own directory or the engine workspace ([`OutboundRoots`]), so
+//! a quoted `MEDIA:~/Documents/passport.pdf` echoed by the engine cannot make
+//! the harness publish a host file with its own privileges. Workspace files
+//! are staged into the turn directory at resolution time so the upload that
+//! follows only ever reads harness-owned copies.
 
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
 
 use base64::Engine as _;
@@ -32,10 +40,14 @@ pub(crate) const MAX_OUTBOUND_FILE_BYTES: u64 = 25 * 1024 * 1024;
 const MAX_CAPTURED_TEXT_BYTES: usize = 64 * 1024;
 /// Most non-text content blocks kept from one reply.
 const MAX_CAPTURED_BLOCKS: usize = 8;
-/// Longest inline base64 payload kept from one block (about 25 MiB decoded).
-const MAX_INLINE_BASE64_BYTES: usize = 34 * 1024 * 1024;
+/// Most inline base64 kept from one reply, summed over every block (about
+/// 25 MiB decoded). A block that would push the turn over this is dropped.
+pub(crate) const MAX_INLINE_BASE64_BUDGET: usize = 34 * 1024 * 1024;
 /// Wall-clock cap for submitting the kind-9.
-const PUBLISH_TIMEOUT: Duration = Duration::from_secs(20);
+pub(crate) const PUBLISH_TIMEOUT: Duration = Duration::from_secs(20);
+/// Wall-clock cap for one reply's uploads, end to end; the kind-9 for
+/// whatever finished in time is still posted.
+pub(crate) const OUTBOUND_DEADLINE: Duration = Duration::from_secs(180);
 /// Extensions the `MEDIA:` matcher accepts; mirrors the Hermes gateway list.
 const MEDIA_EXTENSIONS: &[&str] = &[
     "png", "jpg", "jpeg", "gif", "webp", "mp4", "mov", "avi", "mkv", "webm", "ogg", "opus", "mp3",
@@ -54,6 +66,9 @@ pub struct TurnMediaCapture {
     text_dropped_bytes: usize,
     blocks: Vec<serde_json::Value>,
     dropped_blocks: usize,
+    /// Base64 bytes held by `blocks`, charged against
+    /// [`MAX_INLINE_BASE64_BUDGET`].
+    inline_bytes: usize,
 }
 
 impl TurnMediaCapture {
@@ -78,10 +93,11 @@ impl TurnMediaCapture {
                     .map(str::len)
                     .max()
                     .unwrap_or(0);
-                if self.blocks.len() >= MAX_CAPTURED_BLOCKS || inline_len > MAX_INLINE_BASE64_BYTES
-                {
+                let over_budget = inline_len > MAX_INLINE_BASE64_BUDGET - self.inline_bytes;
+                if self.blocks.len() >= MAX_CAPTURED_BLOCKS || over_budget {
                     self.dropped_blocks += 1;
                 } else {
+                    self.inline_bytes += inline_len;
                     self.blocks.push(content.clone());
                 }
             }
@@ -101,6 +117,7 @@ impl TurnMediaCapture {
     }
 
     /// True when nothing was captured.
+    #[cfg(test)]
     pub fn is_empty(&self) -> bool {
         self.text.is_empty() && self.blocks.is_empty() && self.dropped_blocks == 0
     }
@@ -119,6 +136,33 @@ impl TurnMediaCapture {
     pub fn dropped_blocks(&self) -> usize {
         self.dropped_blocks
     }
+
+    /// Base64 bytes currently held by the captured blocks.
+    #[cfg(test)]
+    pub fn inline_bytes(&self) -> usize {
+        self.inline_bytes
+    }
+
+    /// True when the reply named or carried anything that could be a file,
+    /// including a `MEDIA:` token that looked like a path but was unusable
+    /// (that earns a note rather than silence).
+    pub fn references_media(&self) -> bool {
+        if !self.blocks.is_empty() || self.dropped_blocks > 0 {
+            return true;
+        }
+        let refs = extract_media_refs(&self.text);
+        !refs.paths.is_empty() || !refs.notes.is_empty()
+    }
+}
+
+/// `MEDIA:` references found in reply text, plus the ones that looked like a
+/// reference but could not be used.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct MediaRefs {
+    /// Absolute (or `~/`) paths with a supported extension, deduplicated.
+    pub paths: Vec<String>,
+    /// One reason per `MEDIA:` token that started like a path but was unusable.
+    pub notes: Vec<String>,
 }
 
 /// Find `MEDIA:<path>` references in reply text.
@@ -127,28 +171,41 @@ impl TurnMediaCapture {
 /// be an absolute (or `~/`) path ending in a known media extension, so a
 /// bare `MEDIA:` in prose never triggers an upload. Trailing punctuation
 /// after the extension is dropped.
+#[cfg(test)]
 pub fn extract_media_paths(text: &str) -> Vec<String> {
-    let mut found = Vec::new();
+    extract_media_refs(text).paths
+}
+
+/// Like [`extract_media_paths`], also naming the tokens that started like an
+/// absolute path but carried no supported extension (a path with a space, or
+/// an extension outside the list), so the miss is not silent.
+pub fn extract_media_refs(text: &str) -> MediaRefs {
+    let mut refs = MediaRefs::default();
     let mut rest = text;
     while let Some(idx) = rest.find("MEDIA:") {
         let preceded_ok = idx == 0
-            || rest[..idx]
-                .chars()
-                .next_back()
-                .is_some_and(|c| c.is_whitespace() || matches!(c, '(' | '[' | '`' | '"' | '\''));
+            || rest[..idx].chars().next_back().is_some_and(|c| {
+                c.is_whitespace() || matches!(c, '(' | '[' | '`' | '"' | '\'' | '*' | '_')
+            });
         let after = &rest[idx + "MEDIA:".len()..];
         let after = after.strip_prefix(' ').unwrap_or(after);
         let token: &str = after.split(char::is_whitespace).next().unwrap_or("");
         if preceded_ok {
-            if let Some(path) = trim_to_media_extension(token) {
-                if is_absolute_or_home(path) && !found.iter().any(|p| p == path) {
-                    found.push(path.to_string());
+            match trim_to_media_extension(token) {
+                Some(path) if is_absolute_or_home(path) && !refs.paths.iter().any(|p| p == path) => {
+                    refs.paths.push(path.to_string());
                 }
+                Some(_) => {}
+                None if is_absolute_or_home(token) => refs.notes.push(format!(
+                    "MEDIA:{} skipped: no supported media extension (paths with spaces are not supported)",
+                    token.chars().take(80).collect::<String>()
+                )),
+                None => {}
             }
         }
         rest = &rest[idx + "MEDIA:".len()..];
     }
-    found
+    refs
 }
 
 fn is_absolute_or_home(path: &str) -> bool {
@@ -279,72 +336,232 @@ pub struct OutboundFile {
 /// Files resolved from a capture plus the reasons anything was skipped.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct OutboundResolution {
-    /// Files to upload, at most [`MAX_OUTBOUND_FILES`].
+    /// Files to upload, at most [`MAX_OUTBOUND_FILES`]. Every path is a
+    /// canonical regular file under the turn directory.
     pub files: Vec<OutboundFile>,
     /// Human-readable reasons for references that were not turned into files.
     pub notes: Vec<String>,
 }
 
-/// Turn a capture into concrete files. Inline block data is written under
-/// `scratch`. Missing, unreadable, oversized, or over-cap references become
-/// notes instead of files.
-pub fn resolve_outbound_files(capture: &TurnMediaCapture, scratch: &Path) -> OutboundResolution {
-    let mut out = OutboundResolution::default();
-    let mut inline_index = 0usize;
+impl OutboundResolution {
+    /// True when the reply neither produced a file nor a reason.
+    pub fn is_empty(&self) -> bool {
+        self.files.is_empty() && self.notes.is_empty()
+    }
+}
 
-    let add = |out: &mut OutboundResolution,
-               path: PathBuf,
-               filename: Option<String>,
-               mime: Option<String>,
-               origin: &'static str| {
-        if out.files.iter().any(|f| f.path == path) {
-            return;
+/// The only directories a reply may publish files from.
+///
+/// `turn_dir` is this turn's directory under the attachment root (inbound
+/// blobs and the `out/` scratch live there); `workspace` is the engine's
+/// working directory. Anything else on the host is refused, whatever the
+/// reply says.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OutboundRoots {
+    /// `<attachment root>/<turn id>`; also where workspace files are staged.
+    pub turn_dir: PathBuf,
+    /// The engine's working directory, when known.
+    pub workspace: Option<PathBuf>,
+}
+
+impl OutboundRoots {
+    /// Scratch directory for inline data and staged copies.
+    pub fn scratch(&self) -> PathBuf {
+        self.turn_dir.join("out")
+    }
+
+    /// Resolve `path` to the canonical regular file it names, provided that
+    /// file is under one of the roots.
+    ///
+    /// The path must be absolute and free of `..`; symlinks anywhere in it
+    /// are followed and the target is what has to sit under a root, so a link
+    /// planted inside the workspace cannot reach outside it. Roots that do
+    /// not exist yet cannot contain anything and are skipped.
+    pub fn confine(&self, path: &Path) -> Result<PathBuf, String> {
+        if !path.is_absolute() {
+            return Err("not an absolute path".into());
         }
+        if path.components().any(|c| matches!(c, Component::ParentDir)) {
+            return Err("path traversal (..) is not allowed".into());
+        }
+        let is_symlink = std::fs::symlink_metadata(path)
+            .map(|m| m.file_type().is_symlink())
+            .map_err(|e| e.to_string())?;
+        let canonical = std::fs::canonicalize(path).map_err(|e| e.to_string())?;
+        let inside = [Some(&self.turn_dir), self.workspace.as_ref()]
+            .into_iter()
+            .flatten()
+            .filter_map(|root| std::fs::canonicalize(root).ok())
+            .any(|root| canonical.starts_with(&root));
+        if !inside {
+            return Err(if is_symlink {
+                "symlink resolves outside the turn directory and the workspace".into()
+            } else {
+                "outside the turn directory and the workspace".into()
+            });
+        }
+        Ok(canonical)
+    }
+
+    /// True when `canonical` is already under the turn directory, so it is
+    /// harness-owned and need not be staged.
+    fn owned(&self, canonical: &Path) -> bool {
+        std::fs::canonicalize(&self.turn_dir).is_ok_and(|root| canonical.starts_with(root))
+    }
+}
+
+/// Copy a workspace file into the scratch directory so the upload reads a
+/// harness-owned snapshot taken at the end of the turn, not whatever the
+/// workspace path points at later.
+///
+/// The source is opened without following a symlink at its last component
+/// and checked again through the open handle, so a regular file that passed
+/// [`OutboundRoots::confine`] cannot be swapped for a link before the bytes
+/// are read. A directory higher up the path swapped in the same window is
+/// not caught here; that needs `openat2`-style resolution.
+fn stage_copy(
+    scratch: &Path,
+    index: usize,
+    source: &Path,
+    meta_len: u64,
+) -> Result<PathBuf, String> {
+    std::fs::create_dir_all(scratch)
+        .map_err(|e| format!("cannot create {}: {e}", scratch.display()))?;
+    let ext = source
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(crate::attachments::safe_attachment_filename)
+        .filter(|e| !e.is_empty() && e != "attachment.bin")
+        .unwrap_or_else(|| "bin".into());
+    let staged = scratch.join(format!("staged-{index}.{ext}"));
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.custom_flags(nix::fcntl::OFlag::O_NOFOLLOW.bits());
+    }
+    let mut file = options
+        .open(source)
+        .map_err(|e| format!("cannot open {}: {e}", source.display()))?;
+    let opened = file
+        .metadata()
+        .map_err(|e| format!("cannot stat {}: {e}", source.display()))?;
+    if !opened.is_file() || opened.len() != meta_len {
+        return Err(format!(
+            "{} changed while it was being staged",
+            source.display()
+        ));
+    }
+    let mut out = std::fs::File::create(&staged)
+        .map_err(|e| format!("cannot create {}: {e}", staged.display()))?;
+    let copied = std::io::copy(
+        &mut std::io::Read::take(&mut file, MAX_OUTBOUND_FILE_BYTES + 1),
+        &mut out,
+    )
+    .map_err(|e| format!("cannot stage {}: {e}", source.display()))?;
+    if copied != meta_len || copied > MAX_OUTBOUND_FILE_BYTES {
+        let _ = std::fs::remove_file(&staged);
+        return Err(format!(
+            "{} changed while it was being staged ({meta_len} bytes became {copied})",
+            source.display()
+        ));
+    }
+    std::fs::canonicalize(&staged).map_err(|e| format!("cannot resolve {}: {e}", staged.display()))
+}
+
+/// Turn a capture into concrete files under `roots.turn_dir`. Inline block
+/// data is written under the scratch directory and workspace files are
+/// staged there. Missing, unreadable, oversized, over-cap, or out-of-bounds
+/// references become notes instead of files.
+pub fn resolve_outbound_files(
+    capture: &TurnMediaCapture,
+    roots: &OutboundRoots,
+) -> OutboundResolution {
+    let mut out = OutboundResolution::default();
+    let scratch = roots.scratch();
+    let mut inline_index = 0usize;
+    let mut staged_index = 0usize;
+
+    let mut add = |out: &mut OutboundResolution,
+                   path: PathBuf,
+                   filename: Option<String>,
+                   mime: Option<String>,
+                   origin: &'static str| {
+        let shown = path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| path.display().to_string());
         if out.files.len() >= MAX_OUTBOUND_FILES {
             out.notes.push(format!(
-                "{} skipped: over the {MAX_OUTBOUND_FILES}-file limit per reply",
-                path.display()
+                "{shown} skipped: over the {MAX_OUTBOUND_FILES}-file limit per reply"
             ));
             return;
         }
-        match std::fs::metadata(&path) {
-            Ok(meta)
-                if meta.is_file() && meta.len() > 0 && meta.len() <= MAX_OUTBOUND_FILE_BYTES =>
-            {
-                let filename = filename
-                    .filter(|n| !n.trim().is_empty())
-                    .map(|n| crate::attachments::safe_attachment_filename(&n))
-                    .unwrap_or_else(|| {
-                        path.file_name()
-                            .map(|n| n.to_string_lossy().into_owned())
-                            .unwrap_or_else(|| "attachment.bin".into())
-                    });
-                let mime = mime
-                    .filter(|m| !m.trim().is_empty())
-                    .unwrap_or_else(|| mime_for_path(&path).to_string());
-                out.files.push(OutboundFile {
-                    path,
-                    filename,
-                    mime,
-                    origin,
-                });
+        let canonical = match roots.confine(&path) {
+            Ok(canonical) => canonical,
+            Err(reason) => {
+                out.notes.push(format!("{shown} refused: {reason}"));
+                return;
             }
-            Ok(meta) if !meta.is_file() => out
-                .notes
-                .push(format!("{} skipped: not a regular file", path.display())),
-            Ok(meta) if meta.len() == 0 => out
-                .notes
-                .push(format!("{} skipped: empty file", path.display())),
-            Ok(meta) => out.notes.push(format!(
-                "{} skipped: {} bytes exceeds the {MAX_OUTBOUND_FILE_BYTES} byte limit",
-                path.display(),
-                meta.len()
-            )),
-            Err(e) => out.notes.push(format!("{} skipped: {e}", path.display())),
+        };
+        let meta = match std::fs::symlink_metadata(&canonical) {
+            Ok(meta) => meta,
+            Err(e) => {
+                out.notes.push(format!("{shown} skipped: {e}"));
+                return;
+            }
+        };
+        if !meta.is_file() {
+            out.notes
+                .push(format!("{shown} skipped: not a regular file"));
+            return;
         }
+        if meta.len() == 0 {
+            out.notes.push(format!("{shown} skipped: empty file"));
+            return;
+        }
+        if meta.len() > MAX_OUTBOUND_FILE_BYTES {
+            out.notes.push(format!(
+                "{shown} skipped: {} bytes exceeds the {MAX_OUTBOUND_FILE_BYTES} byte limit",
+                meta.len()
+            ));
+            return;
+        }
+        let stored = if roots.owned(&canonical) {
+            canonical.clone()
+        } else {
+            staged_index += 1;
+            match stage_copy(&scratch, staged_index, &canonical, meta.len()) {
+                Ok(staged) => staged,
+                Err(reason) => {
+                    out.notes.push(format!("{shown} skipped: {reason}"));
+                    return;
+                }
+            }
+        };
+        if out.files.iter().any(|f| f.path == stored) {
+            return;
+        }
+        let filename = crate::attachments::safe_attachment_filename(
+            &filename
+                .filter(|n| !n.trim().is_empty())
+                .unwrap_or_else(|| shown.clone()),
+        );
+        let mime = mime
+            .filter(|m| !m.trim().is_empty())
+            .unwrap_or_else(|| mime_for_path(&canonical).to_string());
+        out.files.push(OutboundFile {
+            path: stored,
+            filename,
+            mime,
+            origin,
+        });
     };
 
-    for raw in extract_media_paths(capture.text()) {
+    let refs = extract_media_refs(capture.text());
+    out.notes.extend(refs.notes);
+    for raw in refs.paths {
         let expanded = if let Some(rest) = raw.strip_prefix("~/") {
             match std::env::var_os("HOME") {
                 Some(home) => PathBuf::from(home).join(rest),
@@ -392,7 +609,7 @@ pub fn resolve_outbound_files(capture: &TurnMediaCapture, scratch: &Path) -> Out
                     .map(str::to_string);
                 if let Some(blob) = resource.get("blob").and_then(|b| b.as_str()) {
                     inline_index += 1;
-                    match write_inline(scratch, inline_index, blob, mime.as_deref()) {
+                    match write_inline(&scratch, inline_index, blob, mime.as_deref()) {
                         Ok(path) => add(&mut out, path, name_from_uri(uri), mime, "resource block"),
                         Err(e) => out.notes.push(format!("resource blob skipped: {e}")),
                     }
@@ -412,7 +629,7 @@ pub fn resolve_outbound_files(capture: &TurnMediaCapture, scratch: &Path) -> Out
                 match block.get("data").and_then(|d| d.as_str()) {
                     Some(data) => {
                         inline_index += 1;
-                        match write_inline(scratch, inline_index, data, mime.as_deref()) {
+                        match write_inline(&scratch, inline_index, data, mime.as_deref()) {
                             Ok(path) => add(&mut out, path, None, mime, "inline content block"),
                             Err(e) => out.notes.push(format!("{kind} block skipped: {e}")),
                         }
@@ -427,7 +644,7 @@ pub fn resolve_outbound_files(capture: &TurnMediaCapture, scratch: &Path) -> Out
     }
     if capture.dropped_blocks() > 0 {
         out.notes.push(format!(
-            "{} content block(s) were not captured (over the {MAX_CAPTURED_BLOCKS}-block or inline-size limit)",
+            "{} content block(s) were not captured (over the {MAX_CAPTURED_BLOCKS}-block limit or the {MAX_INLINE_BASE64_BUDGET} byte inline budget per reply)",
             capture.dropped_blocks()
         ));
     }
@@ -455,7 +672,7 @@ fn write_inline(
     base64_data: &str,
     mime: Option<&str>,
 ) -> Result<PathBuf, String> {
-    if base64_data.len() > MAX_INLINE_BASE64_BYTES {
+    if base64_data.len() > MAX_INLINE_BASE64_BUDGET {
         return Err("inline data exceeds the size limit".into());
     }
     let bytes = base64::engine::general_purpose::STANDARD
@@ -570,9 +787,25 @@ pub fn body_line(item: &PublishedMedia) -> String {
         MediaKind::Image => format!("![image]({})", item.descriptor.url),
         MediaKind::Video => format!("![video]({})", item.descriptor.url),
         MediaKind::Audio | MediaKind::File => {
-            format!("[{}]({})", item.filename, item.descriptor.url)
+            format!(
+                "[{}]({})",
+                markdown_link_text(&item.filename),
+                item.descriptor.url
+            )
         }
     }
+}
+
+/// Escape the characters that would end a markdown link early.
+fn markdown_link_text(name: &str) -> String {
+    let mut out = String::with_capacity(name.len());
+    for c in name.chars() {
+        if matches!(c, '[' | ']' | '(' | ')' | '\\') {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
 }
 
 /// Compose the single kind-9 body and tag set for a reply's uploads.
@@ -610,6 +843,38 @@ impl PublishReport {
     }
 }
 
+/// Longest failure notice posted to a channel, in bytes.
+const FAILURE_NOTICE_MAX_BYTES: usize = 280;
+
+/// One short line for the channel when a reply's media did not all arrive:
+/// how many references failed, the first reason, and how many published.
+/// The full list stays in the log and the observer frame.
+pub fn failure_notice(report: &PublishReport) -> String {
+    let count = report.failed.len();
+    let first = report
+        .failed
+        .first()
+        .map(String::as_str)
+        .unwrap_or("unknown reason");
+    let mut notice = if count == 1 {
+        format!("Could not attach a file from my reply: {first}")
+    } else {
+        format!("Could not attach {count} files from my reply; first reason: {first}")
+    };
+    if !report.published.is_empty() {
+        notice.push_str(&format!(" ({} attached)", report.published.len()));
+    }
+    if notice.len() > FAILURE_NOTICE_MAX_BYTES {
+        let mut cut = FAILURE_NOTICE_MAX_BYTES - 3;
+        while !notice.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        notice.truncate(cut);
+        notice.push_str("...");
+    }
+    notice
+}
+
 /// Reply anchoring for the media message.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReplyTarget {
@@ -638,19 +903,21 @@ impl ReplyTarget {
 }
 
 impl MediaPublisher<'_> {
-    /// Upload every file a capture names and publish one kind-9 with the
-    /// results. Returns `None` when the capture referenced no media at all.
+    /// Upload every resolved file and publish one kind-9 with the results.
+    /// Returns `None` when the resolution is empty.
+    ///
+    /// `deadline` bounds the uploads as a whole: a file whose turn comes after
+    /// it is skipped with a reason, an upload in progress is cut at it, and
+    /// the kind-9 for whatever did finish is still posted under its own
+    /// [`PUBLISH_TIMEOUT`].
     pub async fn publish_turn_media(
         &self,
         target: &ReplyTarget,
-        capture: &TurnMediaCapture,
+        resolution: OutboundResolution,
         scratch: &Path,
+        deadline: tokio::time::Instant,
     ) -> Option<PublishReport> {
-        if capture.is_empty() {
-            return None;
-        }
-        let resolution = resolve_outbound_files(capture, scratch);
-        if resolution.files.is_empty() && resolution.notes.is_empty() {
+        if resolution.is_empty() {
             return None;
         }
         let mut report = PublishReport {
@@ -673,10 +940,25 @@ impl MediaPublisher<'_> {
             false
         };
         for file in &resolution.files {
-            match self
-                .upload_one(&origin, file, relay_supports_audio, scratch)
-                .await
-            {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                report.failed.push(format!(
+                    "{}: skipped, the {OUTBOUND_DEADLINE:?} publish deadline for this reply passed",
+                    file.filename
+                ));
+                continue;
+            }
+            let attempt = tokio::time::timeout(
+                remaining,
+                self.upload_one(&origin, file, relay_supports_audio, scratch),
+            )
+            .await
+            .unwrap_or_else(|_| {
+                Err(format!(
+                    "upload cut off at the {OUTBOUND_DEADLINE:?} publish deadline for this reply"
+                ))
+            });
+            match attempt {
                 Ok(item) => {
                     tracing::info!(
                         target: "acp::media",
@@ -696,9 +978,7 @@ impl MediaPublisher<'_> {
                         via = %file.origin,
                         "upload failed: {reason}"
                     );
-                    report
-                        .failed
-                        .push(format!("{}: {reason}", file.path.display()));
+                    report.failed.push(format!("{}: {reason}", file.filename));
                 }
             }
         }
@@ -789,35 +1069,37 @@ impl MediaPublisher<'_> {
         scratch: &Path,
     ) -> Result<PublishedMedia, AudioAttemptError> {
         let stamp = now_ms();
-        let (candidates, mime): (Vec<PathBuf>, &str) = match self.ffmpeg {
-            Some(ffmpeg) => {
+        // Candidates are produced lazily: the stream copy first, and the
+        // libmp3lame re-encode only after the relay rejects the copy with a
+        // 415/422, the way the Hermes plugin does. One ffmpeg run and one
+        // upload is the common case.
+        let candidates: Vec<(NativeCandidate, &str)> = match self.ffmpeg {
+            Some(_) => {
                 let copied = scratch.join(format!("native-{stamp}-copy.mp3"));
                 let reencoded = scratch.join(format!("native-{stamp}-enc.mp3"));
-                let mut list = Vec::new();
-                match crate::ffmpeg::convert_to_clean_mp3(ffmpeg, &file.path, &copied, false).await
-                {
-                    Ok(()) => list.push(copied),
-                    Err(e) => tracing::debug!(target: "acp::media", "mp3 copy failed: {e}"),
-                }
-                match crate::ffmpeg::convert_to_clean_mp3(ffmpeg, &file.path, &reencoded, true)
-                    .await
-                {
-                    Ok(()) => list.push(reencoded),
-                    Err(e) => tracing::debug!(target: "acp::media", "mp3 re-encode failed: {e}"),
-                }
-                if list.is_empty() {
-                    return Err(AudioAttemptError::FallThrough(
-                        "ffmpeg could not produce a clean MP3".into(),
-                    ));
-                }
-                (list, "audio/mpeg")
+                vec![
+                    (
+                        NativeCandidate::Encode {
+                            out: copied,
+                            reencode: false,
+                        },
+                        "audio/mpeg",
+                    ),
+                    (
+                        NativeCandidate::Encode {
+                            out: reencoded,
+                            reencode: true,
+                        },
+                        "audio/mpeg",
+                    ),
+                ]
             }
             None => {
                 let lower = file.mime.to_ascii_lowercase();
                 if lower == "audio/mpeg" || lower == "audio/mp3" {
-                    (vec![file.path.clone()], "audio/mpeg")
+                    vec![(NativeCandidate::AsIs, "audio/mpeg")]
                 } else if lower == "audio/mp4" || lower == "audio/x-m4a" {
-                    (vec![file.path.clone()], "audio/mp4")
+                    vec![(NativeCandidate::AsIs, "audio/mp4")]
                 } else {
                     return Err(AudioAttemptError::FallThrough(format!(
                         "{} cannot be uploaded as native audio without ffmpeg",
@@ -826,10 +1108,32 @@ impl MediaPublisher<'_> {
                 }
             }
         };
-        let ext = if mime == "audio/mp4" { "m4a" } else { "mp3" };
-        let mut last = String::new();
-        for candidate in candidates {
-            let bytes = read_bounded(&candidate)
+        let mut last = String::from("ffmpeg could not produce a clean MP3");
+        for (candidate, mime) in candidates {
+            let ext = if mime == "audio/mp4" { "m4a" } else { "mp3" };
+            let path = match candidate {
+                NativeCandidate::AsIs => file.path.clone(),
+                NativeCandidate::Encode { out, reencode } => {
+                    let Some(ffmpeg) = self.ffmpeg else {
+                        continue;
+                    };
+                    match crate::ffmpeg::convert_to_clean_mp3(ffmpeg, &file.path, &out, reencode)
+                        .await
+                    {
+                        Ok(()) => out,
+                        Err(e) => {
+                            tracing::debug!(
+                                target: "acp::media",
+                                "mp3 {} failed: {e}",
+                                if reencode { "re-encode" } else { "copy" }
+                            );
+                            last = format!("ffmpeg could not produce a clean MP3: {e}");
+                            continue;
+                        }
+                    }
+                }
+            };
+            let bytes = read_bounded(&path)
                 .await
                 .map_err(AudioAttemptError::FallThrough)?;
             match blossom::upload_blob(self.rest, origin, bytes, mime).await {
@@ -948,6 +1252,14 @@ enum AudioAttemptError {
     Terminal(String),
 }
 
+/// One way to produce the bytes for a native-audio upload.
+enum NativeCandidate {
+    /// The file already is MP3 or M4A; upload it unchanged.
+    AsIs,
+    /// Run ffmpeg into `out`, copying the stream or re-encoding it.
+    Encode { out: PathBuf, reencode: bool },
+}
+
 async fn read_bounded(path: &Path) -> Result<Vec<u8>, String> {
     let meta = tokio::fs::metadata(path)
         .await
@@ -975,6 +1287,35 @@ mod tests {
         root
     }
 
+    /// The test root doubles as the turn directory, so files written under
+    /// it are harness-owned; `workspace` is a sibling the engine could write to.
+    fn roots(turn_dir: &Path) -> OutboundRoots {
+        OutboundRoots {
+            turn_dir: turn_dir.to_path_buf(),
+            workspace: None,
+        }
+    }
+
+    fn far_deadline() -> tokio::time::Instant {
+        tokio::time::Instant::now() + Duration::from_secs(3600)
+    }
+
+    impl MediaPublisher<'_> {
+        /// Resolve then publish, the way the pool does, for a capture whose
+        /// files live under `turn_dir`.
+        async fn publish_capture(
+            &self,
+            target: &ReplyTarget,
+            capture: &TurnMediaCapture,
+            turn_dir: &Path,
+        ) -> Option<PublishReport> {
+            let roots = roots(turn_dir);
+            let resolution = resolve_outbound_files(capture, &roots);
+            self.publish_turn_media(target, resolution, &roots.scratch(), far_deadline())
+                .await
+        }
+    }
+
     #[test]
     fn capture_keeps_text_tail_and_bounded_blocks() {
         let mut capture = TurnMediaCapture::default();
@@ -999,12 +1340,39 @@ mod tests {
 
         let mut oversized = TurnMediaCapture::default();
         oversized.record_chunk(&serde_json::json!({
-            "type": "audio", "mimeType": "audio/mpeg", "data": "A".repeat(MAX_INLINE_BASE64_BYTES + 1)
+            "type": "audio", "mimeType": "audio/mpeg", "data": "A".repeat(MAX_INLINE_BASE64_BUDGET + 1)
         }));
         assert!(oversized.blocks().is_empty());
         assert_eq!(oversized.dropped_blocks(), 1);
         assert!(!oversized.is_empty(), "a dropped block is still a signal");
         assert!(TurnMediaCapture::default().is_empty());
+    }
+
+    #[test]
+    fn inline_budget_is_per_turn_not_per_block() {
+        // Three blocks each well under the per-block size but together over
+        // the turn budget: the first two fit, the third is dropped, and a
+        // small fourth still fits in what is left.
+        let half = MAX_INLINE_BASE64_BUDGET / 2;
+        let mut capture = TurnMediaCapture::default();
+        for _ in 0..2 {
+            capture.record_chunk(&serde_json::json!({
+                "type": "audio", "mimeType": "audio/mpeg", "data": "A".repeat(half - 8)
+            }));
+        }
+        capture.record_chunk(&serde_json::json!({
+            "type": "audio", "mimeType": "audio/mpeg", "data": "A".repeat(32)
+        }));
+        capture.record_chunk(&serde_json::json!({
+            "type": "resource", "resource": {"uri": "file:///x.png", "blob": "A".repeat(16)}
+        }));
+        assert_eq!(capture.blocks().len(), 3);
+        assert_eq!(capture.dropped_blocks(), 1);
+        assert_eq!(capture.inline_bytes(), 2 * (half - 8) + 16);
+        assert!(capture.inline_bytes() <= MAX_INLINE_BASE64_BUDGET);
+        // Text and blocks without inline data cost nothing against the budget.
+        capture.record_chunk(&serde_json::json!({"type": "resource_link", "uri": "file:///y.png"}));
+        assert_eq!(capture.blocks().len(), 4);
     }
 
     #[test]
@@ -1024,6 +1392,32 @@ mod tests {
         assert_eq!(
             extract_media_paths("MEDIA:/tmp/a.mp3."),
             vec!["/tmp/a.mp3".to_string()]
+        );
+        assert_eq!(
+            extract_media_paths("**MEDIA:/tmp/bold.mp3** _MEDIA:/tmp/em.wav_"),
+            vec!["/tmp/bold.mp3".to_string(), "/tmp/em.wav".to_string()],
+            "markdown emphasis before the marker is not a word character"
+        );
+    }
+
+    #[test]
+    fn unusable_media_refs_are_named_not_dropped() {
+        let refs = extract_media_refs(
+            "MEDIA:/tmp/my note.mp3 and MEDIA:/tmp/archive.tar.gz then MEDIA:/tmp/ok.ogg",
+        );
+        assert_eq!(refs.paths, vec!["/tmp/ok.ogg".to_string()]);
+        assert_eq!(refs.notes.len(), 2, "{:?}", refs.notes);
+        assert!(refs.notes[0].contains("MEDIA:/tmp/my"), "{:?}", refs.notes);
+        assert!(refs.notes[1].contains("archive.tar.gz"), "{:?}", refs.notes);
+        assert!(
+            extract_media_refs("MEDIA: is a tag used by tools")
+                .notes
+                .is_empty(),
+            "prose after the marker is not a path and earns no note"
+        );
+        assert!(
+            extract_media_refs("MEDIA:relative/x.mp3").notes.is_empty(),
+            "a relative token is not a candidate, as before"
         );
     }
 
@@ -1066,17 +1460,21 @@ mod tests {
         capture.record_chunk(&serde_json::json!({
             "type": "resource_link", "uri": "https://example.com/not-local.png"
         }));
-        let scratch = root.join("out");
-        let resolved = resolve_outbound_files(&capture, &scratch);
+        let roots = roots(&root);
+        let scratch = roots.scratch();
+        let resolved = resolve_outbound_files(&capture, &roots);
 
         let paths: Vec<&Path> = resolved.files.iter().map(|f| f.path.as_path()).collect();
-        assert_eq!(paths[0], audio.as_path());
+        assert_eq!(paths[0], std::fs::canonicalize(&audio).unwrap());
         assert_eq!(resolved.files[0].mime, "audio/wav");
         assert_eq!(resolved.files[0].origin, "MEDIA: line");
-        assert_eq!(paths[1], png.as_path());
+        assert_eq!(paths[1], std::fs::canonicalize(&png).unwrap());
         assert_eq!(resolved.files[1].filename, "screen.png");
         assert_eq!(resolved.files[1].mime, "image/png");
-        assert_eq!(resolved.files[2].path, scratch.join("inline-1.mp3"));
+        assert_eq!(
+            resolved.files[2].path,
+            std::fs::canonicalize(scratch.join("inline-1.mp3")).unwrap()
+        );
         assert_eq!(std::fs::read(&resolved.files[2].path).unwrap(), b"mp3bytes");
         assert_eq!(resolved.files.len(), 3, "duplicate MEDIA path collapsed");
         assert!(
@@ -1085,10 +1483,7 @@ mod tests {
             resolved.notes
         );
         assert!(
-            resolved
-                .notes
-                .iter()
-                .any(|n| n.contains("/nonexistent/x.mp3")),
+            resolved.notes.iter().any(|n| n.contains("x.mp3")),
             "{:?}",
             resolved.notes
         );
@@ -1114,7 +1509,7 @@ mod tests {
         }
         let mut capture = TurnMediaCapture::default();
         capture.record_chunk(&serde_json::json!({"type": "text", "text": text}));
-        let resolved = resolve_outbound_files(&capture, &root.join("out"));
+        let resolved = resolve_outbound_files(&capture, &roots(&root));
         assert_eq!(resolved.files.len(), MAX_OUTBOUND_FILES);
         assert!(
             resolved.notes.iter().any(|n| n.contains("file limit")),
@@ -1122,6 +1517,182 @@ mod tests {
             resolved.notes
         );
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The blocker from review: a reply may only name files under the turn
+    /// directory or the workspace. Everything else on the host is refused
+    /// with a reason, symlinks are judged by where they resolve, and
+    /// workspace files are snapshotted into the scratch directory.
+    #[test]
+    fn resolve_confines_paths_to_the_turn_dir_and_workspace() {
+        let base = temp_root();
+        let turn_dir = base.join("turn");
+        let workspace = base.join("workspace");
+        let elsewhere = base.join("elsewhere");
+        for d in [&turn_dir, &workspace, &elsewhere] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        let secret = elsewhere.join("passport.pdf");
+        std::fs::write(&secret, b"%PDF secret").unwrap();
+        let ws_file = workspace.join("report.pdf");
+        std::fs::write(&ws_file, b"%PDF report").unwrap();
+        let owned = turn_dir.join("1-voice-note.mp3");
+        std::fs::write(&owned, b"mp3").unwrap();
+        let link_out = turn_dir.join("out-link.pdf");
+        std::os::unix::fs::symlink(&secret, &link_out).unwrap();
+        let link_in = workspace.join("in-link.pdf");
+        std::os::unix::fs::symlink(&ws_file, &link_in).unwrap();
+        let traversal = format!("{}/../elsewhere/passport.pdf", workspace.display());
+        // `~/` expands through the harness HOME; point HOME somewhere the
+        // roots do not cover so the expansion itself cannot rescue it.
+        let home_secret = elsewhere.join("home-secret.csv");
+        std::fs::write(&home_secret, b"a,b").unwrap();
+
+        let mut capture = TurnMediaCapture::default();
+        capture.record_chunk(&serde_json::json!({
+            "type": "text",
+            "text": format!(
+                "MEDIA:{}\nMEDIA:{}\nMEDIA:{}\nMEDIA:{}\nMEDIA:{}\nMEDIA:{traversal}\nMEDIA:../../etc/passwd\nMEDIA:/etc/passwd.txt",
+                secret.display(), ws_file.display(), owned.display(), link_out.display(), link_in.display()
+            )
+        }));
+        capture.record_chunk(&serde_json::json!({
+            "type": "resource_link", "uri": format!("file://{}", secret.display()), "name": "passport.pdf"
+        }));
+        let roots = OutboundRoots {
+            turn_dir: turn_dir.clone(),
+            workspace: Some(workspace.clone()),
+        };
+        let resolved = resolve_outbound_files(&capture, &roots);
+
+        let names: Vec<&str> = resolved.files.iter().map(|f| f.filename.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["report.pdf", "1-voice-note.mp3", "in-link.pdf"],
+            "{:?}",
+            resolved
+        );
+        // Workspace files are staged; the turn-dir file is used in place.
+        let scratch = std::fs::canonicalize(roots.scratch()).unwrap();
+        assert!(
+            resolved.files[0].path.starts_with(&scratch),
+            "{:?}",
+            resolved.files[0]
+        );
+        assert_eq!(
+            std::fs::read(&resolved.files[0].path).unwrap(),
+            b"%PDF report"
+        );
+        assert_eq!(
+            resolved.files[1].path,
+            std::fs::canonicalize(&owned).unwrap()
+        );
+        assert!(resolved.files[2].path.starts_with(&scratch));
+        assert!(
+            resolved.files.iter().all(|f| f
+                .path
+                .starts_with(std::fs::canonicalize(&turn_dir).unwrap())),
+            "every upload source is harness-owned"
+        );
+
+        let refused = |needle: &str| {
+            resolved
+                .notes
+                .iter()
+                .find(|n| n.contains(needle))
+                .unwrap_or_else(|| panic!("no note for {needle}: {:?}", resolved.notes))
+                .clone()
+        };
+        assert!(refused("passport.pdf refused").contains("outside the turn directory"));
+        assert!(refused("out-link.pdf refused").contains("symlink resolves outside"));
+        assert!(refused("passport.pdf refused: path traversal").contains(".."));
+        assert!(
+            refused("passwd.txt refused").contains("outside")
+                || refused("passwd.txt").contains("No such file")
+        );
+        assert_eq!(
+            resolved
+                .notes
+                .iter()
+                .filter(|n| n.contains("passport.pdf refused"))
+                .count(),
+            3,
+            "the MEDIA line, the traversal, and the resource_link were each refused: {:?}",
+            resolved.notes
+        );
+        assert!(
+            !resolved
+                .notes
+                .iter()
+                .any(|n| n.contains("etc/passwd") && !n.contains("passwd.txt")),
+            "a relative reference never becomes a candidate: {:?}",
+            resolved.notes
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn resolve_home_expansion_is_still_confined() {
+        let base = temp_root();
+        let turn_dir = base.join("turn");
+        std::fs::create_dir_all(&turn_dir).unwrap();
+        let home = base.join("home");
+        std::fs::create_dir_all(home.join("Documents")).unwrap();
+        std::fs::write(home.join("Documents/tax.xlsx"), b"cells").unwrap();
+        let mut capture = TurnMediaCapture::default();
+        capture.record_chunk(
+            &serde_json::json!({"type": "text", "text": "MEDIA:~/Documents/tax.xlsx"}),
+        );
+        let roots = OutboundRoots {
+            turn_dir: turn_dir.clone(),
+            workspace: None,
+        };
+        let expanded = {
+            // Resolve under a HOME the roots do not cover.
+            let prev = std::env::var_os("HOME");
+            std::env::set_var("HOME", &home);
+            let resolved = resolve_outbound_files(&capture, &roots);
+            match prev {
+                Some(v) => std::env::set_var("HOME", v),
+                None => std::env::remove_var("HOME"),
+            }
+            resolved
+        };
+        assert!(expanded.files.is_empty(), "{:?}", expanded);
+        assert!(
+            expanded
+                .notes
+                .iter()
+                .any(|n| n.contains("tax.xlsx refused") && n.contains("outside")),
+            "{:?}",
+            expanded.notes
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn staged_copy_is_a_snapshot_of_the_turn() {
+        let base = temp_root();
+        let turn_dir = base.join("turn");
+        let workspace = base.join("ws");
+        std::fs::create_dir_all(&turn_dir).unwrap();
+        std::fs::create_dir_all(&workspace).unwrap();
+        let file = workspace.join("clip.wav");
+        std::fs::write(&file, b"first").unwrap();
+        let mut capture = TurnMediaCapture::default();
+        capture.record_chunk(
+            &serde_json::json!({"type": "text", "text": format!("MEDIA:{}", file.display())}),
+        );
+        let roots = OutboundRoots {
+            turn_dir,
+            workspace: Some(workspace),
+        };
+        let resolved = resolve_outbound_files(&capture, &roots);
+        assert_eq!(resolved.files.len(), 1, "{:?}", resolved.notes);
+        // The workspace file changes after the turn ended; the upload source does not.
+        std::fs::write(&file, b"second, written after the turn").unwrap();
+        assert_eq!(std::fs::read(&resolved.files[0].path).unwrap(), b"first");
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]
@@ -1254,6 +1825,21 @@ mod tests {
     async fn scripted_server(
         script: impl FnOnce(&str) -> Vec<(&'static str, String)>,
     ) -> (String, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+        scripted_server_with_delays(|base| {
+            script(base)
+                .into_iter()
+                .map(|(status, body)| (status, body, Duration::ZERO))
+                .collect()
+        })
+        .await
+    }
+
+    /// One connection per scripted response, each held for its delay before
+    /// the reply is written; a client that gives up first is tolerated so the
+    /// later responses still get served.
+    async fn scripted_server_with_delays(
+        script: impl FnOnce(&str) -> Vec<(&'static str, String, Duration)>,
+    ) -> (String, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -1262,13 +1848,15 @@ mod tests {
         let requests = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let seen = requests.clone();
         tokio::spawn(async move {
-            for (status, body) in responses {
+            // A delayed response is written from its own task so the accept
+            // loop keeps serving the connections scripted after it.
+            for (status, body, delay) in responses {
                 let (mut socket, _) = listener.accept().await.unwrap();
                 let mut buf = Vec::new();
                 let mut chunk = vec![0u8; 16384];
                 let mut header_end = None;
                 loop {
-                    let n = socket.read(&mut chunk).await.unwrap();
+                    let n = socket.read(&mut chunk).await.unwrap_or(0);
                     if n == 0 {
                         break;
                     }
@@ -1295,8 +1883,13 @@ mod tests {
                     "HTTP/1.1 {status}\r\nConnection: close\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
                     body.len()
                 );
-                socket.write_all(resp.as_bytes()).await.unwrap();
-                socket.shutdown().await.ok();
+                tokio::spawn(async move {
+                    if !delay.is_zero() {
+                        tokio::time::sleep(delay).await;
+                    }
+                    let _ = socket.write_all(resp.as_bytes()).await;
+                    socket.shutdown().await.ok();
+                });
             }
         });
         (base, requests)
@@ -1367,7 +1960,7 @@ mod tests {
         }));
 
         let report = publisher
-            .publish_turn_media(&target, &capture, &root.join("out"))
+            .publish_capture(&target, &capture, &root)
             .await
             .expect("media referenced");
 
@@ -1469,7 +2062,7 @@ mod tests {
         }));
 
         let report = publisher
-            .publish_turn_media(&target, &capture, &root.join("out"))
+            .publish_capture(&target, &capture, &root)
             .await
             .unwrap();
 
@@ -1520,7 +2113,7 @@ mod tests {
         );
 
         let report = publisher
-            .publish_turn_media(&target, &capture, &root.join("out"))
+            .publish_capture(&target, &capture, &root)
             .await
             .unwrap();
 
@@ -1555,9 +2148,143 @@ mod tests {
         let target = ReplyTarget::for_trigger(uuid::Uuid::new_v4(), &trigger);
         let mut capture = TurnMediaCapture::default();
         capture.record_chunk(&serde_json::json!({"type": "text", "text": "plain reply, no files"}));
+        assert!(!capture.references_media());
         assert!(publisher
-            .publish_turn_media(&target, &capture, Path::new("/nonexistent"))
+            .publish_capture(&target, &capture, Path::new("/nonexistent"))
             .await
             .is_none());
+        assert!(
+            !Path::new("/nonexistent/out").exists(),
+            "a text-only reply creates no scratch directory"
+        );
+    }
+
+    #[tokio::test]
+    async fn uploads_stop_at_the_reply_deadline_but_the_kind9_still_goes_out() {
+        let root = temp_root();
+        let first = root.join("one.txt");
+        let second = root.join("two.txt");
+        let third = root.join("three.txt");
+        std::fs::write(&first, b"one").unwrap();
+        std::fs::write(&second, b"two").unwrap();
+        std::fs::write(&third, b"three").unwrap();
+        let sha = blossom::sha256_hex(b"one");
+        // Connection 1: upload of `one` answers at once. Connection 2: upload
+        // of `two` is held past the deadline, so the client is cut off
+        // mid-request. `three` is never attempted. Connection 3: the kind-9
+        // for `one`.
+        let (base, requests) = scripted_server_with_delays(|base| {
+            vec![
+                (
+                    "200 OK",
+                    descriptor_json(base, &sha, "text/plain", 3),
+                    Duration::ZERO,
+                ),
+                ("200 OK", "{}".to_string(), Duration::from_secs(5)),
+                ("200 OK", r#"{"accepted":true}"#.to_string(), Duration::ZERO),
+            ]
+        })
+        .await;
+        let rest = rest_for(&base);
+        let cache = AudioSupportCache::default();
+        let publisher = MediaPublisher {
+            rest: &rest,
+            audio_support: &cache,
+            ffmpeg: None,
+        };
+        let keys = Keys::generate();
+        let trigger = nostr::EventBuilder::new(nostr::Kind::Custom(9), "x")
+            .sign_with_keys(&keys)
+            .unwrap();
+        let target = ReplyTarget::for_trigger(uuid::Uuid::new_v4(), &trigger);
+        let mut capture = TurnMediaCapture::default();
+        capture.record_chunk(&serde_json::json!({
+            "type": "text",
+            "text": format!(
+                "MEDIA:{}\nMEDIA:{}\nMEDIA:{}",
+                first.display(),
+                second.display(),
+                third.display()
+            )
+        }));
+        let roots = roots(&root);
+        let resolution = resolve_outbound_files(&capture, &roots);
+        assert_eq!(resolution.files.len(), 3, "{:?}", resolution.notes);
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(500);
+        let started = std::time::Instant::now();
+        let report = publisher
+            .publish_turn_media(&target, resolution, &roots.scratch(), deadline)
+            .await
+            .unwrap();
+        assert!(
+            started.elapsed() < Duration::from_secs(4),
+            "the held upload is cut at the deadline, not waited out: {:?}",
+            started.elapsed()
+        );
+        assert_eq!(report.published.len(), 1, "{report:?}");
+        assert!(
+            report.event_id.is_some(),
+            "what finished in time is still announced: {report:?}"
+        );
+        assert_eq!(report.failed.len(), 2, "{:?}", report.failed);
+        assert!(
+            report.failed[0].starts_with("two.txt: upload cut off"),
+            "{}",
+            report.failed[0]
+        );
+        assert!(
+            report.failed[1].starts_with("three.txt: skipped"),
+            "{}",
+            report.failed[1]
+        );
+        assert!(report.failed.iter().all(|f| f.contains("deadline")));
+        let seen = requests.lock().unwrap().clone();
+        assert_eq!(
+            seen.len(),
+            3,
+            "two uploads reached the wire, then the kind-9"
+        );
+        assert!(seen[0].starts_with("PUT /upload"), "{}", seen[0]);
+        assert!(seen[1].starts_with("PUT /upload"), "{}", seen[1]);
+        assert!(seen[2].starts_with("POST /events"), "{}", seen[2]);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn failure_notice_is_short_and_names_the_first_reason() {
+        let mut report = PublishReport {
+            failed: vec![
+                "passport.pdf refused: outside the turn directory and the workspace".into(),
+            ],
+            ..PublishReport::default()
+        };
+        assert_eq!(
+            failure_notice(&report),
+            "Could not attach a file from my reply: passport.pdf refused: outside the turn directory and the workspace"
+        );
+        report.failed.push("x".repeat(400));
+        report
+            .published
+            .push(published(MediaKind::File, "ok.txt", None));
+        let notice = failure_notice(&report);
+        assert!(notice
+            .starts_with("Could not attach 2 files from my reply; first reason: passport.pdf"));
+        assert!(notice.len() <= FAILURE_NOTICE_MAX_BYTES, "{}", notice.len());
+        let mut long = PublishReport::default();
+        long.failed
+            .push(format!("{}\u{e9}", "y".repeat(FAILURE_NOTICE_MAX_BYTES)));
+        let notice = failure_notice(&long);
+        assert!(notice.ends_with("..."), "{notice}");
+        assert!(notice.len() <= FAILURE_NOTICE_MAX_BYTES);
+        assert!(failure_notice(&PublishReport::default()).contains("unknown reason"));
+    }
+
+    #[test]
+    fn body_line_escapes_markdown_in_filenames() {
+        let item = published(MediaKind::File, "notes](x)[.txt", None);
+        assert_eq!(
+            body_line(&item),
+            format!("[notes\\]\\(x\\)\\[.txt]({})", item.descriptor.url)
+        );
     }
 }

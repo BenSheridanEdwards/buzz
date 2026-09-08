@@ -812,10 +812,16 @@ pub struct PromptContext {
     /// the desktop keys per (agent, relay) pair, e.g. `session_config_captured`,
     /// mirroring the `managed_agent_runtime_lifecycle` frames.
     pub relay_url: String,
-    /// Per-agent temp root for inbound attachment blobs and outbound scratch
-    /// files. One subdirectory per turn; the oldest are pruned so the root
-    /// stays bounded (see `attachments::prepare_turn_dir`).
-    pub attachment_dir: std::path::PathBuf,
+    /// Per-agent private root for inbound attachment blobs and outbound
+    /// scratch files, or the reason the harness has none (the root failed the
+    /// ownership, mode, or symlink checks in
+    /// `attachments::prepare_attachment_root`). One subdirectory per turn;
+    /// the oldest are pruned so the root stays bounded (see
+    /// `attachments::prepare_turn_dir`).
+    pub attachment_dir: Result<std::path::PathBuf, String>,
+    /// Turn directories that are still being prompted or published, kept out
+    /// of the prune (see `attachments::prune_turn_dirs`).
+    pub live_turn_dirs: crate::attachments::LiveTurnDirs,
     /// Cached NIP-11 `buzz-audio` answer shared by every reply.
     pub audio_support: crate::blossom::AudioSupportCache,
     /// ffmpeg binary found at startup, if any. Without it voice-note
@@ -2084,8 +2090,13 @@ fn with_canvas(prompt: Option<String>, canvas: Option<&str>) -> Option<String> {
     }
 }
 
-/// Fetch every `imeta` attachment on a batch (cancelled events first, then
-/// the live ones) into this turn's directory under the per-agent temp root.
+/// Fetch every `imeta` attachment on a batch into this turn's directory
+/// under the per-agent temp root.
+///
+/// Live events are admitted before the cancelled ones they superseded, so
+/// on a steer the message that caused it gets the attachment budget ahead of
+/// the blobs already fetched for the cancelled turn. The whole phase runs
+/// under `attachments::INBOUND_DEADLINE`.
 ///
 /// When the directory cannot be created the attachments are still named in
 /// the prompt, each with that reason, so the engine knows what it did not get.
@@ -2095,9 +2106,9 @@ async fn collect_batch_attachments(
     turn_id: &str,
 ) -> crate::attachments::InboundAttachments {
     let events: Vec<&nostr::Event> = batch
-        .cancelled_events
+        .events
         .iter()
-        .chain(batch.events.iter())
+        .chain(batch.cancelled_events.iter())
         .map(|be| &be.event)
         .collect();
     let has_imeta = events.iter().any(|event| {
@@ -2109,20 +2120,25 @@ async fn collect_batch_attachments(
     if !has_imeta {
         return crate::attachments::InboundAttachments::default();
     }
-    match crate::attachments::prepare_turn_dir(&ctx.attachment_dir, turn_id) {
+    let turn_dir = ctx
+        .attachment_dir
+        .as_deref()
+        .map_err(|reason| std::io::Error::other(reason.clone()))
+        .and_then(|root| crate::attachments::prepare_turn_dir(root, turn_id, &ctx.live_turn_dirs));
+    match turn_dir {
         Ok(turn_dir) => {
             crate::attachments::collect_inbound_attachments(
                 &ctx.rest_client,
                 &events,
                 &turn_dir,
                 ctx.ffmpeg.as_deref(),
+                tokio::time::Instant::now() + crate::attachments::INBOUND_DEADLINE,
             )
             .await
         }
         Err(e) => {
             tracing::warn!(
                 target: "acp::media",
-                dir = %ctx.attachment_dir.display(),
                 "attachment directory unavailable: {e}"
             );
             crate::attachments::InboundAttachments::unavailable(
@@ -2133,67 +2149,122 @@ async fn collect_batch_attachments(
     }
 }
 
+/// Outer bound on one reply's media task: the upload deadline, the kind-9
+/// submit, and slack for the failure notice and resolving files on disk.
+const REPLY_MEDIA_TASK_TIMEOUT: Duration = crate::media_publish::OUTBOUND_DEADLINE
+    .saturating_add(crate::media_publish::PUBLISH_TIMEOUT)
+    .saturating_add(Duration::from_secs(20));
+
+/// Observer plumbing detached from the agent so a task that outlives the
+/// turn can still emit frames under the turn's context.
+#[derive(Clone)]
+struct TurnObserver {
+    handle: Option<observer::ObserverHandle>,
+    agent_index: Option<usize>,
+    context: observer::ObserverContext,
+}
+
+impl TurnObserver {
+    fn for_agent(agent: &OwnedAgent) -> Self {
+        Self {
+            handle: agent.acp.observer_handle(),
+            agent_index: agent.acp.observer_agent_index(),
+            context: agent.acp.observer_context().clone(),
+        }
+    }
+
+    fn emit(&self, kind: &str, payload: serde_json::Value) {
+        if let Some(handle) = &self.handle {
+            handle.emit(kind, self.agent_index, &self.context, payload);
+        }
+    }
+}
+
 /// Publish any files the engine's reply named for a completed channel turn.
 ///
-/// Always takes the capture (so it cannot leak into the next turn), then
-/// uploads and posts one kind-9 when the turn had a channel to answer in.
-/// Failures are logged and emitted as an observer frame; the engine's own
-/// text reply is unaffected because the harness never publishes it.
-async fn publish_reply_media(
-    ctx: &PromptContext,
+/// Always takes the capture (so it cannot leak into the next turn). When the
+/// turn had a channel to answer in and the reply named or carried media, the
+/// uploads and the kind-9 run on their own task so the agent slot returns to
+/// the pool at once; the task keeps the turn directory live (`guard`) until it
+/// is done and is bounded by [`REPLY_MEDIA_TASK_TIMEOUT`] end to end.
+///
+/// Anything that did not reach the relay is posted as a short notice in the
+/// same thread the media would have landed in, so the human who read "here
+/// is your voice note" is not left waiting for a file that never comes
+/// (rule 1); the log and the `turn_media_published` observer frame carry the
+/// full reasons. Returns the task handle so tests can await it.
+fn publish_reply_media(
+    ctx: &Arc<PromptContext>,
     agent: &mut OwnedAgent,
     batch: Option<&FlushBatch>,
     turn_id: &str,
-) {
+    guard: crate::attachments::LiveTurnGuard,
+) -> Option<tokio::task::JoinHandle<()>> {
     let capture = agent.acp.take_turn_media();
     let Some(batch) = batch else {
-        return;
-    };
-    if capture.is_empty() {
-        return;
-    }
-    let Some(trigger) = batch.events.last() else {
-        return;
-    };
-    let scratch = match crate::attachments::prepare_turn_dir(&ctx.attachment_dir, turn_id) {
-        Ok(dir) => dir.join("out"),
-        Err(e) => {
+        if capture.references_media() {
+            // Heartbeat and initial-message replies have no channel to post
+            // into; say so rather than losing the reference silently.
             tracing::warn!(
                 target: "acp::media",
-                dir = %ctx.attachment_dir.display(),
-                "reply media scratch directory unavailable: {e}"
+                blocks = capture.blocks().len(),
+                "reply named media outside a channel turn; only channel turns can attach files"
             );
             agent.acp.observe(
-                "turn_media_published",
+                "turn_media_dropped",
                 serde_json::json!({
-                    "published": 0,
-                    "failed": [format!("scratch directory unavailable: {e}")],
-                    "eventId": serde_json::Value::Null,
+                    "reason": "not a channel turn",
+                    "blocks": capture.blocks().len(),
                 }),
             );
-            return;
         }
+        return None;
     };
-    let target = crate::media_publish::ReplyTarget::for_trigger(batch.channel_id, &trigger.event);
-    let publisher = crate::media_publish::MediaPublisher {
-        rest: &ctx.rest_client,
-        audio_support: &ctx.audio_support,
-        ffmpeg: ctx.ffmpeg.as_deref(),
-    };
-    if let Some(report) = publisher
-        .publish_turn_media(&target, &capture, &scratch)
-        .await
-    {
+    if !capture.references_media() {
+        return None;
+    }
+    let trigger = batch.events.last()?;
+    let observer = TurnObserver::for_agent(agent);
+    let ctx = Arc::clone(ctx);
+    let channel_id = batch.channel_id;
+    let trigger = trigger.event.clone();
+    let turn_id = turn_id.to_string();
+    Some(tokio::spawn(async move {
+        let _guard = guard;
+        let target = crate::media_publish::ReplyTarget::for_trigger(channel_id, &trigger);
+        let work = publish_reply_media_now(&ctx, &target, capture, &turn_id);
+        let report = match tokio::time::timeout(REPLY_MEDIA_TASK_TIMEOUT, work).await {
+            Ok(report) => report,
+            Err(_) => crate::media_publish::PublishReport {
+                published: Vec::new(),
+                failed: vec![format!(
+                    "reply media task did not finish within {REPLY_MEDIA_TASK_TIMEOUT:?}"
+                )],
+                event_id: None,
+            },
+        };
         if !report.is_clean() {
             tracing::warn!(
                 target: "acp::media",
-                channel = %batch.channel_id,
+                channel = %channel_id,
                 published = report.published.len(),
                 "reply media partially failed: {}",
                 report.failed.join("; ")
             );
+            let thread_tags = crate::queue::ThreadTags {
+                root_event_id: Some(target.root_event_id.to_hex()),
+                parent_event_id: Some(target.root_event_id.to_hex()),
+                mentioned_pubkeys: Vec::new(),
+            };
+            post_failure_notice(
+                &ctx.rest_client,
+                channel_id,
+                &thread_tags,
+                &crate::media_publish::failure_notice(&report),
+            )
+            .await;
         }
-        agent.acp.observe(
+        observer.emit(
             "turn_media_published",
             serde_json::json!({
                 "published": report.published.len(),
@@ -2206,7 +2277,58 @@ async fn publish_reply_media(
                     .collect::<Vec<_>>(),
             }),
         );
-    }
+    }))
+}
+
+/// Resolve the capture against the turn directory and the workspace, upload
+/// what passes, and post the kind-9. Every skipped reference is in `failed`.
+async fn publish_reply_media_now(
+    ctx: &PromptContext,
+    target: &crate::media_publish::ReplyTarget,
+    capture: crate::media_publish::TurnMediaCapture,
+    turn_id: &str,
+) -> crate::media_publish::PublishReport {
+    let failed = |reason: String| crate::media_publish::PublishReport {
+        published: Vec::new(),
+        failed: vec![reason],
+        event_id: None,
+    };
+    let turn_dir = match ctx.attachment_dir.as_deref() {
+        Ok(root) => {
+            match crate::attachments::prepare_turn_dir(root, turn_id, &ctx.live_turn_dirs) {
+                Ok(dir) => dir,
+                Err(e) => return failed(format!("attachment storage unavailable: {e}")),
+            }
+        }
+        Err(reason) => return failed(format!("attachment storage unavailable: {reason}")),
+    };
+    let roots = crate::media_publish::OutboundRoots {
+        turn_dir,
+        workspace: Some(std::path::PathBuf::from(&ctx.cwd)),
+    };
+    // Canonicalising, staging, and decoding inline data are disk work; keep
+    // them off the runtime threads.
+    let resolution = {
+        let roots = roots.clone();
+        match tokio::task::spawn_blocking(move || {
+            crate::media_publish::resolve_outbound_files(&capture, &roots)
+        })
+        .await
+        {
+            Ok(resolution) => resolution,
+            Err(e) => return failed(format!("resolving reply files failed: {e}")),
+        }
+    };
+    let publisher = crate::media_publish::MediaPublisher {
+        rest: &ctx.rest_client,
+        audio_support: &ctx.audio_support,
+        ffmpeg: ctx.ffmpeg.as_deref(),
+    };
+    let deadline = tokio::time::Instant::now() + crate::media_publish::OUTBOUND_DEADLINE;
+    publisher
+        .publish_turn_media(target, resolution, &roots.scratch(), deadline)
+        .await
+        .unwrap_or_default()
 }
 
 /// Return `agent` to the pool via `result_tx`, clearing any steer receiver first.
@@ -2268,6 +2390,10 @@ pub async fn run_prompt_task(
     };
     let observer_channel_id = source.channel_id();
     let turn_started_at = chrono::Utc::now().to_rfc3339();
+    // This turn's attachment directory stays out of the prune while the
+    // engine may read it and, after the turn, while its reply media is
+    // published (the guard moves into that task).
+    let turn_dir_guard = ctx.live_turn_dirs.hold(&turn_id);
     agent.acp.set_observer_context(observer::context_for_turn(
         observer_channel_id,
         None,
@@ -3198,7 +3324,13 @@ pub async fn run_prompt_task(
                             &source,
                             &control_signal,
                         );
-                        publish_reply_media(&ctx, &mut agent, batch.as_ref(), &turn_id).await;
+                        publish_reply_media(
+                            &ctx,
+                            &mut agent,
+                            batch.as_ref(),
+                            &turn_id,
+                            turn_dir_guard,
+                        );
                         let usage = agent.acp.take_turn_usage();
                         publish_agent_turn_metric(
                             &ctx,
@@ -3278,7 +3410,7 @@ pub async fn run_prompt_task(
             if matches!(stop_reason, StopReason::Cancelled | StopReason::Refusal) {
                 let _ = agent.acp.take_turn_media();
             } else {
-                publish_reply_media(&ctx, &mut agent, batch.as_ref(), &turn_id).await;
+                publish_reply_media(&ctx, &mut agent, batch.as_ref(), &turn_id, turn_dir_guard);
             }
 
             let core_stop = acp_stop_to_core(&stop_reason);
@@ -6956,6 +7088,506 @@ done"#
         );
     }
 
+    /// One HTTP request as the media test server saw it.
+    #[derive(Debug, Clone)]
+    struct SeenRequest {
+        method: String,
+        path: String,
+        /// Header names lower-cased.
+        headers: Vec<(String, String)>,
+        body: Vec<u8>,
+    }
+
+    impl SeenRequest {
+        fn header(&self, name: &str) -> Option<&str> {
+            self.headers
+                .iter()
+                .find(|(k, _)| k == name)
+                .map(|(_, v)| v.as_str())
+        }
+
+        fn json(&self) -> serde_json::Value {
+            serde_json::from_slice(&self.body).unwrap_or(serde_json::Value::Null)
+        }
+    }
+
+    /// A relay stand-in that serves one blob, accepts uploads and events, and
+    /// answers everything else with an empty JSON document. Keep-alive aware,
+    /// since the Blossom client pools connections.
+    async fn media_relay_server(
+        blob: Vec<u8>,
+        blob_sha: String,
+    ) -> (String, std::sync::Arc<std::sync::Mutex<Vec<SeenRequest>>>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let base = format!("http://{addr}");
+        let seen: std::sync::Arc<std::sync::Mutex<Vec<SeenRequest>>> = Default::default();
+        let log = seen.clone();
+        let blob = std::sync::Arc::new(blob);
+        let descriptor_base = base.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    return;
+                };
+                let log = log.clone();
+                let blob = blob.clone();
+                let blob_sha = blob_sha.clone();
+                let base = descriptor_base.clone();
+                tokio::spawn(async move {
+                    let mut buf: Vec<u8> = Vec::new();
+                    let mut chunk = vec![0u8; 65536];
+                    loop {
+                        // Read one request: headers, then Content-Length bytes.
+                        let header_end = loop {
+                            if let Some(p) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                                break p + 4;
+                            }
+                            match socket.read(&mut chunk).await {
+                                Ok(0) | Err(_) => return,
+                                Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                            }
+                        };
+                        let head = String::from_utf8_lossy(&buf[..header_end]).into_owned();
+                        let mut lines = head.lines();
+                        let request_line = lines.next().unwrap_or_default().to_string();
+                        let mut parts = request_line.split_whitespace();
+                        let method = parts.next().unwrap_or_default().to_string();
+                        let path = parts.next().unwrap_or_default().to_string();
+                        let headers: Vec<(String, String)> = lines
+                            .filter_map(|l| {
+                                let (k, v) = l.split_once(':')?;
+                                Some((k.trim().to_ascii_lowercase(), v.trim().to_string()))
+                            })
+                            .collect();
+                        let len = headers
+                            .iter()
+                            .find(|(k, _)| k == "content-length")
+                            .and_then(|(_, v)| v.parse::<usize>().ok())
+                            .unwrap_or(0);
+                        while buf.len() < header_end + len {
+                            match socket.read(&mut chunk).await {
+                                Ok(0) | Err(_) => return,
+                                Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                            }
+                        }
+                        let body = buf[header_end..header_end + len].to_vec();
+                        buf.drain(..header_end + len);
+                        let (content_type, response): (&str, Vec<u8>) = match (
+                            method.as_str(),
+                            path.as_str(),
+                        ) {
+                            ("GET", p) if p.contains(&blob_sha) => {
+                                ("application/octet-stream", blob.as_ref().clone())
+                            }
+                            ("PUT", "/upload") | ("PUT", "/media/upload") => {
+                                let sha = crate::blossom::sha256_hex(&body);
+                                let mime = headers
+                                    .iter()
+                                    .find(|(k, _)| k == "content-type")
+                                    .map(|(_, v)| v.clone())
+                                    .unwrap_or_else(|| "application/octet-stream".into());
+                                (
+                                        "application/json",
+                                        format!(
+                                            r#"{{"url":"{base}/media/{sha}.bin","sha256":"{sha}","size":{},"type":"{mime}","uploaded":1}}"#,
+                                            body.len()
+                                        )
+                                        .into_bytes(),
+                                    )
+                            }
+                            ("POST", "/events") => {
+                                ("application/json", br#"{"accepted":true}"#.to_vec())
+                            }
+                            ("POST", _) => ("application/json", b"[]".to_vec()),
+                            _ => ("application/json", b"{}".to_vec()),
+                        };
+                        log.lock().unwrap().push(SeenRequest {
+                            method,
+                            path,
+                            headers,
+                            body,
+                        });
+                        let mut resp = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\n\r\n",
+                            response.len()
+                        )
+                        .into_bytes();
+                        resp.extend_from_slice(&response);
+                        if socket.write_all(&resp).await.is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+        (base, seen)
+    }
+
+    /// Poll the server log until `pred` holds or ten seconds pass.
+    async fn wait_for_requests(
+        seen: &std::sync::Arc<std::sync::Mutex<Vec<SeenRequest>>>,
+        what: &str,
+        pred: impl Fn(&[SeenRequest]) -> bool,
+    ) -> Vec<SeenRequest> {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let snapshot = seen.lock().unwrap().clone();
+            if pred(&snapshot) {
+                return snapshot;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out waiting for {what}; saw {:?}",
+                snapshot
+                    .iter()
+                    .map(|r| format!("{} {}", r.method, r.path))
+                    .collect::<Vec<_>>()
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    fn kind9_posts(seen: &[SeenRequest]) -> Vec<serde_json::Value> {
+        seen.iter()
+            .filter(|r| r.method == "POST" && r.path == "/events")
+            .map(SeenRequest::json)
+            .filter(|e| e["kind"].as_u64() == Some(9))
+            .collect()
+    }
+
+    /// Review item 6: binds `run_prompt_task` end to end. A channel turn whose
+    /// trigger carries an `imeta` attachment gets the blob fetched (with the
+    /// auth tag on the wire) and handed to the engine as a `<buzz-attachments>`
+    /// section plus a `resource_link` block in the same `session/prompt`; a
+    /// reply that names a workspace file has it uploaded (auth tag again) and
+    /// announced in one kind-9 anchored to the trigger; a reference outside
+    /// the turn directory and the workspace is refused and the refusal is
+    /// posted as a short notice in the same thread. A turn the engine ends
+    /// with `cancelled` and a heartbeat turn publish nothing.
+    #[tokio::test]
+    async fn channel_turn_delivers_inbound_attachments_and_publishes_reply_media() {
+        let blob = b"voice note bytes".to_vec();
+        let blob_sha = crate::blossom::sha256_hex(&blob);
+        let (base, seen) = media_relay_server(blob.clone(), blob_sha.clone()).await;
+
+        let scratch = std::env::temp_dir().join(format!("buzz-acp-pool-media-{}", Uuid::new_v4()));
+        let workspace = scratch.join("workspace");
+        let elsewhere = scratch.join("elsewhere");
+        let attachment_root = scratch.join("attachments");
+        for d in [&workspace, &elsewhere, &attachment_root] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        let reply_file = workspace.join("reply.txt");
+        std::fs::write(&reply_file, b"hello from the workspace").unwrap();
+        let secret = elsewhere.join("secret.txt");
+        std::fs::write(&secret, b"not yours to publish").unwrap();
+
+        let capture = scratch.join("acp-requests.ndjson");
+        let quoted_capture = capture.to_string_lossy().replace('\'', "'\\''");
+        let reply_text = format!(
+            "Here you go.\\nMEDIA:{}\\nMEDIA:{}",
+            reply_file.display(),
+            secret.display()
+        );
+        // Every prompt gets the same reply: one workspace file, one file from
+        // outside every root. Turn 2 ends with `cancelled`, the rest `end_turn`.
+        let script = format!(
+            r#"count=0
+while IFS= read -r line; do
+  printf '%s\n' "$line" >> '{quoted_capture}'
+  count=$((count + 1))
+  printf '%s\n' '{{"jsonrpc":"2.0","method":"session/update","params":{{"sessionId":"live-session","update":{{"sessionUpdate":"agent_message_chunk","content":{{"type":"text","text":"{reply_text}"}}}}}}}}'
+  if [ "$count" -eq 2 ]; then stop=cancelled; else stop=end_turn; fi
+  printf '%s\n' "{{\"jsonrpc\":\"2.0\",\"id\":$((count - 1)),\"result\":{{\"stopReason\":\"$stop\"}}}}"
+done"#
+        );
+        let acp = AcpClient::spawn("bash", &["-c".to_string(), script], &[], false)
+            .await
+            .expect("spawn media ACP script");
+        let channel_id = Uuid::new_v4();
+        let mut agent = OwnedAgent {
+            index: 0,
+            acp,
+            state: SessionState::default(),
+            model_capabilities: None,
+            desired_model: None,
+            model_overridden: false,
+            desired_model_request_id: None,
+            desired_model_pending_ack: false,
+            startup_effort: None,
+            agent_name: "media-test-agent".into(),
+            goose_system_prompt_supported: None,
+            protocol_version: 1,
+        };
+        agent
+            .state
+            .sessions
+            .insert(conv(channel_id), "live-session".into());
+        agent
+            .state
+            .deliveries
+            .insert(conv(channel_id), ChannelDeliveryState::default());
+        agent.state.heartbeat_session = Some("live-session".into());
+
+        let mut ctx = make_prompt_context_no_owner();
+        ctx.rest_client.base_url = base.clone();
+        ctx.rest_client.auth_tag_json = Some(r#"{"tag":"member"}"#.into());
+        ctx.attachment_dir = Ok(attachment_root.clone());
+        ctx.cwd = workspace.to_string_lossy().into_owned();
+        let ctx = Arc::new(ctx);
+        let (result_tx, mut result_rx) = mpsc::unbounded_channel();
+
+        let author = Keys::generate();
+        let channel_batch = |content: &str, with_attachment: bool| {
+            let mut builder = EventBuilder::new(Kind::Custom(9), content);
+            if with_attachment {
+                let imeta = Tag::parse([
+                    "imeta",
+                    &format!("url {base}/media/{blob_sha}.bin"),
+                    "m audio/mpeg",
+                    &format!("x {blob_sha}"),
+                    &format!("size {}", blob.len()),
+                    "filename voice-note-1.mp3",
+                ])
+                .unwrap();
+                builder = builder.tags([imeta]);
+            }
+            let event = builder.sign_with_keys(&author).unwrap();
+            FlushBatch {
+                channel_id,
+                scope: SessionScope::Conversation { channel_id },
+                events: vec![crate::queue::BatchEvent {
+                    event,
+                    prompt_tag: "test".into(),
+                    received_at: std::time::Instant::now(),
+                }],
+                cancelled_events: vec![],
+                cancel_reason: None,
+            }
+        };
+
+        // Turn 1: attachment in, workspace file out, refusal noticed.
+        let batch = channel_batch("listen to this", true);
+        let trigger_id = batch.events[0].event.id.to_hex();
+        run_prompt_task(
+            agent,
+            Some(batch),
+            None,
+            Arc::clone(&ctx),
+            result_tx.clone(),
+            None,
+            "turn-1".into(),
+        )
+        .await;
+        let result = result_rx.recv().await.expect("prompt result");
+        assert!(matches!(
+            result.outcome,
+            PromptOutcome::Ok(StopReason::EndTurn)
+        ));
+        agent = result.agent;
+
+        let requests = wait_for_requests(&seen, "turn 1 media kind-9 and failure notice", |seen| {
+            let posts = kind9_posts(seen);
+            posts
+                .iter()
+                .any(|e| e["content"].as_str().unwrap_or("").contains("reply.txt"))
+                && posts.iter().any(|e| {
+                    e["content"]
+                        .as_str()
+                        .unwrap_or("")
+                        .contains("Could not attach")
+                })
+        })
+        .await;
+
+        // Inbound: the blob was fetched with the auth tag and the prompt the
+        // engine saw carries the section and the link in one request.
+        let download = requests
+            .iter()
+            .find(|r| r.method == "GET" && r.path.contains(&blob_sha))
+            .expect("blob downloaded");
+        assert_eq!(download.header("x-auth-tag"), Some(r#"{"tag":"member"}"#));
+        let acp_requests: Vec<serde_json::Value> = std::fs::read_to_string(&capture)
+            .unwrap()
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        assert_eq!(acp_requests[0]["method"], "session/prompt");
+        let prompt = acp_requests[0]["params"]["prompt"].as_array().unwrap();
+        let section = prompt
+            .iter()
+            .filter(|b| b["type"] == "text")
+            .find_map(|b| {
+                b["text"]
+                    .as_str()
+                    .filter(|t| t.contains("<buzz-attachments>"))
+            })
+            .expect("attachments section in the prompt");
+        assert!(section.contains("voice-note-1.mp3"), "{section}");
+        let link = prompt
+            .iter()
+            .find(|b| b["type"] == "resource_link")
+            .expect("resource_link in the same prompt");
+        let uri = link["uri"].as_str().unwrap();
+        let stored = std::path::Path::new(uri.strip_prefix("file://").unwrap());
+        assert!(
+            stored.starts_with(attachment_root.join("turn-1")),
+            "{uri} is under this turn's directory"
+        );
+        assert_eq!(
+            std::fs::read(stored).unwrap(),
+            blob,
+            "the verified blob is what the engine reads"
+        );
+        assert_eq!(link["mimeType"], "audio/mpeg");
+
+        // Outbound: one upload of the workspace file, with the auth tag.
+        let uploads: Vec<&SeenRequest> = requests
+            .iter()
+            .filter(|r| r.method == "PUT" && r.path.contains("upload"))
+            .collect();
+        assert_eq!(uploads.len(), 1, "exactly one upload for turn 1");
+        assert_eq!(uploads[0].body, b"hello from the workspace");
+        assert_eq!(uploads[0].header("x-auth-tag"), Some(r#"{"tag":"member"}"#));
+
+        // One kind-9 for the media, anchored to the trigger and in the channel.
+        let posts = kind9_posts(&requests);
+        let media_post = posts
+            .iter()
+            .find(|e| e["content"].as_str().unwrap().contains("reply.txt"))
+            .unwrap();
+        let tags = media_post["tags"].as_array().unwrap();
+        assert!(
+            tags.iter()
+                .any(|t| t[0] == "e" && t[1] == trigger_id.as_str()),
+            "media kind-9 anchors to the trigger: {tags:?}"
+        );
+        assert!(tags
+            .iter()
+            .any(|t| t[0] == "h" && t[1] == channel_id.to_string().as_str()));
+        assert!(tags.iter().any(|t| t[0] == "imeta"), "{tags:?}");
+        assert!(media_post["content"].as_str().unwrap().contains("/media/"));
+
+        // The refusal reached the humans in the same thread, in one short line.
+        let notice = posts
+            .iter()
+            .find(|e| e["content"].as_str().unwrap().contains("Could not attach"))
+            .unwrap();
+        let text = notice["content"].as_str().unwrap();
+        assert!(text.contains("secret.txt refused"), "{text}");
+        assert!(text.contains("outside the turn directory"), "{text}");
+        assert!(text.contains("(1 attached)"), "{text}");
+        assert!(text.len() <= 280, "{text}");
+        let notice_tags = notice["tags"].as_array().unwrap();
+        assert!(
+            notice_tags
+                .iter()
+                .any(|t| t[0] == "e" && t[1] == trigger_id.as_str()),
+            "notice anchors where the media would have: {notice_tags:?}"
+        );
+        assert!(
+            !requests.iter().any(|r| r.body == b"not yours to publish"),
+            "the out-of-root file never reached the wire"
+        );
+
+        // Turn 2: the engine ends with `cancelled`; its reply media is discarded.
+        run_prompt_task(
+            agent,
+            Some(channel_batch("again", false)),
+            None,
+            Arc::clone(&ctx),
+            result_tx.clone(),
+            None,
+            "turn-2".into(),
+        )
+        .await;
+        let result = result_rx.recv().await.unwrap();
+        assert!(matches!(
+            result.outcome,
+            PromptOutcome::Ok(StopReason::Cancelled)
+        ));
+        agent = result.agent;
+
+        // Turn 3: a heartbeat has no channel to publish into.
+        run_prompt_task(
+            agent,
+            None,
+            Some("heartbeat".into()),
+            Arc::clone(&ctx),
+            result_tx.clone(),
+            None,
+            "turn-3".into(),
+        )
+        .await;
+        let result = result_rx.recv().await.unwrap();
+        assert!(matches!(
+            result.outcome,
+            PromptOutcome::Ok(StopReason::EndTurn)
+        ));
+        agent = result.agent;
+
+        // Turn 4: a normal channel turn publishes again, which bounds the wait
+        // for anything turns 2 and 3 might have leaked.
+        run_prompt_task(
+            agent,
+            Some(channel_batch("once more", false)),
+            None,
+            Arc::clone(&ctx),
+            result_tx.clone(),
+            None,
+            "turn-4".into(),
+        )
+        .await;
+        let result = result_rx.recv().await.unwrap();
+        assert!(matches!(
+            result.outcome,
+            PromptOutcome::Ok(StopReason::EndTurn)
+        ));
+        agent = result.agent;
+        let requests = wait_for_requests(&seen, "turn 4 media kind-9", |seen| {
+            kind9_posts(seen)
+                .iter()
+                .filter(|e| e["content"].as_str().unwrap_or("").contains("reply.txt"))
+                .count()
+                >= 2
+        })
+        .await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let requests = if seen.lock().unwrap().len() == requests.len() {
+            requests
+        } else {
+            seen.lock().unwrap().clone()
+        };
+        let uploads = requests
+            .iter()
+            .filter(|r| r.method == "PUT" && r.path.contains("upload"))
+            .count();
+        assert_eq!(
+            uploads, 2,
+            "turns 1 and 4 uploaded; the cancelled turn and the heartbeat did not"
+        );
+        assert_eq!(
+            kind9_posts(&requests)
+                .iter()
+                .filter(|e| e["content"]
+                    .as_str()
+                    .unwrap_or("")
+                    .contains("Could not attach"))
+                .count(),
+            2,
+            "one notice per publishing turn"
+        );
+        assert!(
+            ctx.live_turn_dirs.is_empty(),
+            "every turn released its directory once its media task finished"
+        );
+
+        agent.acp.shutdown().await;
+        let _ = std::fs::remove_dir_all(&scratch);
+    }
+
     #[tokio::test]
     async fn merged_cancel_prompt_commits_and_deduplicates_all_rendered_event_ids() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -9158,7 +9790,8 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
             memory_enabled: false,
             harness_name: "goose".to_string(),
             relay_url: "ws://127.0.0.1:3000".to_string(),
-            attachment_dir: std::env::temp_dir().join("buzz-acp-test-attachments"),
+            attachment_dir: Ok(std::env::temp_dir().join("buzz-acp-test-attachments")),
+            live_turn_dirs: crate::attachments::LiveTurnDirs::default(),
             audio_support: crate::blossom::AudioSupportCache::default(),
             ffmpeg: None,
         }

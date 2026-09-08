@@ -2806,22 +2806,36 @@ async fn tokio_main() -> Result<()> {
         );
     }
 
-    // Attachment blobs and reply scratch files live under the daemon's temp
-    // root, keyed by agent so two harnesses never share a directory.
-    let attachment_dir = std::env::temp_dir()
-        .join("buzz-acp")
-        .join(pubkey_hex.get(..16).unwrap_or(pubkey_hex.as_str()))
-        .join("attachments");
+    // Attachment blobs and reply scratch files live under a private
+    // (mode 0700, owned by this process) root keyed by agent, so two harnesses
+    // never share a directory and another local user cannot plant one. A root
+    // that fails those checks is refused for the life of the process: every
+    // turn then names its attachments with that reason instead of storing
+    // them (rule 4: containment failures are errors, not warnings).
+    let attachment_base = crate::attachments::default_attachment_base();
+    let attachment_dir = crate::attachments::prepare_attachment_root(
+        &attachment_base,
+        pubkey_hex.get(..16).unwrap_or(pubkey_hex.as_str()),
+    )
+    .map_err(|e| {
+        let reason = format!(
+            "attachment root under {} refused: {e}",
+            attachment_base.display()
+        );
+        tracing::error!(target: "acp::media", "{reason}; attachments are disabled");
+        reason
+    });
     let ffmpeg = crate::ffmpeg::find_ffmpeg();
     tracing::info!(
         target: "acp::media",
-        attachment_dir = %attachment_dir.display(),
+        attachment_dir = %attachment_dir.as_deref().map(|p| p.display().to_string()).unwrap_or_else(|_| "disabled".into()),
         ffmpeg = ffmpeg.as_deref().map(|p| p.display().to_string()).unwrap_or_else(|| "none".into()),
         "attachment handling ready"
     );
 
     let ctx = Arc::new(PromptContext {
         attachment_dir,
+        live_turn_dirs: crate::attachments::LiveTurnDirs::default(),
         audio_support: crate::blossom::AudioSupportCache::default(),
         ffmpeg,
         mcp_servers: build_mcp_servers(&config),

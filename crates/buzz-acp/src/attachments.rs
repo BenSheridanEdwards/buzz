@@ -12,9 +12,15 @@
 //!
 //! Nothing is dropped silently: every rejected tag, failed download, and
 //! over-cap attachment is named in the section with its reason (rule 1).
+//!
+//! Storage is bounded two ways: the whole inbound phase runs under
+//! [`INBOUND_DEADLINE`], and the attachment root keeps at most
+//! [`KEEP_TURN_DIRS`] turn directories, never pruning one whose turn is
+//! still running or still publishing ([`LiveTurnDirs`]).
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 use nostr::Event;
 
@@ -33,6 +39,8 @@ const MAX_MIME_LEN: usize = 255;
 const MAX_FILENAME_BYTES: usize = 120;
 /// Turn directories kept under the attachment root before the oldest go.
 const KEEP_TURN_DIRS: usize = 16;
+/// Wall-clock cap for fetching one turn's attachments, all events included.
+pub(crate) const INBOUND_DEADLINE: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// One structurally valid `imeta` attachment.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -133,16 +141,48 @@ pub fn imeta_fields(tag: &[String]) -> HashMap<String, String> {
     fields
 }
 
+/// Unicode format characters (general category Cf): zero-width joiners,
+/// bidirectional overrides such as U+202E, soft hyphens, and the like. They
+/// are invisible in a prompt or a chat body and can reorder what a reader
+/// sees, so they are stripped alongside control characters.
+fn is_format_char(c: char) -> bool {
+    matches!(
+        c as u32,
+        0x00AD
+            | 0x0600..=0x0605
+            | 0x061C
+            | 0x06DD
+            | 0x070F
+            | 0x0890..=0x0891
+            | 0x08E2
+            | 0x180E
+            | 0x200B..=0x200F
+            | 0x202A..=0x202E
+            | 0x2060..=0x2064
+            | 0x2066..=0x206F
+            | 0xFEFF
+            | 0xFFF9..=0xFFFB
+            | 0x110BD
+            | 0x110CD
+            | 0x13430..=0x1343F
+            | 0x1BCA0..=0x1BCA3
+            | 0x1D173..=0x1D17A
+            | 0xE0001
+            | 0xE0020..=0xE007F
+    )
+}
+
 /// Reduce an untrusted `filename` field to a safe basename.
 ///
-/// Path separators, control characters, and dot-only names are removed; the
-/// result is capped at [`MAX_FILENAME_BYTES`] while keeping a short extension.
+/// Path separators, control and format characters, and dot-only names are
+/// removed; the result is capped at [`MAX_FILENAME_BYTES`] while keeping a
+/// short extension.
 pub fn safe_attachment_filename(value: &str) -> String {
     let base = value.replace('\\', "/");
     let base = base.rsplit('/').next().unwrap_or("");
     let cleaned: String = base
         .chars()
-        .filter(|c| !c.is_control())
+        .filter(|c| !c.is_control() && !is_format_char(*c))
         .collect::<String>()
         .trim()
         .to_string();
@@ -283,6 +323,16 @@ pub enum AttachmentOutcome {
         /// Why it was rejected.
         reason: String,
     },
+    /// The same blob (by `x`) was already fetched for this turn; it is not
+    /// fetched twice, and the engine is told where the first copy went.
+    Duplicate {
+        /// Event that carried the tag.
+        event_id: String,
+        /// Declared filename on this tag.
+        filename: String,
+        /// Event whose copy of the blob was stored.
+        first_event_id: String,
+    },
 }
 
 /// Everything the harness learned about a batch's attachments.
@@ -367,6 +417,14 @@ impl InboundAttachments {
                     "Event {event_id}: imeta tag rejected: {}",
                     escape_semantic_text(reason)
                 ),
+                AttachmentOutcome::Duplicate {
+                    event_id,
+                    filename,
+                    first_event_id,
+                } => format!(
+                    "Event {event_id}: attachment {} is the same blob as the one on event {first_event_id}; see that entry",
+                    escape_semantic_text(filename)
+                ),
             });
         }
         if self.stored().next().is_some() {
@@ -403,15 +461,97 @@ pub fn file_uri(path: &Path) -> String {
         .unwrap_or_else(|_| format!("file://{}", path.to_string_lossy()))
 }
 
+/// Turn directories that must survive the prune: their turn is still being
+/// prompted, or its reply media is still being published.
+///
+/// Shared by every prompt task of one harness. Hold a guard from
+/// [`LiveTurnDirs::hold`] for as long as the directory may be read.
+#[derive(Debug, Clone, Default)]
+pub struct LiveTurnDirs(Arc<Mutex<HashSet<String>>>);
+
+impl LiveTurnDirs {
+    /// Mark `turn_id`'s directory live until the returned guard drops.
+    pub fn hold(&self, turn_id: &str) -> LiveTurnGuard {
+        let name = safe_attachment_filename(turn_id);
+        if let Ok(mut set) = self.0.lock() {
+            set.insert(name.clone());
+        }
+        LiveTurnGuard {
+            dirs: self.clone(),
+            name,
+        }
+    }
+
+    /// Whether the directory named `dir_name` under the root is live.
+    pub fn is_live(&self, dir_name: &str) -> bool {
+        self.0.lock().is_ok_and(|set| set.contains(dir_name))
+    }
+
+    /// Number of live turn directories.
+    #[cfg(test)]
+    pub fn len(&self) -> usize {
+        self.0.lock().map(|set| set.len()).unwrap_or(0)
+    }
+
+    /// True when no turn directory is live.
+    #[cfg(test)]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
+/// Keeps one turn directory out of the prune; see [`LiveTurnDirs::hold`].
+#[derive(Debug)]
+pub struct LiveTurnGuard {
+    dirs: LiveTurnDirs,
+    name: String,
+}
+
+impl Drop for LiveTurnGuard {
+    fn drop(&mut self) {
+        if let Ok(mut set) = self.dirs.0.lock() {
+            set.remove(&self.name);
+        }
+    }
+}
+
+/// `<root>/<turn_id>`, the directory every inbound blob and outbound scratch
+/// file of one turn lives under.
+pub fn turn_dir_path(root: &Path, turn_id: &str) -> PathBuf {
+    root.join(safe_attachment_filename(turn_id))
+}
+
 /// Create `<root>/<turn_id>` and prune the oldest sibling turn directories
 /// beyond [`KEEP_TURN_DIRS`], so the attachment root stays bounded no matter
-/// how many turns the daemon runs.
-pub fn prepare_turn_dir(root: &Path, turn_id: &str) -> std::io::Result<PathBuf> {
-    let turn_dir = root.join(safe_attachment_filename(turn_id));
+/// how many turns the daemon runs. Directories in `live` are never pruned.
+pub fn prepare_turn_dir(
+    root: &Path,
+    turn_id: &str,
+    live: &LiveTurnDirs,
+) -> std::io::Result<PathBuf> {
+    let turn_dir = turn_dir_path(root, turn_id);
     std::fs::create_dir_all(&turn_dir)?;
+    // The root was verified at startup; re-check it per turn so a root
+    // replaced underneath a running harness is refused rather than written
+    // through.
+    check_private_dir(root)?;
+    prune_turn_dirs(root, live, Some(&turn_dir))?;
+    Ok(turn_dir)
+}
+
+/// Remove the oldest turn directories under `root` beyond [`KEEP_TURN_DIRS`],
+/// skipping the live ones and `keep`, the directory the caller just created
+/// (its mtime says nothing about whether it is in use). Live directories
+/// count toward the total, so a busy pool keeps more than `KEEP_TURN_DIRS`
+/// on disk only while those turns are running.
+pub fn prune_turn_dirs(
+    root: &Path,
+    live: &LiveTurnDirs,
+    keep: Option<&Path>,
+) -> std::io::Result<()> {
     let mut siblings: Vec<(std::time::SystemTime, PathBuf)> = std::fs::read_dir(root)?
         .filter_map(Result::ok)
-        .filter(|entry| entry.path() != turn_dir)
+        .filter(|entry| keep != Some(entry.path().as_path()))
         .filter_map(|entry| {
             let meta = entry.metadata().ok()?;
             meta.is_dir().then(|| {
@@ -423,24 +563,111 @@ pub fn prepare_turn_dir(root: &Path, turn_id: &str) -> std::io::Result<PathBuf> 
         })
         .collect();
     siblings.sort();
-    let excess = (siblings.len() + 1).saturating_sub(KEEP_TURN_DIRS);
-    for (_, stale) in siblings.into_iter().take(excess) {
+    let total = siblings.len() + usize::from(keep.is_some());
+    let mut excess = total.saturating_sub(KEEP_TURN_DIRS);
+    for (_, stale) in siblings {
+        if excess == 0 {
+            break;
+        }
+        let name = stale
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        if live.is_live(&name) {
+            continue;
+        }
+        excess -= 1;
         if let Err(e) = std::fs::remove_dir_all(&stale) {
             tracing::debug!(target: "acp::media", "prune {} failed: {e}", stale.display());
         }
     }
-    Ok(turn_dir)
+    Ok(())
+}
+
+/// Where the per-agent attachment root goes: `XDG_RUNTIME_DIR` when set (a
+/// per-user, mode-0700 directory on Linux hosts), else the system temp dir.
+pub fn default_attachment_base() -> PathBuf {
+    std::env::var_os("XDG_RUNTIME_DIR")
+        .map(PathBuf::from)
+        .filter(|dir| !dir.as_os_str().is_empty() && dir.is_absolute() && dir.is_dir())
+        .unwrap_or_else(std::env::temp_dir)
+}
+
+/// Create the per-agent attachment root privately and refuse one that could
+/// have been planted by another local user.
+///
+/// Every directory on the path below `base` is created with mode `0700`
+/// (rule 4: a shared `/tmp` on a Linux host is not ours alone). An existing
+/// root is accepted only when it is a real directory, not a symlink, owned by
+/// this process; a wider mode is tightened back to `0700`. Any other state is
+/// an error, and the caller must not store blobs there.
+pub fn prepare_attachment_root(base: &Path, agent_key: &str) -> std::io::Result<PathBuf> {
+    let root = base.join("buzz-acp").join(agent_key).join("attachments");
+    let mut builder = std::fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt as _;
+        builder.mode(0o700);
+    }
+    builder.create(&root)?;
+    for dir in [root.as_path(), root.parent().unwrap_or(root.as_path())] {
+        check_private_dir(dir)?;
+    }
+    Ok(root)
+}
+
+fn check_private_dir(dir: &Path) -> std::io::Result<()> {
+    let meta = std::fs::symlink_metadata(dir)?;
+    if meta.file_type().is_symlink() {
+        return Err(std::io::Error::other(format!(
+            "{} is a symlink; refusing to store attachments through it",
+            dir.display()
+        )));
+    }
+    if !meta.is_dir() {
+        return Err(std::io::Error::other(format!(
+            "{} is not a directory",
+            dir.display()
+        )));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+        let uid = nix::unistd::Uid::current().as_raw();
+        if meta.uid() != uid {
+            return Err(std::io::Error::other(format!(
+                "{} is owned by uid {} rather than this process (uid {uid}); refusing to use it",
+                dir.display(),
+                meta.uid()
+            )));
+        }
+        let mode = meta.permissions().mode() & 0o777;
+        if mode & 0o077 != 0 {
+            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
+            tracing::warn!(
+                target: "acp::media",
+                dir = %dir.display(),
+                "attachment directory was mode {mode:o}; tightened to 700"
+            );
+        }
+    }
+    Ok(())
 }
 
 /// Fetch every attachment on `events` into `turn_dir`.
 ///
 /// `ffmpeg`, when present, is used to extract MP3 audio from voice-note MP4
 /// envelopes so speech reaches the engine as audio rather than video.
+/// `deadline` bounds the whole phase: an attachment whose turn comes after it
+/// is reported as failed without a request, and a fetch in progress is cut
+/// at it, so the pool slot is held for at most [`INBOUND_DEADLINE`].
 pub async fn collect_inbound_attachments(
     rest: &RestClient,
     events: &[&Event],
     turn_dir: &Path,
     ffmpeg: Option<&Path>,
+    deadline: tokio::time::Instant,
 ) -> InboundAttachments {
     let mut inbound = InboundAttachments::default();
     let Some(origin) = RelayOrigin::from_base_url(&rest.base_url) else {
@@ -459,7 +686,7 @@ pub async fn collect_inbound_attachments(
         return inbound;
     };
     let mut budget = AttachmentBudget::default();
-    let mut seen: HashSet<String> = HashSet::new();
+    let mut seen: HashMap<String, String> = HashMap::new();
     let mut index = 0usize;
     for event in events {
         let event_id = event.id.to_hex();
@@ -471,11 +698,34 @@ pub async fn collect_inbound_attachments(
             });
         }
         for attachment in parsed.accepted {
-            if !seen.insert(attachment.sha256.clone()) {
+            if let Some(first_event_id) = seen.get(&attachment.sha256) {
+                inbound.outcomes.push(AttachmentOutcome::Duplicate {
+                    event_id: event_id.clone(),
+                    filename: attachment.filename,
+                    first_event_id: first_event_id.clone(),
+                });
                 continue;
             }
+            seen.insert(attachment.sha256.clone(), event_id.clone());
             index += 1;
-            match fetch_attachment(rest, &origin, &attachment, turn_dir, index, ffmpeg).await {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            let fetched = if remaining.is_zero() {
+                Err(format!(
+                    "skipped: the {INBOUND_DEADLINE:?} attachment deadline for this turn passed"
+                ))
+            } else {
+                tokio::time::timeout(
+                    remaining,
+                    fetch_attachment(rest, &origin, &attachment, turn_dir, index, ffmpeg),
+                )
+                .await
+                .unwrap_or_else(|_| {
+                    Err(format!(
+                        "cut off at the {INBOUND_DEADLINE:?} attachment deadline for this turn"
+                    ))
+                })
+            };
+            match fetched {
                 Ok(local) => inbound.outcomes.push(AttachmentOutcome::Stored {
                     event_id: event_id.clone(),
                     local,
@@ -540,12 +790,21 @@ async fn fetch_attachment(
                         .unwrap_or("voice-note")
                 );
                 let mp3_path = turn_dir.join(&mp3_name);
-                match crate::ffmpeg::extract_voice_note_audio(ffmpeg, &path, &mp3_path).await {
-                    Ok(()) => {
-                        let size = tokio::fs::metadata(&mp3_path)
+                let extracted =
+                    match crate::ffmpeg::extract_voice_note_audio(ffmpeg, &path, &mp3_path).await {
+                        Ok(()) => tokio::fs::metadata(&mp3_path)
                             .await
                             .map(|m| m.len())
-                            .unwrap_or(0);
+                            .map_err(|e| format!("extracted file unreadable: {e}"))
+                            .and_then(|size| {
+                                (size > 0)
+                                    .then_some(size)
+                                    .ok_or_else(|| "extracted file is empty".to_string())
+                            }),
+                        Err(e) => Err(e),
+                    };
+                match extracted {
+                    Ok(size) => {
                         local.path = mp3_path;
                         local.filename = mp3_name;
                         local.mime_type = "audio/mpeg".into();
@@ -578,6 +837,10 @@ mod tests {
 
     fn origin() -> RelayOrigin {
         RelayOrigin::from_base_url("https://relay.example").unwrap()
+    }
+
+    fn far_deadline() -> tokio::time::Instant {
+        tokio::time::Instant::now() + std::time::Duration::from_secs(3600)
     }
 
     fn event_with_imeta(tags: &[Vec<&str>]) -> Event {
@@ -848,7 +1111,8 @@ mod tests {
     fn prepare_turn_dir_prunes_oldest_siblings() {
         let root = std::env::temp_dir().join(format!("buzz-acp-att-{}", uuid::Uuid::new_v4()));
         for i in 0..(KEEP_TURN_DIRS + 3) {
-            let dir = prepare_turn_dir(&root, &format!("turn-{i:03}")).unwrap();
+            let dir =
+                prepare_turn_dir(&root, &format!("turn-{i:03}"), &LiveTurnDirs::default()).unwrap();
             assert!(dir.is_dir());
             // Distinct mtimes so the prune order is deterministic.
             let t = filetime_now_plus(i as u64);
@@ -862,6 +1126,161 @@ mod tests {
         assert_eq!(remaining.len(), KEEP_TURN_DIRS);
         assert!(!remaining.contains(&"turn-000".to_string()));
         assert!(remaining.contains(&format!("turn-{:03}", KEEP_TURN_DIRS + 2)));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Review item 3: a turn whose engine is still reading its attachments
+    /// must not have its directory removed by later turns completing.
+    #[test]
+    fn prune_skips_live_turn_dirs_until_their_guard_drops() {
+        let root = std::env::temp_dir().join(format!("buzz-acp-att-{}", uuid::Uuid::new_v4()));
+        let live = LiveTurnDirs::default();
+        let guard = live.hold("turn-000");
+        assert_eq!(live.len(), 1);
+        for i in 0..(KEEP_TURN_DIRS + 3) {
+            let dir = prepare_turn_dir(&root, &format!("turn-{i:03}"), &live).unwrap();
+            let t = filetime_now_plus(i as u64);
+            let _ = std::fs::File::open(&dir).and_then(|f| f.set_modified(t));
+        }
+        let names = |root: &Path| -> Vec<String> {
+            std::fs::read_dir(root)
+                .unwrap()
+                .filter_map(Result::ok)
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .collect()
+        };
+        let remaining = names(&root);
+        assert_eq!(remaining.len(), KEEP_TURN_DIRS, "{remaining:?}");
+        assert!(
+            remaining.contains(&"turn-000".to_string()),
+            "the oldest directory is live and survives: {remaining:?}"
+        );
+        assert!(
+            !remaining.contains(&"turn-001".to_string())
+                && !remaining.contains(&"turn-002".to_string()),
+            "the prune takes the next-oldest instead: {remaining:?}"
+        );
+        drop(guard);
+        assert!(live.is_empty());
+        prune_turn_dirs(&root, &live, None).unwrap();
+        assert!(
+            names(&root).contains(&"turn-000".to_string()),
+            "no excess, nothing more pruned"
+        );
+        prepare_turn_dir(&root, "turn-999", &live).unwrap();
+        assert!(
+            !names(&root).contains(&"turn-000".to_string()),
+            "once released, the old directory goes at the next prune"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn attachment_root_is_private_and_refuses_symlinks() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let base = std::env::temp_dir().join(format!("buzz-acp-root-{}", uuid::Uuid::new_v4()));
+        let root = prepare_attachment_root(&base, "abcdef0123456789").unwrap();
+        assert_eq!(root, base.join("buzz-acp/abcdef0123456789/attachments"));
+        for dir in [root.as_path(), root.parent().unwrap()] {
+            let mode = std::fs::metadata(dir).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o700, "{} is {mode:o}", dir.display());
+        }
+        // A pre-existing root that is too open is tightened, not refused.
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o755)).unwrap();
+        prepare_attachment_root(&base, "abcdef0123456789").unwrap();
+        let mode = std::fs::metadata(&root).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700);
+
+        // A symlink planted where the root should be is an error.
+        let planted =
+            std::env::temp_dir().join(format!("buzz-acp-planted-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&planted).unwrap();
+        std::fs::create_dir_all(base.join("buzz-acp/victim")).unwrap();
+        std::os::unix::fs::symlink(&planted, base.join("buzz-acp/victim/attachments")).unwrap();
+        let err = prepare_attachment_root(&base, "victim").unwrap_err();
+        assert!(err.to_string().contains("symlink"), "{err}");
+        // So is a regular file.
+        std::fs::create_dir_all(base.join("buzz-acp/plain")).unwrap();
+        std::fs::write(base.join("buzz-acp/plain/attachments"), b"").unwrap();
+        assert!(prepare_attachment_root(&base, "plain").is_err());
+        let _ = std::fs::remove_dir_all(&base);
+        let _ = std::fs::remove_dir_all(&planted);
+    }
+
+    #[test]
+    fn filenames_lose_format_characters_too() {
+        assert_eq!(
+            safe_attachment_filename("in\u{202E}fdp.exe"),
+            "infdp.exe",
+            "a right-to-left override cannot disguise the extension"
+        );
+        assert_eq!(safe_attachment_filename("a\u{200B}b\u{FEFF}.txt"), "ab.txt");
+        assert_eq!(
+            safe_attachment_filename("caf\u{E9}.txt"),
+            "caf\u{E9}.txt",
+            "letters stay"
+        );
+    }
+
+    #[tokio::test]
+    async fn inbound_deadline_fails_attachments_it_cannot_reach_in_time() {
+        let rest = rest_for("http://127.0.0.1:1");
+        let event = imeta_event_for(
+            "http://127.0.0.1:1",
+            &"a".repeat(64),
+            4,
+            "audio/mpeg",
+            "one.mp3",
+        );
+        let root = std::env::temp_dir().join(format!("buzz-acp-dl-{}", uuid::Uuid::new_v4()));
+        let turn_dir = prepare_turn_dir(&root, "turn-1", &LiveTurnDirs::default()).unwrap();
+        let passed = tokio::time::Instant::now() - std::time::Duration::from_secs(1);
+        let inbound = collect_inbound_attachments(&rest, &[&event], &turn_dir, None, passed).await;
+        assert_eq!(inbound.outcomes.len(), 1);
+        match &inbound.outcomes[0] {
+            AttachmentOutcome::Failed { reason, .. } => {
+                assert!(reason.contains("deadline"), "{reason}");
+            }
+            other => panic!("expected Failed, got {other:?}"),
+        }
+        assert!(inbound.section().unwrap().contains("deadline"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn duplicate_blob_on_a_second_event_is_named_not_refetched() {
+        let body = b"same blob".to_vec();
+        let sha = blossom::sha256_hex(&body);
+        let (base, _head_rx) = one_shot_server("200 OK", body.clone(), Some(body.len())).await;
+        let rest = rest_for(&base);
+        let first = imeta_event_for(&base, &sha, body.len(), "audio/mpeg", "voice-note-1.mp3");
+        let second = imeta_event_for(&base, &sha, body.len(), "audio/mpeg", "voice-note-2.mp3");
+        let root = std::env::temp_dir().join(format!("buzz-acp-dl-{}", uuid::Uuid::new_v4()));
+        let turn_dir = prepare_turn_dir(&root, "turn-1", &LiveTurnDirs::default()).unwrap();
+        let inbound =
+            collect_inbound_attachments(&rest, &[&first, &second], &turn_dir, None, far_deadline())
+                .await;
+        assert_eq!(inbound.outcomes.len(), 2, "{:?}", inbound.outcomes);
+        assert!(matches!(
+            inbound.outcomes[0],
+            AttachmentOutcome::Stored { .. }
+        ));
+        match &inbound.outcomes[1] {
+            AttachmentOutcome::Duplicate {
+                first_event_id,
+                filename,
+                ..
+            } => {
+                assert_eq!(first_event_id, &first.id.to_hex());
+                assert_eq!(filename, "voice-note-2.mp3");
+            }
+            other => panic!("expected Duplicate, got {other:?}"),
+        }
+        assert!(inbound
+            .section()
+            .unwrap()
+            .contains("same blob as the one on event"));
+        assert_eq!(inbound.prompt_blocks().len(), 1, "one file, one link");
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -936,9 +1355,10 @@ mod tests {
         let rest = rest_for(&base);
         let event = imeta_event_for(&base, &sha, body.len(), "audio/mpeg", "voice-note-9.mp3");
         let root = std::env::temp_dir().join(format!("buzz-acp-dl-{}", uuid::Uuid::new_v4()));
-        let turn_dir = prepare_turn_dir(&root, "turn-1").unwrap();
+        let turn_dir = prepare_turn_dir(&root, "turn-1", &LiveTurnDirs::default()).unwrap();
 
-        let inbound = collect_inbound_attachments(&rest, &[&event], &turn_dir, None).await;
+        let inbound =
+            collect_inbound_attachments(&rest, &[&event], &turn_dir, None, far_deadline()).await;
 
         let head = head_rx.await.unwrap();
         assert!(
@@ -988,9 +1408,10 @@ mod tests {
         let rest = rest_for(&base);
         let event = imeta_event_for(&base, &claimed, body.len(), "image/png", "pic.png");
         let root = std::env::temp_dir().join(format!("buzz-acp-dl-{}", uuid::Uuid::new_v4()));
-        let turn_dir = prepare_turn_dir(&root, "turn-1").unwrap();
+        let turn_dir = prepare_turn_dir(&root, "turn-1", &LiveTurnDirs::default()).unwrap();
 
-        let inbound = collect_inbound_attachments(&rest, &[&event], &turn_dir, None).await;
+        let inbound =
+            collect_inbound_attachments(&rest, &[&event], &turn_dir, None, far_deadline()).await;
 
         match &inbound.outcomes[0] {
             AttachmentOutcome::Failed {
@@ -1017,9 +1438,10 @@ mod tests {
         let rest = rest_for(&base);
         let event = imeta_event_for(&base, &sha, 5, "text/plain", "a.txt");
         let root = std::env::temp_dir().join(format!("buzz-acp-dl-{}", uuid::Uuid::new_v4()));
-        let turn_dir = prepare_turn_dir(&root, "turn-1").unwrap();
+        let turn_dir = prepare_turn_dir(&root, "turn-1", &LiveTurnDirs::default()).unwrap();
 
-        let inbound = collect_inbound_attachments(&rest, &[&event], &turn_dir, None).await;
+        let inbound =
+            collect_inbound_attachments(&rest, &[&event], &turn_dir, None, far_deadline()).await;
 
         match &inbound.outcomes[0] {
             AttachmentOutcome::Failed { reason, .. } => {
@@ -1039,9 +1461,10 @@ mod tests {
         let rest = rest_for(&base);
         let event = imeta_event_for(&base, &sha, 6, "audio/mpeg", "voice-note-1.mp3");
         let root = std::env::temp_dir().join(format!("buzz-acp-dl-{}", uuid::Uuid::new_v4()));
-        let turn_dir = prepare_turn_dir(&root, "turn-1").unwrap();
+        let turn_dir = prepare_turn_dir(&root, "turn-1", &LiveTurnDirs::default()).unwrap();
 
-        let inbound = collect_inbound_attachments(&rest, &[&event], &turn_dir, None).await;
+        let inbound =
+            collect_inbound_attachments(&rest, &[&event], &turn_dir, None, far_deadline()).await;
 
         match &inbound.outcomes[0] {
             AttachmentOutcome::Failed { reason, .. } => {
