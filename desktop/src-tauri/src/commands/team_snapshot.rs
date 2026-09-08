@@ -580,8 +580,10 @@ pub async fn confirm_team_snapshot_import(
             turn_timeout_seconds: 0,
             idle_timeout_seconds: member.definition.idle_timeout_seconds,
             max_turn_duration_seconds: member.definition.max_turn_duration_seconds,
-            parallelism: minted_parallelism
-                .unwrap_or(crate::managed_agents::DEFAULT_AGENT_PARALLELISM),
+            parallelism: crate::managed_agents::mint_parallelism(
+                definition.runtime.as_deref().unwrap_or_default(),
+                minted_parallelism,
+            ),
             system_prompt: member.definition.system_prompt.clone(),
             model: member.definition.model.clone(),
             provider: member.definition.provider.clone(),

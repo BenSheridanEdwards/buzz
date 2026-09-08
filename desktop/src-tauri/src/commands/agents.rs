@@ -14,7 +14,7 @@ use crate::{
         stop_managed_agent_workspace_pair, sync_managed_agent_processes, try_regenerate_nest,
         validate_provider_config, BackendKind, CreateManagedAgentRequest,
         CreateManagedAgentResponse, ManagedAgentRecord, ManagedAgentSummary, RelayMeshConfig,
-        DEFAULT_ACP_COMMAND, DEFAULT_AGENT_PARALLELISM, DEFAULT_AGENT_TURN_TIMEOUT_SECONDS,
+        DEFAULT_ACP_COMMAND, DEFAULT_AGENT_TURN_TIMEOUT_SECONDS,
     },
     relay::relay_ws_url_with_override,
     util::now_iso,
@@ -599,6 +599,10 @@ pub async fn create_managed_agent(
             input.parallelism,
             linked_persona.as_ref(),
         )?;
+        // Harness default when nothing was requested (Hermes mints at 1;
+        // everything else at DEFAULT_AGENT_PARALLELISM).
+        let minted_parallelism =
+            crate::managed_agents::mint_parallelism(&agent_command, minted.parallelism);
         let record = ManagedAgentRecord {
             pubkey: pubkey.clone(),
             name: name.clone(),
@@ -627,7 +631,7 @@ pub async fn create_managed_agent(
             // 0 or None → harness uses its own default (320s idle, 3600s max), and the CLI also clamps 0 → minimum.
             idle_timeout_seconds: input.idle_timeout_seconds.filter(|s| *s > 0),
             max_turn_duration_seconds: input.max_turn_duration_seconds.filter(|s| *s > 0),
-            parallelism: minted.parallelism.unwrap_or(DEFAULT_AGENT_PARALLELISM),
+            parallelism: minted_parallelism,
             system_prompt: snapshot_prompt.or_else(|| {
                 input
                     .system_prompt

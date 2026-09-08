@@ -20,6 +20,10 @@ pub(super) struct PresetHarness {
     /// State-specific setup guidance for the wrapped vendor CLI.
     underlying_cli_install_hint: Option<&'static str>,
     underlying_cli_install_instructions_url: Option<&'static str>,
+    /// Parallelism a freshly minted record stores when neither the create
+    /// input nor the linked definition sets one. `None` means the app-wide
+    /// `DEFAULT_AGENT_PARALLELISM`.
+    default_parallelism: Option<u32>,
 }
 
 /// Build one preset catalog entry through an injectable command resolver.
@@ -100,6 +104,7 @@ pub(super) fn preset_catalog_entry(
         // unavailable entries (command: null in JSON, None here) still carry
         // the cap — the harness cap is command-keyed, not availability-gated.
         max_parallelism: crate::managed_agents::harness_max_parallelism(def.command),
+        default_parallelism: crate::managed_agents::harness_default_parallelism(def.command),
     }
 }
 
@@ -118,6 +123,7 @@ pub(super) const PRESET_HARNESSES: &[PresetHarness] = &[
         underlying_cli_install_instructions_url: Some(
             "https://github.com/badlogic/pi-mono/tree/main/packages/coding-agent",
         ),
+        default_parallelism: None,
     },
     PresetHarness {
         id: "devin",
@@ -129,6 +135,7 @@ pub(super) const PRESET_HARNESSES: &[PresetHarness] = &[
         underlying_cli: None,
         underlying_cli_install_hint: None,
         underlying_cli_install_instructions_url: None,
+        default_parallelism: None,
     },
     PresetHarness {
         id: "cursor",
@@ -140,6 +147,7 @@ pub(super) const PRESET_HARNESSES: &[PresetHarness] = &[
         underlying_cli: None,
         underlying_cli_install_hint: None,
         underlying_cli_install_instructions_url: None,
+        default_parallelism: None,
     },
     PresetHarness {
         id: "omp",
@@ -151,6 +159,7 @@ pub(super) const PRESET_HARNESSES: &[PresetHarness] = &[
         underlying_cli: None,
         underlying_cli_install_hint: None,
         underlying_cli_install_instructions_url: None,
+        default_parallelism: None,
     },
     PresetHarness {
         id: "grok",
@@ -162,6 +171,7 @@ pub(super) const PRESET_HARNESSES: &[PresetHarness] = &[
         underlying_cli: None,
         underlying_cli_install_hint: None,
         underlying_cli_install_instructions_url: None,
+        default_parallelism: None,
     },
     PresetHarness {
         id: "opencode",
@@ -173,6 +183,7 @@ pub(super) const PRESET_HARNESSES: &[PresetHarness] = &[
         underlying_cli: None,
         underlying_cli_install_hint: None,
         underlying_cli_install_instructions_url: None,
+        default_parallelism: None,
     },
     PresetHarness {
         id: "kimi",
@@ -184,6 +195,7 @@ pub(super) const PRESET_HARNESSES: &[PresetHarness] = &[
         underlying_cli: None,
         underlying_cli_install_hint: None,
         underlying_cli_install_instructions_url: None,
+        default_parallelism: None,
     },
     PresetHarness {
         id: "amp",
@@ -195,6 +207,7 @@ pub(super) const PRESET_HARNESSES: &[PresetHarness] = &[
         underlying_cli: Some("amp"),
         underlying_cli_install_hint: None,
         underlying_cli_install_instructions_url: None,
+        default_parallelism: None,
     },
     PresetHarness {
         id: "hermes",
@@ -206,6 +219,9 @@ pub(super) const PRESET_HARNESSES: &[PresetHarness] = &[
         underlying_cli: None,
         underlying_cli_install_hint: None,
         underlying_cli_install_instructions_url: None,
+        // Every worker is a full Hermes process that loads the profile's own
+        // MCP servers; the app default (10) is far too heavy for that.
+        default_parallelism: Some(1),
     },
     PresetHarness {
         id: "openclaw",
@@ -224,6 +240,7 @@ pub(super) const PRESET_HARNESSES: &[PresetHarness] = &[
         underlying_cli: None,
         underlying_cli_install_hint: None,
         underlying_cli_install_instructions_url: None,
+        default_parallelism: None,
     },
 ];
 
@@ -262,6 +279,25 @@ pub(super) fn preset_command_for_id(id: &str) -> Option<&'static str> {
         .iter()
         .find(|p| p.id == id)
         .map(|p| p.command)
+}
+
+/// Find a static preset by runtime id or by command identity (bare name,
+/// path-prefixed, `.exe`/`.cmd` suffixed), or `None` when the input is not a
+/// preset harness.
+fn find_preset(harness: &str) -> Option<&'static PresetHarness> {
+    let normalized = super::normalize_command_identity(harness);
+    if normalized.is_empty() {
+        return None;
+    }
+    PRESET_HARNESSES
+        .iter()
+        .find(|p| p.id == normalized || super::normalize_command_identity(p.command) == normalized)
+}
+
+/// Per-preset default parallelism (by id or command), or `None` when the
+/// preset uses the app-wide default.
+pub(crate) fn preset_default_parallelism(harness: &str) -> Option<u32> {
+    find_preset(harness).and_then(|p| p.default_parallelism)
 }
 
 /// Return the primary harness command for a given runtime id, or `None`.
@@ -307,10 +343,7 @@ pub(crate) fn canonical_harness_command(input: &str) -> Option<String> {
     }
 
     // Tier 2: static presets — matched by id or by normalized command.
-    if let Some(p) = PRESET_HARNESSES
-        .iter()
-        .find(|p| p.id == normalized || super::normalize_command_identity(p.command) == normalized)
-    {
+    if let Some(p) = find_preset(input) {
         return Some(p.command.to_string());
     }
 
@@ -342,6 +375,7 @@ mod tests {
         underlying_cli: Some("amp"),
         underlying_cli_install_hint: Some("Install the Amp Test CLI."),
         underlying_cli_install_instructions_url: Some("https://example.com/amp"),
+        default_parallelism: None,
     };
 
     #[test]
@@ -586,6 +620,84 @@ mod tests {
             "available OpenClaw must carry max_parallelism {}",
             crate::managed_agents::parallelism::OPENCLAW_MAX_PARALLELISM
         );
+    }
+
+    // ── Hermes: per-preset default parallelism ───────────────────────────────
+
+    /// The Hermes preset mints at 1 regardless of install status (the value is
+    /// command-keyed static data, like `max_parallelism`), and the catalog
+    /// entry carries the same number the mint site will store.
+    #[test]
+    fn hermes_preset_carries_default_parallelism_one() {
+        let hermes = PRESET_HARNESSES
+            .iter()
+            .find(|p| p.id == "hermes")
+            .expect("hermes preset must be present");
+        assert_eq!(hermes.command, "hermes-acp");
+        assert_eq!(hermes.default_parallelism, Some(1));
+
+        let unavailable = preset_catalog_entry(hermes, |_| None);
+        assert_eq!(
+            unavailable.availability,
+            AcpAvailabilityStatus::NotInstalled
+        );
+        assert_eq!(unavailable.default_parallelism, 1);
+
+        let available = preset_catalog_entry(hermes, |cmd| {
+            (cmd == "hermes-acp").then(|| PathBuf::from("/usr/local/bin/hermes-acp"))
+        });
+        assert_eq!(available.availability, AcpAvailabilityStatus::Available);
+        assert_eq!(available.default_parallelism, 1);
+    }
+
+    /// Every other preset stays on the app-wide default, so the Hermes
+    /// override cannot leak into harnesses that never asked for it.
+    #[test]
+    fn non_hermes_presets_use_app_default_parallelism() {
+        for preset in PRESET_HARNESSES.iter().filter(|p| p.id != "hermes") {
+            assert_eq!(
+                preset.default_parallelism, None,
+                "preset {} must use the app default parallelism",
+                preset.id
+            );
+            let entry = preset_catalog_entry(preset, |_| None);
+            assert_eq!(
+                entry.default_parallelism,
+                crate::managed_agents::DEFAULT_AGENT_PARALLELISM,
+                "catalog entry for {}",
+                preset.id
+            );
+        }
+    }
+
+    /// `preset_default_parallelism` resolves by id and by every command shape
+    /// the mint sites can hand it (bare, absolute, Windows path with `.exe`),
+    /// and rejects non-presets and empty input.
+    #[test]
+    fn preset_lookups_accept_id_and_command_identities() {
+        for hermes in [
+            "hermes",
+            "hermes-acp",
+            "/opt/hermes/bin/hermes-acp",
+            "hermes-acp.exe",
+            r"C:\Users\me\AppData\Roaming\npm\HERMES-ACP.EXE",
+        ] {
+            assert_eq!(
+                super::preset_default_parallelism(hermes),
+                Some(1),
+                "default parallelism for {hermes:?}"
+            );
+        }
+        for other in [
+            "goose",
+            "claude-agent-acp",
+            "openclaw",
+            "devin",
+            "/opt/custom/agent",
+            "",
+        ] {
+            assert_eq!(super::preset_default_parallelism(other), None, "{other:?}");
+        }
     }
 
     /// Uncapped preset (devin): max_parallelism must be None.

@@ -34,6 +34,29 @@ pub fn harness_max_parallelism(command: &str) -> Option<u32> {
     }
 }
 
+/// Return the parallelism a freshly minted record stores when neither the
+/// create input nor the linked definition sets one.
+///
+/// The app-wide default is [`super::DEFAULT_AGENT_PARALLELISM`]; a preset can
+/// carry its own (`PresetHarness::default_parallelism`), e.g. Hermes, where
+/// every worker is a full Hermes process loading the profile's MCP servers.
+/// Accepts a runtime id ("hermes") or a command ("hermes-acp", path-prefixed
+/// or `.exe`-suffixed) and reads static data only, so it is safe inside
+/// discovery and at the mint sites alike.
+pub fn harness_default_parallelism(harness: &str) -> u32 {
+    super::discovery::preset_default_parallelism(harness)
+        .unwrap_or(super::DEFAULT_AGENT_PARALLELISM)
+}
+
+/// Resolve the parallelism to persist on a new record: the explicit or
+/// definition-provided value when present, else the harness default.
+///
+/// Shared by every mint site (create, team snapshot adopt, persona snapshot
+/// import) so they cannot drift on which default applies.
+pub fn mint_parallelism(harness: &str, requested: Option<u32>) -> u32 {
+    requested.unwrap_or_else(|| harness_default_parallelism(harness))
+}
+
 /// Return the effective parallelism for the given harness command and
 /// requested value: `min(value, harness_max_parallelism(command))`.
 ///
@@ -182,6 +205,59 @@ mod tests {
         assert_eq!(super::effective_parallelism("openclaw", cap - 2), cap - 2);
         assert_eq!(super::effective_parallelism("goose", 99), 99);
         assert_eq!(super::effective_parallelism("buzz-agent", 32), 32);
+    }
+
+    // ── Policy table: harness_default_parallelism / mint_parallelism ──────────
+
+    /// Hermes (by id, command, path, or `.exe`) defaults to 1; every other
+    /// harness, including unknown and empty commands, uses the app default.
+    #[test]
+    fn default_parallelism_table() {
+        let app_default = crate::managed_agents::DEFAULT_AGENT_PARALLELISM;
+        for hermes in [
+            "hermes",
+            "hermes-acp",
+            "/opt/hermes/bin/hermes-acp",
+            "hermes-acp.exe",
+            r"C:\Tools\Hermes\HERMES-ACP.EXE",
+        ] {
+            assert_eq!(
+                super::harness_default_parallelism(hermes),
+                1,
+                "Hermes default parallelism for {hermes:?}"
+            );
+        }
+        for other in [
+            "goose",
+            "claude-agent-acp",
+            "codex-acp",
+            "buzz-agent",
+            "openclaw",
+            "devin",
+            "/opt/custom/my-agent",
+            "",
+        ] {
+            assert_eq!(
+                super::harness_default_parallelism(other),
+                app_default,
+                "non-Hermes default parallelism for {other:?}"
+            );
+        }
+        assert_ne!(app_default, 1, "the Hermes default must be observable");
+    }
+
+    /// Explicit or definition-provided values always win over the harness
+    /// default; the default fills in only when nothing was requested.
+    #[test]
+    fn mint_parallelism_prefers_requested_value() {
+        assert_eq!(super::mint_parallelism("hermes-acp", None), 1);
+        assert_eq!(super::mint_parallelism("hermes", None), 1);
+        assert_eq!(super::mint_parallelism("hermes-acp", Some(4)), 4);
+        assert_eq!(
+            super::mint_parallelism("goose", None),
+            crate::managed_agents::DEFAULT_AGENT_PARALLELISM
+        );
+        assert_eq!(super::mint_parallelism("goose", Some(2)), 2);
     }
 
     // ── acp_agents_value: spawn-env seam ──────────────────────────────────────

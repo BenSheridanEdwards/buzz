@@ -88,7 +88,10 @@ pub(crate) use global_config::{
 };
 pub(crate) use managed_node_paths::*;
 pub use nest::*;
-pub use parallelism::{acp_agents_value, effective_parallelism, harness_max_parallelism};
+pub use parallelism::{
+    acp_agents_value, effective_parallelism, harness_default_parallelism, harness_max_parallelism,
+    mint_parallelism,
+};
 pub use personas::*;
 #[cfg(windows)]
 pub use process_lifecycle::*;

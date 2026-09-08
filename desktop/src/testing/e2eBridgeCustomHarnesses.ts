@@ -5,6 +5,7 @@
  * independently of the full e2eBridge.ts context (which requires a browser
  * environment and full Playwright setup).
  */
+import { DEFAULT_AGENT_PARALLELISM } from "../features/agents/lib/agentParallelism.ts";
 import type { RawAcpRuntimeCatalogEntry } from "../shared/api/tauri.ts";
 
 /** In-memory store for custom harnesses saved via `save_custom_harness`. */
@@ -97,6 +98,9 @@ export function handleSaveCustomHarness(args: {
     node_required: false,
     auth_status: { status: "not_applicable" },
     source: "custom",
+    // Custom harnesses never carry a per-harness default; the backend emits
+    // the app-wide value for them.
+    default_parallelism: DEFAULT_AGENT_PARALLELISM,
     // Omit definition_env when the env map is empty — mirrors Rust's BTreeMap
     // serialization which skips empty maps so the field is absent on the wire.
     definition_env:

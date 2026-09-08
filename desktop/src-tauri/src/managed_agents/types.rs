@@ -703,6 +703,11 @@ pub struct AcpRuntimeCatalogEntry {
     /// Spawn-time parallelism cap; absent for uncapped harnesses.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_parallelism: Option<u32>,
+    /// Parallelism a new record stores when the form leaves it blank. The
+    /// app-wide `DEFAULT_AGENT_PARALLELISM` unless the harness overrides it
+    /// (see `harness_default_parallelism`); the form shows it as the
+    /// placeholder so the blank state is never a surprise.
+    pub default_parallelism: u32,
 }
 
 /// Result of a single install step (CLI or adapter).

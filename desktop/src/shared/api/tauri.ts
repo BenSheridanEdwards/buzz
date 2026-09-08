@@ -196,6 +196,8 @@ export type RawAcpRuntimeCatalogEntry = {
   /** Definition-level env vars for `source: custom` entries; absent for builtin/preset. */
   definition_env?: Record<string, string>;
   max_parallelism?: number;
+  /** Parallelism a new record stores when the form leaves it blank; always emitted. */
+  default_parallelism: number;
   effort_canonical_values?: string[] | null;
 };
 
@@ -703,6 +705,7 @@ export function fromRawAcpRuntimeCatalogEntry(
     ...(entry.max_parallelism !== undefined && {
       maxParallelism: entry.max_parallelism,
     }),
+    defaultParallelism: entry.default_parallelism,
   };
 }
 

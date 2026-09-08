@@ -287,10 +287,10 @@ pub fn build_managed_agent_summary(
             env: Default::default(),
         }
     });
-    let effective_mcp_command = known_acp_runtime(&descriptor.command)
-        .and_then(|r| r.mcp_command)
-        .unwrap_or("")
-        .to_string();
+    // Only a sidecar that actually resolves here is reported as attached; a
+    // missing binary reads as "none", matching what the spawn would hand the
+    // child.
+    let effective_mcp_command = super::attached_mcp_command(&descriptor.command).to_string();
 
     Ok(ManagedAgentSummary {
         pubkey: record.pubkey.clone(),
@@ -519,22 +519,22 @@ pub fn spawn_agent_child(
         .map_err(|error| format!("failed to clone log handle: {error}"))?;
     let resolved_acp_command = resolve_command(&record.acp_command)
         .ok_or_else(|| missing_command_message(&record.acp_command, "ACP harness command"))?;
-    let effective_mcp_command = known_acp_runtime(effective_command)
-        .and_then(|r| r.mcp_command)
-        .unwrap_or("");
-    let resolved_mcp_command: Option<std::path::PathBuf> = if effective_mcp_command.is_empty() {
-        None
-    } else {
-        match resolve_command(effective_mcp_command) {
-            Some(path) => Some(path),
-            None => {
-                eprintln!(
-                    "buzz-desktop: mcp_command {effective_mcp_command:?} not found, skipping"
-                );
+    // A configured sidecar that does not resolve is a degraded spawn, not a
+    // detail: the agent loses those tools for the whole run. Record it in the
+    // agent's own log (the file the user opens when it misbehaves) rather
+    // than only on the Desktop's stderr, which nobody reads.
+    let resolved_mcp_command: Option<std::path::PathBuf> =
+        match super::mcp_sidecar_with(effective_command, resolve_command) {
+            Some((_, Some(path))) => Some(path),
+            Some((name, None)) => {
+                let note =
+                    format!("=== MCP sidecar {name:?} not found; starting without its tools ===");
+                append_log_marker(&log_path, &note)?;
+                eprintln!("buzz-desktop: {note}");
                 None
             }
-        }
-    };
+            None => None,
+        };
     // Resolve agent command to a full path (DMG launches have minimal PATH).
     let resolved_agent_command = resolve_command(effective_command)
         .map(|p| p.display().to_string())

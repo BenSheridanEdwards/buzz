@@ -24,8 +24,8 @@ pub(crate) use login_shell::{
     is_login_shell_path_uninit, is_safe_nvm_tag, login_shell_candidates, parse_semver_tag,
 };
 pub(crate) use presets::{
-    canonical_harness_command, command_for_runtime_id, preset_harness_definitions,
-    preset_harness_ids,
+    canonical_harness_command, command_for_runtime_id, preset_default_parallelism,
+    preset_harness_definitions, preset_harness_ids,
 };
 use presets::{preset_catalog_entry, PRESET_HARNESSES};
 pub(crate) use runtime_metadata::EffortNormalization;
@@ -155,6 +155,53 @@ pub(crate) fn known_acp_runtime(command: &str) -> Option<&'static KnownAcpRuntim
 
 pub(crate) fn known_acp_runtime_exact(id: &str) -> Option<&'static KnownAcpRuntime> {
     KNOWN_ACP_RUNTIMES.iter().find(|p| p.id == id)
+}
+
+/// The bundled MCP sidecar a harness command is configured for, paired with
+/// the path it resolves to on this machine.
+///
+/// - `Some((name, Some(path)))`: configured, and launchable here.
+/// - `Some((name, None))`: configured, but the binary is missing or not
+///   executable, so the spawn starts the agent without it.
+/// - `None`: this harness gets no sidecar at all.
+///
+/// The resolver is injected so the "configured but absent" branch is
+/// exercisable without a filesystem. Production callers pass `resolve_command`
+/// (the spawn, which may probe a login shell once) or `resolve_command_cached`
+/// (the read-only paths, which must never spawn one).
+pub(crate) fn mcp_sidecar_with(
+    command: &str,
+    resolve: impl FnOnce(&str) -> Option<PathBuf>,
+) -> Option<(&'static str, Option<PathBuf>)> {
+    let configured = known_acp_runtime(command)
+        .and_then(|runtime| runtime.mcp_command)
+        .filter(|name| !name.is_empty())?;
+    Some((configured, resolve(configured)))
+}
+
+/// The MCP sidecar a summary or restart snapshot may report: the catalog name
+/// only when the binary behind it actually resolves, else `""`.
+///
+/// A sidecar the spawn silently skipped must not be reported as attached: the
+/// UI would claim tools the agent does not have, and the restart diff would
+/// see no drift on the day the binary appears. Resolution goes through the
+/// cache only (never a login-shell probe) because these callers sit on the
+/// cheap read path; the spawn warms that cache with the full resolver, so the
+/// stamped snapshot and the prospective one agree.
+pub(crate) fn attached_mcp_command_with(
+    command: &str,
+    resolve: impl FnOnce(&str) -> Option<PathBuf>,
+) -> &'static str {
+    match mcp_sidecar_with(command, resolve) {
+        Some((name, Some(_))) => name,
+        _ => "",
+    }
+}
+
+/// [`attached_mcp_command_with`] against the resolve cache: the derivation the
+/// summary and the restart snapshot use.
+pub(crate) fn attached_mcp_command(command: &str) -> &'static str {
+    attached_mcp_command_with(command, resolve_command_cached)
 }
 
 /// The agent command a freshly-created agent defaults to when the create
@@ -1057,6 +1104,7 @@ fn discover_acp_runtime_phase1(runtime: &'static KnownAcpRuntime, force: bool) -
             source: HarnessSource::Builtin,
             definition_env: Default::default(),
             max_parallelism: super::parallelism::harness_max_parallelism(runtime.id),
+            default_parallelism: super::parallelism::harness_default_parallelism(runtime.id),
         },
     }
 }
@@ -1198,6 +1246,7 @@ pub fn discover_acp_runtimes_from(
                 source: HarnessSource::Custom,
                 definition_env: def.env.clone(), // preserve for edit round-trip
                 max_parallelism: super::parallelism::harness_max_parallelism(&def.command),
+                default_parallelism: super::parallelism::harness_default_parallelism(&def.command),
             });
         }
     }

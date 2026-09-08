@@ -1776,3 +1776,67 @@ fn discovery_publish_path_drops_mid_flight_delete() {
         "discovery's publish must not resurrect a harness deleted mid-discovery"
     );
 }
+
+// ── Bundled MCP sidecar: configured vs. actually resolvable ──────────────────
+
+/// `mcp_sidecar_with` reports the catalog name and, separately, whether the
+/// binary behind it resolves. The two are distinct facts: a harness stays
+/// "configured for buzz-dev-mcp" on a machine where that binary is missing,
+/// and the spawn there starts without it.
+#[test]
+fn mcp_sidecar_separates_configured_from_resolvable() {
+    let present = |_: &str| Some(PathBuf::from("/Applications/Buzz.app/Contents/MacOS/found"));
+    let absent = |_: &str| None;
+
+    assert_eq!(
+        super::mcp_sidecar_with("codex-acp", present),
+        Some((
+            "buzz-dev-mcp",
+            Some(PathBuf::from("/Applications/Buzz.app/Contents/MacOS/found"))
+        )),
+        "a resolvable sidecar reports its path"
+    );
+    assert_eq!(
+        super::mcp_sidecar_with("codex-acp", absent),
+        Some(("buzz-dev-mcp", None)),
+        "a missing binary keeps the configured name but resolves to nothing"
+    );
+    assert_eq!(
+        super::mcp_sidecar_with("goose", present),
+        None,
+        "a harness with no sidecar never consults the resolver"
+    );
+    assert_eq!(
+        super::mcp_sidecar_with("/opt/custom/my-agent", present),
+        None
+    );
+    assert_eq!(super::mcp_sidecar_with("", present), None);
+}
+
+/// The value the summary and the restart snapshot publish is empty whenever
+/// the sidecar did not resolve, so the UI never reports a sidecar the agent
+/// did not actually get, and the restart diff sees drift once it appears.
+#[test]
+fn attached_mcp_command_is_empty_when_the_sidecar_is_missing() {
+    use super::attached_mcp_command_with;
+    assert_eq!(
+        attached_mcp_command_with("codex-acp", |_| Some(PathBuf::from(
+            "/usr/bin/buzz-dev-mcp"
+        ))),
+        "buzz-dev-mcp"
+    );
+    assert_eq!(
+        attached_mcp_command_with("codex-acp", |_| None),
+        "",
+        "a sidecar that cannot be launched must not be reported as attached"
+    );
+    assert_eq!(
+        attached_mcp_command_with("buzz-agent", |_| None),
+        "",
+        "the bundled agent is not exempt: a missing sidecar is a missing sidecar"
+    );
+    assert_eq!(
+        attached_mcp_command_with("goose", |_| Some(PathBuf::from("/usr/bin/x"))),
+        ""
+    );
+}
