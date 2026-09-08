@@ -39,6 +39,10 @@ const MAX_MIME_LEN: usize = 255;
 const MAX_FILENAME_BYTES: usize = 120;
 /// Turn directories kept under the attachment root before the oldest go.
 const KEEP_TURN_DIRS: usize = 16;
+/// Directory under the attachment root that holds the per-publish scratch
+/// directories ([`PublishScratch`]). It is not a turn directory and is never
+/// pruned or handed to the engine.
+const OUTBOUND_DIR: &str = ".outbound";
 /// Wall-clock cap for fetching one turn's attachments, all events included.
 pub(crate) const INBOUND_DEADLINE: std::time::Duration = std::time::Duration::from_secs(60);
 
@@ -552,6 +556,7 @@ pub fn prune_turn_dirs(
     let mut siblings: Vec<(std::time::SystemTime, PathBuf)> = std::fs::read_dir(root)?
         .filter_map(Result::ok)
         .filter(|entry| keep != Some(entry.path().as_path()))
+        .filter(|entry| entry.file_name() != std::ffi::OsStr::new(OUTBOUND_DIR))
         .filter_map(|entry| {
             let meta = entry.metadata().ok()?;
             meta.is_dir().then(|| {
@@ -597,12 +602,26 @@ pub fn default_attachment_base() -> PathBuf {
 /// have been planted by another local user.
 ///
 /// Every directory on the path below `base` is created with mode `0700`
-/// (rule 4: a shared `/tmp` on a Linux host is not ours alone). An existing
-/// root is accepted only when it is a real directory, not a symlink, owned by
-/// this process; a wider mode is tightened back to `0700`. Any other state is
-/// an error, and the caller must not store blobs there.
+/// (rule 4: a shared `/tmp` on a Linux host is not ours alone) and every one
+/// of them is then checked: `<base>/buzz-acp` first, because on the `/tmp`
+/// fallback that is the one component another local user could have created
+/// before us, then the per-agent directory and the root itself. A directory
+/// is accepted only when it is real, not a symlink, and owned by this
+/// process; a wider mode is tightened back to `0700`. Any other state is an
+/// error, and the caller must not store blobs there.
 pub fn prepare_attachment_root(base: &Path, agent_key: &str) -> std::io::Result<PathBuf> {
-    let root = base.join("buzz-acp").join(agent_key).join("attachments");
+    let shared = base.join("buzz-acp");
+    let per_agent = shared.join(agent_key);
+    let root = per_agent.join("attachments");
+    private_dir_builder().create(&root)?;
+    for dir in [shared.as_path(), per_agent.as_path(), root.as_path()] {
+        check_private_dir(dir)?;
+    }
+    Ok(root)
+}
+
+/// A `DirBuilder` that creates every directory it makes with mode `0700`.
+fn private_dir_builder() -> std::fs::DirBuilder {
     let mut builder = std::fs::DirBuilder::new();
     builder.recursive(true);
     #[cfg(unix)]
@@ -610,11 +629,7 @@ pub fn prepare_attachment_root(base: &Path, agent_key: &str) -> std::io::Result<
         use std::os::unix::fs::DirBuilderExt as _;
         builder.mode(0o700);
     }
-    builder.create(&root)?;
-    for dir in [root.as_path(), root.parent().unwrap_or(root.as_path())] {
-        check_private_dir(dir)?;
-    }
-    Ok(root)
+    builder
 }
 
 fn check_private_dir(dir: &Path) -> std::io::Result<()> {
@@ -653,6 +668,178 @@ fn check_private_dir(dir: &Path) -> std::io::Result<()> {
         }
     }
     Ok(())
+}
+
+/// A harness-private directory for one publish, created fresh with an
+/// unguessable name and mode `0700`, and removed when the publish task drops
+/// it.
+///
+/// The turn directory is handed to the engine as a `file://` URI and is
+/// writable by it, so anything the harness writes at a name the engine can
+/// predict is a symlink the engine can plant: `File::create` on it would
+/// overwrite whatever the link points at, with harness privileges. Staged
+/// copies, decoded inline blocks, and ffmpeg output therefore never go under
+/// the turn directory. They go here, under `<root>/.outbound/pub-<uuid>`,
+/// outside both the engine's working directory and its scratch, with every
+/// file created by [`PublishScratch::create_file`] under
+/// `O_CREAT | O_EXCL | O_NOFOLLOW` at a random name.
+#[derive(Debug)]
+pub struct PublishScratch {
+    dir: PathBuf,
+}
+
+impl PublishScratch {
+    /// Create the per-publish directory under the attachment `root`.
+    ///
+    /// `std::fs::create_dir` is atomic and fails with `EEXIST` on anything
+    /// already at the path, symlinks included, which is what `mkdtemp(3)`
+    /// buys; the UUID makes the name unguessable, so there is nothing for
+    /// the engine to plant in the first place.
+    pub fn create(root: &Path) -> std::io::Result<Self> {
+        let base = root.join(OUTBOUND_DIR);
+        private_dir_builder().create(&base)?;
+        check_private_dir(&base)?;
+        let dir = base.join(format!("pub-{}", uuid::Uuid::new_v4().simple()));
+        let mut once = private_dir_builder();
+        once.recursive(false);
+        once.create(&dir)?;
+        prune_abandoned_scratch(&base, &dir);
+        Ok(Self { dir })
+    }
+
+    /// The directory itself; ffmpeg writes its output here.
+    pub fn dir(&self) -> &Path {
+        &self.dir
+    }
+
+    /// A fresh, empty file in the directory with a random name, opened for
+    /// writing with `O_CREAT | O_EXCL | O_NOFOLLOW` and mode `0600`.
+    pub fn create_file(&self, ext: &str) -> std::io::Result<(std::fs::File, PathBuf)> {
+        let ext = safe_attachment_filename(ext);
+        let ext = if ext.is_empty() || ext == "attachment.bin" {
+            "bin".to_string()
+        } else {
+            ext
+        };
+        let path = self.reserve(&ext);
+        let file = create_new_no_follow(&path)?;
+        Ok((file, path))
+    }
+
+    /// A random, unused path in the directory for a subprocess (ffmpeg) to
+    /// write. Nothing else can be sitting there: the directory is fresh and
+    /// only this process knows its name.
+    pub fn reserve(&self, ext: &str) -> PathBuf {
+        self.dir
+            .join(format!("{}.{ext}", uuid::Uuid::new_v4().simple()))
+    }
+}
+
+/// How long an abandoned publish scratch directory can sit under the
+/// outbound base before the next publish removes it. Comfortably past the
+/// pool's whole reply-media budget, so a directory this old belongs to a
+/// process that is gone (rule 4: the disk is a bounded resource, and a
+/// harness that is killed mid-publish must not leave copies behind forever).
+const ABANDONED_SCRATCH_AGE: std::time::Duration = std::time::Duration::from_secs(60 * 60);
+
+/// Remove publish scratch directories left behind by a process that died
+/// before its `Drop` ran. Failures are only logged: this is housekeeping on
+/// the way to doing the real work, never a reason to refuse a publish.
+fn prune_abandoned_scratch(base: &Path, keep: &Path) {
+    let Ok(entries) = std::fs::read_dir(base) else {
+        return;
+    };
+    let now = std::time::SystemTime::now();
+    for entry in entries.filter_map(Result::ok) {
+        let path = entry.path();
+        if path == keep {
+            continue;
+        }
+        let stale = entry
+            .metadata()
+            .ok()
+            .filter(|meta| meta.is_dir())
+            .and_then(|meta| meta.modified().ok())
+            .and_then(|modified| now.duration_since(modified).ok())
+            .is_some_and(|age| age > ABANDONED_SCRATCH_AGE);
+        if stale {
+            if let Err(e) = std::fs::remove_dir_all(&path) {
+                tracing::debug!(
+                    target: "acp::media",
+                    "removing abandoned publish scratch {} failed: {e}",
+                    path.display()
+                );
+            }
+        }
+    }
+}
+
+/// Create `path` for writing with `O_CREAT | O_EXCL | O_NOFOLLOW` and mode
+/// `0600`: it must not exist, and if a symlink is sitting there the open
+/// fails rather than writing through it to whatever it points at.
+///
+/// `O_EXCL` is the flag that does the work on creation, a dangling link
+/// included, so removing `O_NOFOLLOW` alone fails no test; it is kept
+/// because every other open in this module carries it, and it is the only
+/// guard on the read side ([`open_verified`]).
+pub fn create_new_no_follow(path: &Path) -> std::io::Result<std::fs::File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600);
+        options.custom_flags(nix::fcntl::OFlag::O_NOFOLLOW.bits());
+    }
+    options.open(path)
+}
+
+impl Drop for PublishScratch {
+    fn drop(&mut self) {
+        if let Err(e) = std::fs::remove_dir_all(&self.dir) {
+            tracing::debug!(
+                target: "acp::media",
+                "removing publish scratch {} failed: {e}",
+                self.dir.display()
+            );
+        }
+    }
+}
+
+/// Open `path` for reading without following a symlink at its last component
+/// and confirm through the open handle that it is a regular file, of exactly
+/// `expected_len` bytes when one is given. Returns the handle and its length.
+///
+/// Every read of a file the harness is about to upload goes through this, so
+/// a path that resolved to a regular file cannot be swapped for a link (or
+/// for different content) between resolution and the read.
+pub fn open_verified(
+    path: &Path,
+    expected_len: Option<u64>,
+) -> std::io::Result<(std::fs::File, u64)> {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.custom_flags(nix::fcntl::OFlag::O_NOFOLLOW.bits());
+    }
+    let file = options.open(path)?;
+    let meta = file.metadata()?;
+    if !meta.is_file() {
+        return Err(std::io::Error::other(format!(
+            "{} is not a regular file",
+            path.display()
+        )));
+    }
+    if let Some(expected) = expected_len.filter(|expected| *expected != meta.len()) {
+        return Err(std::io::Error::other(format!(
+            "{} changed underneath us ({expected} bytes became {})",
+            path.display(),
+            meta.len()
+        )));
+    }
+    Ok((file, meta.len()))
 }
 
 /// Fetch every attachment on `events` into `turn_dir`.
@@ -1205,6 +1392,111 @@ mod tests {
         assert!(prepare_attachment_root(&base, "plain").is_err());
         let _ = std::fs::remove_dir_all(&base);
         let _ = std::fs::remove_dir_all(&planted);
+    }
+
+    /// S6 from the confirmation pass: on the shared `/tmp` fallback the
+    /// `<base>/buzz-acp` component is the one another local user can create
+    /// first, so it is checked like the two below it.
+    #[test]
+    fn the_shared_component_of_the_root_is_checked_too() {
+        let base = std::env::temp_dir().join(format!("buzz-acp-shared-{}", uuid::Uuid::new_v4()));
+        let planted =
+            std::env::temp_dir().join(format!("buzz-acp-shared-planted-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&planted).unwrap();
+        std::fs::create_dir_all(&base).unwrap();
+        std::os::unix::fs::symlink(&planted, base.join("buzz-acp")).unwrap();
+        let err = prepare_attachment_root(&base, "abcdef0123456789")
+            .expect_err("a planted `buzz-acp` component is refused");
+        assert!(err.to_string().contains("symlink"), "{err}");
+        assert!(
+            err.to_string().contains("buzz-acp"),
+            "the refusal names the component: {err}"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+        let _ = std::fs::remove_dir_all(&planted);
+    }
+
+    /// The publish scratch is a fresh directory per publish, private, at a
+    /// name nothing else knows, outside every directory the engine was
+    /// handed, and it takes its files with it when it drops.
+    fn set_dir_mtime(dir: &Path, when: std::time::SystemTime) {
+        let spec = |t: std::time::SystemTime| {
+            let d = t.duration_since(std::time::UNIX_EPOCH).unwrap();
+            nix::sys::time::TimeSpec::new(d.as_secs() as i64, d.subsec_nanos() as i64)
+        };
+        nix::sys::stat::utimensat(
+            nix::fcntl::AT_FDCWD,
+            dir,
+            &spec(when),
+            &spec(when),
+            nix::sys::stat::UtimensatFlags::NoFollowSymlink,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn publish_scratch_is_private_fresh_and_removed_with_its_publish() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let root = std::env::temp_dir().join(format!("buzz-acp-scratch-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let dir = {
+            let scratch = PublishScratch::create(&root).unwrap();
+            let mode = std::fs::metadata(scratch.dir())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(mode, 0o700, "{mode:o}");
+            let second = PublishScratch::create(&root).unwrap();
+            assert_ne!(
+                scratch.dir(),
+                second.dir(),
+                "each publish gets its own directory"
+            );
+
+            let (_, first) = scratch.create_file("txt").unwrap();
+            let (_, again) = scratch.create_file("txt").unwrap();
+            assert_ne!(first, again, "names are not predictable");
+            assert!(first.starts_with(scratch.dir()));
+            let mode = std::fs::metadata(&first).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "{mode:o}");
+
+            // A link planted at a scratch name is never written through:
+            // this is the open every scratch file is created with.
+            let victim = root.join("victim.txt");
+            std::fs::write(&victim, b"victim").unwrap();
+            let planted = scratch.reserve("txt");
+            std::os::unix::fs::symlink(&victim, &planted).unwrap();
+            let err = create_new_no_follow(&planted)
+                .expect_err("a planted symlink is not written through");
+            assert!(
+                err.kind() == std::io::ErrorKind::AlreadyExists
+                    || err.raw_os_error() == Some(nix::libc::ELOOP),
+                "{err:?}"
+            );
+            assert_eq!(std::fs::read(&victim).unwrap(), b"victim");
+            // And so is a plain existing file.
+            let taken = scratch.reserve("txt");
+            std::fs::write(&taken, b"first").unwrap();
+            assert!(create_new_no_follow(&taken).is_err());
+            scratch.dir().to_path_buf()
+        };
+        assert!(!dir.exists(), "the scratch goes when the publish does");
+
+        // A directory left behind by a process that died mid-publish is
+        // reclaimed by the next one; a fresh one is not.
+        let abandoned = root.join(OUTBOUND_DIR).join("pub-abandoned");
+        std::fs::create_dir_all(&abandoned).unwrap();
+        let long_ago = std::time::SystemTime::now()
+            - (ABANDONED_SCRATCH_AGE + std::time::Duration::from_secs(60));
+        set_dir_mtime(&abandoned, long_ago);
+        let recent = root.join(OUTBOUND_DIR).join("pub-recent");
+        std::fs::create_dir_all(&recent).unwrap();
+        let live = PublishScratch::create(&root).unwrap();
+        assert!(!abandoned.exists(), "the abandoned scratch was reclaimed");
+        assert!(recent.is_dir(), "a fresh one is left alone");
+        assert!(live.dir().is_dir());
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

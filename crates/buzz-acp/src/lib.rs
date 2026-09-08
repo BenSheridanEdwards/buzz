@@ -2836,6 +2836,9 @@ async fn tokio_main() -> Result<()> {
     let ctx = Arc::new(PromptContext {
         attachment_dir,
         live_turn_dirs: crate::attachments::LiveTurnDirs::default(),
+        // One in-flight reply-media publish per agent slot: the tasks are
+        // detached from the turn, so nothing else bounds how many pile up.
+        publish_slots: Arc::new(tokio::sync::Semaphore::new(config.agents.max(1) as usize)),
         audio_support: crate::blossom::AudioSupportCache::default(),
         ffmpeg,
         mcp_servers: build_mcp_servers(&config),

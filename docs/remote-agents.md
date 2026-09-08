@@ -1117,6 +1117,15 @@ workspace `emptyDir` (e.g. `/home/agent`), and the harness runs with cwd =
 system gitconfig references the nostr helpers by absolute path so it works
 regardless of `HOME`.
 
+One consequence for outbound media: the harness will not publish files from
+a working directory that is `HOME`, a parent of `HOME`, the filesystem root,
+or a directory containing the attachment root, because none of those is a
+boundary: a reply naming `~/Documents/passport.pdf` would otherwise have the
+harness read and post it. Under this deployment (cwd = `HOME`) the only
+directory a reply can attach a file from is that turn's own attachment
+directory; a provider that wants the engine to send its own files should
+give the harness a dedicated project directory as cwd.
+
 ### Pod shape
 
 - **Bare Pod; `restartPolicy` follows lifetime policy (I5).** No Job, no

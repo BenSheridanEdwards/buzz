@@ -822,6 +822,14 @@ pub struct PromptContext {
     /// Turn directories that are still being prompted or published, kept out
     /// of the prune (see `attachments::prune_turn_dirs`).
     pub live_turn_dirs: crate::attachments::LiveTurnDirs,
+    /// How many reply-media publish tasks may run at once (rule 4). Each one
+    /// outlives its turn, holds a turn directory out of the prune, up to
+    /// `MAX_OUTBOUND_FILES` x `MAX_OUTBOUND_FILE_BYTES` on disk and in memory
+    /// and possibly an ffmpeg child, so without this a pool answering quickly
+    /// accumulates them without limit. A turn that cannot get a slot within
+    /// `PUBLISH_SLOT_WAIT` reports its media as failed through the notice
+    /// rather than queueing behind the others.
+    pub publish_slots: Arc<tokio::sync::Semaphore>,
     /// Cached NIP-11 `buzz-audio` answer shared by every reply.
     pub audio_support: crate::blossom::AudioSupportCache,
     /// ffmpeg binary found at startup, if any. Without it voice-note
@@ -2090,6 +2098,22 @@ fn with_canvas(prompt: Option<String>, canvas: Option<&str>) -> Option<String> {
     }
 }
 
+/// The events one batch fetches attachments for, in budget order.
+///
+/// Live events come first and cancelled ones last, so on a steer the message
+/// that caused the steer gets the 4-file, 25 MiB budget ahead of the blobs
+/// already fetched for the turn it superseded; the other order spends the
+/// budget on stale attachments and refuses the live voice note that prompted
+/// the steer.
+fn batch_attachment_events(batch: &FlushBatch) -> Vec<&nostr::Event> {
+    batch
+        .events
+        .iter()
+        .chain(batch.cancelled_events.iter())
+        .map(|be| &be.event)
+        .collect()
+}
+
 /// Fetch every `imeta` attachment on a batch into this turn's directory
 /// under the per-agent temp root.
 ///
@@ -2105,12 +2129,7 @@ async fn collect_batch_attachments(
     batch: &FlushBatch,
     turn_id: &str,
 ) -> crate::attachments::InboundAttachments {
-    let events: Vec<&nostr::Event> = batch
-        .events
-        .iter()
-        .chain(batch.cancelled_events.iter())
-        .map(|be| &be.event)
-        .collect();
+    let events = batch_attachment_events(batch);
     let has_imeta = events.iter().any(|event| {
         event
             .tags
@@ -2154,6 +2173,13 @@ async fn collect_batch_attachments(
 const REPLY_MEDIA_TASK_TIMEOUT: Duration = crate::media_publish::OUTBOUND_DEADLINE
     .saturating_add(crate::media_publish::PUBLISH_TIMEOUT)
     .saturating_add(Duration::from_secs(20));
+
+/// How long a reply-media task waits for one of `PromptContext::publish_slots`
+/// before giving up and reporting its media as failed. Short on purpose: a
+/// queue of waiting tasks is the unbounded growth the semaphore exists to
+/// prevent, and the human is better served by "it did not go" than by an
+/// attachment that arrives half an hour after the text.
+const PUBLISH_SLOT_WAIT: Duration = Duration::from_secs(5);
 
 /// Observer plumbing detached from the agent so a task that outlives the
 /// turn can still emit frames under the turn's context.
@@ -2230,15 +2256,37 @@ fn publish_reply_media(
     let trigger = trigger.event.clone();
     let turn_id = turn_id.to_string();
     Some(tokio::spawn(async move {
+        // Held for the whole task: the turn directory must survive the
+        // uploads, not just the prompt, or the prune reclaims the files
+        // being uploaded out from under it.
         let _guard = guard;
         let target = crate::media_publish::ReplyTarget::for_trigger(channel_id, &trigger);
-        let work = publish_reply_media_now(&ctx, &target, capture, &turn_id);
-        let report = match tokio::time::timeout(REPLY_MEDIA_TASK_TIMEOUT, work).await {
-            Ok(report) => report,
-            Err(_) => crate::media_publish::PublishReport {
+        let slot = tokio::time::timeout(
+            PUBLISH_SLOT_WAIT,
+            Arc::clone(&ctx.publish_slots).acquire_owned(),
+        )
+        .await;
+        let report = match slot {
+            Ok(Ok(permit)) => {
+                let work = publish_reply_media_now(&ctx, &target, capture, &turn_id);
+                match tokio::time::timeout(REPLY_MEDIA_TASK_TIMEOUT, work).await {
+                    Ok(report) => {
+                        drop(permit);
+                        report
+                    }
+                    Err(_) => crate::media_publish::PublishReport {
+                        published: Vec::new(),
+                        failed: vec![format!(
+                            "reply media task did not finish within {REPLY_MEDIA_TASK_TIMEOUT:?}"
+                        )],
+                        event_id: None,
+                    },
+                }
+            }
+            Ok(Err(_)) | Err(_) => crate::media_publish::PublishReport {
                 published: Vec::new(),
                 failed: vec![format!(
-                    "reply media task did not finish within {REPLY_MEDIA_TASK_TIMEOUT:?}"
+                    "no reply media slot free within {PUBLISH_SLOT_WAIT:?}; too many replies are already publishing"
                 )],
                 event_id: None,
             },
@@ -2302,16 +2350,53 @@ async fn publish_reply_media_now(
         }
         Err(reason) => return failed(format!("attachment storage unavailable: {reason}")),
     };
+    // The scratch every staged copy, decoded inline block, and ffmpeg output
+    // goes into: created fresh for this publish, at a name nothing else
+    // knows, outside both the engine's working directory and the turn
+    // directory it was handed.
+    let scratch = match ctx
+        .attachment_dir
+        .as_deref()
+        .map_err(|reason| std::io::Error::other(reason.clone()))
+        .and_then(crate::attachments::PublishScratch::create)
+    {
+        Ok(scratch) => Arc::new(scratch),
+        Err(e) => return failed(format!("publish scratch unavailable: {e}")),
+    };
+    tracing::debug!(
+        target: "acp::media",
+        scratch = %scratch.dir().display(),
+        "reply media staging into a private directory"
+    );
+    let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+    // The harness runs wherever it was started, which the remote-agent
+    // deployment documents as HOME; a working directory that broad is not a
+    // boundary at all, so it is refused as a root and named in the notes.
+    let workspace = crate::media_publish::outbound_workspace(
+        std::path::Path::new(&ctx.cwd),
+        home.as_deref(),
+        ctx.attachment_dir.as_deref().ok(),
+    );
+    if let Err(reason) = &workspace {
+        tracing::error!(
+            target: "acp::media",
+            cwd = %ctx.cwd,
+            "the working directory is not an outbound root: {reason}; only this turn's own directory is"
+        );
+    }
     let roots = crate::media_publish::OutboundRoots {
         turn_dir,
-        workspace: Some(std::path::PathBuf::from(&ctx.cwd)),
+        workspace: workspace.as_ref().ok().cloned(),
+        workspace_refused: workspace.err(),
+        home,
     };
     // Canonicalising, staging, and decoding inline data are disk work; keep
     // them off the runtime threads.
     let resolution = {
         let roots = roots.clone();
+        let scratch = Arc::clone(&scratch);
         match tokio::task::spawn_blocking(move || {
-            crate::media_publish::resolve_outbound_files(&capture, &roots)
+            crate::media_publish::resolve_outbound_files(&capture, &roots, &scratch)
         })
         .await
         {
@@ -2326,7 +2411,7 @@ async fn publish_reply_media_now(
     };
     let deadline = tokio::time::Instant::now() + crate::media_publish::OUTBOUND_DEADLINE;
     publisher
-        .publish_turn_media(target, resolution, &roots.scratch(), deadline)
+        .publish_turn_media(target, resolution, &scratch, deadline)
         .await
         .unwrap_or_default()
 }
@@ -7117,6 +7202,7 @@ done"#
     async fn media_relay_server(
         blob: Vec<u8>,
         blob_sha: String,
+        upload_gate: Option<Arc<tokio::sync::Semaphore>>,
     ) -> (String, std::sync::Arc<std::sync::Mutex<Vec<SeenRequest>>>) {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -7135,6 +7221,7 @@ done"#
                 let blob = blob.clone();
                 let blob_sha = blob_sha.clone();
                 let base = descriptor_base.clone();
+                let upload_gate = upload_gate.clone();
                 tokio::spawn(async move {
                     let mut buf: Vec<u8> = Vec::new();
                     let mut chunk = vec![0u8; 65536];
@@ -7182,6 +7269,18 @@ done"#
                                 ("application/octet-stream", blob.as_ref().clone())
                             }
                             ("PUT", "/upload") | ("PUT", "/media/upload") => {
+                                // A gated server logs the upload and then
+                                // holds the response, so a test can look at
+                                // the harness while a publish is in flight.
+                                if let Some(gate) = upload_gate.as_ref() {
+                                    log.lock().unwrap().push(SeenRequest {
+                                        method: "PUT-STARTED".into(),
+                                        path: path.clone(),
+                                        headers: headers.clone(),
+                                        body: body.clone(),
+                                    });
+                                    let _ = gate.acquire().await.map(|p| p.forget());
+                                }
                                 let sha = crate::blossom::sha256_hex(&body);
                                 let mime = headers
                                     .iter()
@@ -7270,7 +7369,7 @@ done"#
     async fn channel_turn_delivers_inbound_attachments_and_publishes_reply_media() {
         let blob = b"voice note bytes".to_vec();
         let blob_sha = crate::blossom::sha256_hex(&blob);
-        let (base, seen) = media_relay_server(blob.clone(), blob_sha.clone()).await;
+        let (base, seen) = media_relay_server(blob.clone(), blob_sha.clone(), None).await;
 
         let scratch = std::env::temp_dir().join(format!("buzz-acp-pool-media-{}", Uuid::new_v4()));
         let workspace = scratch.join("workspace");
@@ -7586,6 +7685,395 @@ done"#
 
         agent.acp.shutdown().await;
         let _ = std::fs::remove_dir_all(&scratch);
+    }
+
+    /// S4 and S3 from the confirmation pass. The publish task outlives its
+    /// turn, so it must hold the turn directory out of the prune for as long
+    /// as it runs, and the number of those tasks must be bounded. Both are
+    /// exercised against a relay that holds the upload open: the live turn's
+    /// directory survives a prune that has every reason to take it, and a
+    /// second turn that cannot get a publish slot says so in the channel
+    /// instead of queueing behind the first.
+    #[tokio::test]
+    async fn publish_task_holds_its_turn_dir_and_bounds_how_many_run() {
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        let (base, seen) =
+            media_relay_server(b"unused".to_vec(), "unused".into(), Some(gate.clone())).await;
+
+        let scratch = std::env::temp_dir().join(format!("buzz-acp-pool-hold-{}", Uuid::new_v4()));
+        let workspace = scratch.join("workspace");
+        let attachment_root = scratch.join("attachments");
+        for d in [&workspace, &attachment_root] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        let reply_file = workspace.join("reply.txt");
+        std::fs::write(&reply_file, b"held upload").unwrap();
+        let reply_text = format!("here\\nMEDIA:{}", reply_file.display());
+        let script = format!(
+            r#"count=0
+while IFS= read -r line; do
+  count=$((count + 1))
+  printf '%s\n' '{{"jsonrpc":"2.0","method":"session/update","params":{{"sessionId":"live-session","update":{{"sessionUpdate":"agent_message_chunk","content":{{"type":"text","text":"{reply_text}"}}}}}}}}'
+  printf '%s\n' "{{\"jsonrpc\":\"2.0\",\"id\":$((count - 1)),\"result\":{{\"stopReason\":\"end_turn\"}}}}"
+done"#
+        );
+        let acp = AcpClient::spawn("bash", &["-c".to_string(), script], &[], false)
+            .await
+            .expect("spawn hold ACP script");
+        let channel_id = Uuid::new_v4();
+        let mut agent = OwnedAgent {
+            index: 0,
+            acp,
+            state: SessionState::default(),
+            model_capabilities: None,
+            desired_model: None,
+            model_overridden: false,
+            desired_model_request_id: None,
+            desired_model_pending_ack: false,
+            startup_effort: None,
+            agent_name: "hold-test-agent".into(),
+            goose_system_prompt_supported: None,
+            protocol_version: 1,
+        };
+        agent
+            .state
+            .sessions
+            .insert(conv(channel_id), "live-session".into());
+        agent
+            .state
+            .deliveries
+            .insert(conv(channel_id), ChannelDeliveryState::default());
+
+        let mut ctx = make_prompt_context_no_owner();
+        ctx.rest_client.base_url = base.clone();
+        ctx.attachment_dir = Ok(attachment_root.clone());
+        ctx.cwd = workspace.to_string_lossy().into_owned();
+        // One slot, so the second turn's media cannot start while the first
+        // is still uploading.
+        ctx.publish_slots = Arc::new(tokio::sync::Semaphore::new(1));
+        let ctx = Arc::new(ctx);
+        let (result_tx, mut result_rx) = mpsc::unbounded_channel();
+
+        let author = Keys::generate();
+        let batch = |content: &str| {
+            let event = EventBuilder::new(Kind::Custom(9), content)
+                .sign_with_keys(&author)
+                .unwrap();
+            FlushBatch {
+                channel_id,
+                scope: SessionScope::Conversation { channel_id },
+                events: vec![crate::queue::BatchEvent {
+                    event,
+                    prompt_tag: "test".into(),
+                    received_at: std::time::Instant::now(),
+                }],
+                cancelled_events: vec![],
+                cancel_reason: None,
+            }
+        };
+
+        run_prompt_task(
+            agent,
+            Some(batch("first")),
+            None,
+            Arc::clone(&ctx),
+            result_tx.clone(),
+            None,
+            "turn-live".into(),
+        )
+        .await;
+        let result = result_rx.recv().await.expect("prompt result");
+        agent = result.agent;
+        // The slot came back before the upload did.
+        wait_for_requests(&seen, "the held upload to start", |seen| {
+            seen.iter().any(|r| r.method == "PUT-STARTED")
+        })
+        .await;
+
+        // Everything the prune uses to choose a victim now points at the
+        // publishing turn: it is the oldest directory and the root is well
+        // over the keep count.
+        for i in 0..20 {
+            std::fs::create_dir_all(attachment_root.join(format!("stale-{i}"))).unwrap();
+        }
+        let live_dir = attachment_root.join("turn-live");
+        assert!(live_dir.is_dir(), "the publish task created its turn dir");
+        assert!(
+            ctx.live_turn_dirs.is_live("turn-live"),
+            "the publish task holds its turn directory"
+        );
+        crate::attachments::prune_turn_dirs(&attachment_root, &ctx.live_turn_dirs, None).unwrap();
+        assert!(
+            live_dir.is_dir(),
+            "the directory of a turn that is still publishing survives the prune"
+        );
+        assert!(
+            attachment_root.join(".outbound").is_dir(),
+            "the publish scratch is not a turn directory and is never pruned"
+        );
+
+        // A second turn cannot get the one publish slot and says so in the
+        // channel rather than queueing behind the held upload.
+        run_prompt_task(
+            agent,
+            Some(batch("second")),
+            None,
+            Arc::clone(&ctx),
+            result_tx.clone(),
+            None,
+            "turn-queued".into(),
+        )
+        .await;
+        let result = result_rx.recv().await.expect("second prompt result");
+        agent = result.agent;
+        let requests = wait_for_requests(&seen, "the no-slot notice", |seen| {
+            kind9_posts(seen).iter().any(|e| {
+                e["content"]
+                    .as_str()
+                    .unwrap_or("")
+                    .contains("no reply media slot free")
+            })
+        })
+        .await;
+        assert!(
+            !requests
+                .iter()
+                .any(|r| r.method == "PUT" && r.body == b"held upload"),
+            "the queued turn never uploaded"
+        );
+
+        // Release the upload; the task finishes, drops the guard, and the
+        // directory becomes prunable again.
+        gate.add_permits(8);
+        wait_for_requests(&seen, "the media kind-9", |seen| {
+            kind9_posts(seen)
+                .iter()
+                .any(|e| e["content"].as_str().unwrap_or("").contains("reply.txt"))
+        })
+        .await;
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !ctx.live_turn_dirs.is_empty() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "guards never released"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        // The first prune already took its five victims; give the next one
+        // work to do so the released directory is a candidate again.
+        for i in 20..30 {
+            std::fs::create_dir_all(attachment_root.join(format!("stale-{i}"))).unwrap();
+        }
+        crate::attachments::prune_turn_dirs(&attachment_root, &ctx.live_turn_dirs, None).unwrap();
+        assert!(
+            !live_dir.exists(),
+            "once the task is done the directory is prunable like any other"
+        );
+
+        agent.acp.shutdown().await;
+        let _ = std::fs::remove_dir_all(&scratch);
+    }
+
+    /// B2 and S1 at the pool seam: the harness working directory is only an
+    /// outbound root when it is a real project directory. Here it contains
+    /// the attachment root, so a reply naming a file under it publishes
+    /// nothing and the channel is told why.
+    #[tokio::test]
+    async fn a_workspace_that_is_not_a_boundary_publishes_nothing() {
+        let (base, seen) = media_relay_server(b"unused".to_vec(), "unused".into(), None).await;
+        let scratch = std::env::temp_dir().join(format!("buzz-acp-pool-cwd-{}", Uuid::new_v4()));
+        let attachment_root = scratch.join("attachments");
+        std::fs::create_dir_all(&attachment_root).unwrap();
+        let reply_file = scratch.join("reply.txt");
+        std::fs::write(&reply_file, b"under the harness cwd").unwrap();
+        let reply_text = format!("here\\nMEDIA:{}", reply_file.display());
+        let script = format!(
+            r#"count=0
+while IFS= read -r line; do
+  count=$((count + 1))
+  printf '%s\n' '{{"jsonrpc":"2.0","method":"session/update","params":{{"sessionId":"live-session","update":{{"sessionUpdate":"agent_message_chunk","content":{{"type":"text","text":"{reply_text}"}}}}}}}}'
+  printf '%s\n' "{{\"jsonrpc\":\"2.0\",\"id\":$((count - 1)),\"result\":{{\"stopReason\":\"end_turn\"}}}}"
+done"#
+        );
+        let acp = AcpClient::spawn("bash", &["-c".to_string(), script], &[], false)
+            .await
+            .expect("spawn cwd ACP script");
+        let channel_id = Uuid::new_v4();
+        let mut agent = OwnedAgent {
+            index: 0,
+            acp,
+            state: SessionState::default(),
+            model_capabilities: None,
+            desired_model: None,
+            model_overridden: false,
+            desired_model_request_id: None,
+            desired_model_pending_ack: false,
+            startup_effort: None,
+            agent_name: "cwd-test-agent".into(),
+            goose_system_prompt_supported: None,
+            protocol_version: 1,
+        };
+        agent
+            .state
+            .sessions
+            .insert(conv(channel_id), "live-session".into());
+        agent
+            .state
+            .deliveries
+            .insert(conv(channel_id), ChannelDeliveryState::default());
+
+        let mut ctx = make_prompt_context_no_owner();
+        ctx.rest_client.base_url = base.clone();
+        ctx.attachment_dir = Ok(attachment_root.clone());
+        // The documented remote-agent shape in miniature: the harness was
+        // started from a directory that holds everything, this turn's
+        // attachment root included.
+        ctx.cwd = scratch.to_string_lossy().into_owned();
+        let ctx = Arc::new(ctx);
+        let (result_tx, mut result_rx) = mpsc::unbounded_channel();
+
+        let author = Keys::generate();
+        let event = EventBuilder::new(Kind::Custom(9), "send me that file")
+            .sign_with_keys(&author)
+            .unwrap();
+        run_prompt_task(
+            agent,
+            Some(FlushBatch {
+                channel_id,
+                scope: SessionScope::Conversation { channel_id },
+                events: vec![crate::queue::BatchEvent {
+                    event,
+                    prompt_tag: "test".into(),
+                    received_at: std::time::Instant::now(),
+                }],
+                cancelled_events: vec![],
+                cancel_reason: None,
+            }),
+            None,
+            Arc::clone(&ctx),
+            result_tx.clone(),
+            None,
+            "turn-1".into(),
+        )
+        .await;
+        let result = result_rx.recv().await.expect("prompt result");
+        let mut agent = result.agent;
+
+        let requests = wait_for_requests(&seen, "the refusal notice", |seen| {
+            kind9_posts(seen)
+                .iter()
+                .any(|e| e["content"].as_str().unwrap_or("").contains("refused"))
+        })
+        .await;
+        let notice = kind9_posts(&requests)
+            .into_iter()
+            .find(|e| e["content"].as_str().unwrap_or("").contains("refused"))
+            .unwrap();
+        let text = notice["content"].as_str().unwrap().to_string();
+        assert!(text.contains("reply.txt refused"), "{text}");
+        assert!(text.contains("no workspace root"), "{text}");
+        assert!(
+            !requests.iter().any(|r| r.body == b"under the harness cwd"),
+            "the file under the harness cwd never reached the wire"
+        );
+
+        agent.acp.shutdown().await;
+        let _ = std::fs::remove_dir_all(&scratch);
+    }
+
+    /// S5 from the confirmation pass: on a steer the live message must get
+    /// the attachment budget before the blobs of the turn it superseded.
+    /// Swapping the two chains in `batch_attachment_events` makes the
+    /// cancelled event's attachment the one that is stored and the live one
+    /// the one refused, which is exactly what this asserts against.
+    #[tokio::test]
+    async fn live_events_take_the_attachment_budget_before_cancelled_ones() {
+        let base = "http://127.0.0.1:1".to_string();
+        let author = Keys::generate();
+        let imeta_event = |name: &str, sha_seed: char| {
+            let sha: String = std::iter::repeat_n(sha_seed, 64).collect();
+            let imeta = Tag::parse([
+                "imeta",
+                &format!("url {base}/media/{sha}.bin"),
+                "m audio/mpeg",
+                &format!("x {sha}"),
+                "size 1024",
+                &format!("filename {name}"),
+            ])
+            .unwrap();
+            EventBuilder::new(Kind::Custom(9), name)
+                .tags([imeta])
+                .sign_with_keys(&author)
+                .unwrap()
+        };
+        let batch_event = |event: nostr::Event| crate::queue::BatchEvent {
+            event,
+            prompt_tag: "test".into(),
+            received_at: std::time::Instant::now(),
+        };
+        // Four live attachments fill the per-turn budget; the cancelled
+        // turn's blob is the one that must be turned away.
+        let live: Vec<nostr::Event> = ('a'..='d')
+            .map(|c| imeta_event(&format!("live-{c}.mp3"), c))
+            .collect();
+        let stale = imeta_event("stale.mp3", 'e');
+        let channel_id = Uuid::new_v4();
+        let batch = FlushBatch {
+            channel_id,
+            scope: SessionScope::Conversation { channel_id },
+            events: live.iter().cloned().map(batch_event).collect(),
+            cancelled_events: vec![batch_event(stale.clone())],
+            cancel_reason: Some(crate::queue::CancelReason::Steer),
+        };
+
+        let ordered = batch_attachment_events(&batch);
+        assert_eq!(
+            ordered.last().map(|e| e.id),
+            Some(stale.id),
+            "the cancelled turn's events come last"
+        );
+
+        let rest = crate::relay::RestClient {
+            http: reqwest::Client::new(),
+            base_url: base.clone(),
+            keys: Keys::generate(),
+            auth_tag_json: None,
+        };
+        let root = std::env::temp_dir().join(format!("buzz-acp-budget-{}", Uuid::new_v4()));
+        let turn_dir = crate::attachments::prepare_turn_dir(
+            &root,
+            "turn-1",
+            &crate::attachments::LiveTurnDirs::default(),
+        )
+        .unwrap();
+        let inbound = crate::attachments::collect_inbound_attachments(
+            &rest,
+            &ordered,
+            &turn_dir,
+            None,
+            tokio::time::Instant::now() + Duration::from_secs(10),
+        )
+        .await;
+
+        let over_budget: Vec<&str> = inbound
+            .outcomes
+            .iter()
+            .filter_map(|o| match o {
+                crate::attachments::AttachmentOutcome::Rejected { event_id, reason }
+                    if reason.contains("attachment limit") =>
+                {
+                    Some(event_id.as_str())
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            over_budget,
+            vec![stale.id.to_hex().as_str()],
+            "only the superseded turn's attachment is over budget: {:?}",
+            inbound.outcomes
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[tokio::test]
@@ -9791,6 +10279,7 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
             harness_name: "goose".to_string(),
             relay_url: "ws://127.0.0.1:3000".to_string(),
             attachment_dir: Ok(std::env::temp_dir().join("buzz-acp-test-attachments")),
+            publish_slots: Arc::new(tokio::sync::Semaphore::new(4)),
             live_turn_dirs: crate::attachments::LiveTurnDirs::default(),
             audio_support: crate::blossom::AudioSupportCache::default(),
             ffmpeg: None,
