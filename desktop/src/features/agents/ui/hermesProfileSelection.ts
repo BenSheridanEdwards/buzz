@@ -63,6 +63,12 @@ export type HarnessSelection = {
 /**
  * True when the selected harness is Hermes: the preset id, or any catalog
  * entry (custom harness included) whose command resolves to a Hermes binary.
+ *
+ * `command` is the harness's own executable as the catalog holds it — a path
+ * or a bare program name, not a shell line. A launcher that runs Hermes as an
+ * argument (`npx hermes-acp`) is not recognised, and does not need to be: the
+ * profile pin is `HERMES_HOME` on the process env, which such a launcher
+ * inherits either way; all this decides is whether the picker is shown.
  */
 export function isHermesHarness(
   runtimeId: string,
@@ -110,21 +116,30 @@ export function selectedHermesProfilePath(
  * A path whose shape says it came from Windows, where the filesystem case-folds
  * and a hand-typed `c:\users\...` names the same directory the scanner reported
  * as `C:\Users\...`.
+ *
+ * Only a drive-letter or UNC prefix counts. "Contains a backslash" would also
+ * match a POSIX directory with a literal backslash in its name, and that path
+ * would then be case-folded *and* have its backslash rewritten to `/` by the
+ * normalizer, so `/p/a\b` would compare equal to `/p/a/b`.
  */
 function looksLikeWindowsPath(path: string): boolean {
-  return /^[a-z]:[\\/]/i.test(path.trim()) || path.includes("\\");
+  const trimmed = path.trim();
+  return /^[a-z]:[\\/]/i.test(trimmed) || trimmed.startsWith("\\\\");
 }
 
 /**
- * Path equality tolerant of separator style, a trailing separator, and — for
- * Windows paths only — case. POSIX paths stay case-sensitive because there
- * `/Users/me` and `/users/me` really can be two directories.
+ * Path equality tolerant of a trailing separator, and — for Windows paths only
+ * — of separator style and case. POSIX paths get neither: there `/Users/me`
+ * and `/users/me` really can be two directories, and a backslash is an
+ * ordinary character in a file name rather than a separator, so rewriting it
+ * would make `/p/a\b` and `/p/a/b` compare equal.
  */
 export function isSameProfilePath(a: string, b: string): boolean {
-  const caseFold = looksLikeWindowsPath(a) && looksLikeWindowsPath(b);
+  const windows = looksLikeWindowsPath(a) && looksLikeWindowsPath(b);
   const normalize = (path: string) => {
-    const trimmed = path.trim().replace(/\\/g, "/").replace(/\/+$/, "");
-    return caseFold ? trimmed.toLowerCase() : trimmed;
+    const separated = windows ? path.trim().replace(/\\/g, "/") : path.trim();
+    const trimmed = separated.replace(/\/+$/, "");
+    return windows ? trimmed.toLowerCase() : trimmed;
   };
   const left = normalize(a);
   return left.length > 0 && left === normalize(b);

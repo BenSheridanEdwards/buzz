@@ -176,11 +176,24 @@ describe("isSameProfilePath", () => {
       ),
       true,
     );
+    // A UNC path is Windows too.
+    assert.equal(
+      isSameProfilePath(
+        "\\\\server\\share\\Profiles\\Bond",
+        "\\\\SERVER\\share\\profiles\\bond",
+      ),
+      true,
+    );
     // POSIX paths do not: /Users/me and /users/me can be two directories.
     assert.equal(
       isSameProfilePath("/users/me/.hermes/profiles/bond", bond.path),
       false,
     );
+    // A literal backslash in a POSIX directory name does not make it a Windows
+    // path: case-folding it would be wrong, and rewriting the backslash to a
+    // separator would make two different directories compare equal.
+    assert.equal(isSameProfilePath("/p/a\\b", "/p/a/b"), false);
+    assert.equal(isSameProfilePath("/p/a\\b", "/p/A\\b"), false);
   });
 });
 

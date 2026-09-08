@@ -23,6 +23,7 @@ export function PersonaDropdownField({
   onValueChange,
   options,
   placeholder,
+  readOnly,
   value,
 }: {
   contentClassName?: string;
@@ -33,9 +34,17 @@ export function PersonaDropdownField({
   onValueChange: (value: string) => void;
   options: readonly PersonaDropdownOption[];
   placeholder: string;
+  /**
+   * Inert, but still focusable, so a screen reader reaches the control and the
+   * text explaining why it cannot be changed. Prefer this over `disabled` for
+   * a value another surface owns: a `disabled` button is skipped by the tab
+   * order and its `aria-describedby` is never announced.
+   */
+  readOnly?: boolean;
   value: string;
 }) {
   const [open, setOpen] = React.useState(false);
+  const isInert = disabled === true || readOnly === true;
   const selectedOption = options.find((option) => option.value === value);
 
   return (
@@ -44,13 +53,22 @@ export function PersonaDropdownField({
         <DropdownMenuTrigger asChild>
           <button
             aria-describedby={describedBy}
+            aria-disabled={isInert || undefined}
             className={cn(
               "flex h-11 w-full items-center justify-between gap-3 px-3 py-2 text-left text-sm leading-6",
               PERSONA_FIELD_CONTROL_CLASS,
-              disabled && "cursor-default opacity-60",
+              isInert && "cursor-default opacity-60",
             )}
             disabled={disabled}
             id={id}
+            onClick={(event) => {
+              if (readOnly) event.preventDefault();
+            }}
+            onKeyDown={(event) => {
+              if (readOnly && (event.key === "Enter" || event.key === " ")) {
+                event.preventDefault();
+              }
+            }}
             type="button"
           >
             <span

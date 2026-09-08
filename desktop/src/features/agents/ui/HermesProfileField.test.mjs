@@ -364,6 +364,20 @@ describe("HermesProfileField", () => {
     assert.ok(html.includes('role="alert"'));
   });
 
+  it("describes the control with the empty-state line too", () => {
+    // "No profiles found in ~/.hermes/profiles." is the only thing on screen
+    // explaining why the dropdown has nothing in it; leaving it out of
+    // aria-describedby means it is never announced.
+    const html = render({ profiles: [] });
+    assert.ok(
+      html.includes(
+        'aria-describedby="persona-hermes-profile-empty persona-hermes-profile-help"',
+      ),
+      html,
+    );
+    assert.ok(html.includes('id="persona-hermes-profile-empty"'));
+  });
+
   it("renders an inherited pin read-only with a way back to the definition", () => {
     let edited = 0;
     const html = renderToStaticMarkup(
@@ -384,7 +398,18 @@ describe("HermesProfileField", () => {
     );
     // An instance override cannot unset an inherited env var, so the control is
     // read-only and the recovery affordance points at the definition.
-    assert.ok(html.includes("disabled"));
+    //
+    // `aria-disabled`, not `disabled`: a disabled button is not focusable, so
+    // a screen reader never reaches it and never announces the explanation
+    // below it or the route out. The control stays in the tab order and inert.
+    assert.ok(html.includes('aria-disabled="true"'), html);
+    assert.ok(!html.includes('disabled=""'), html);
+    assert.ok(
+      html.includes(
+        'aria-describedby="persona-hermes-profile-inherited persona-hermes-profile-path persona-hermes-profile-help"',
+      ),
+      html,
+    );
     assert.ok(html.includes("Set by this agent&#x27;s definition."));
     assert.ok(html.includes("Edit definition"));
     assert.equal(edited, 0);

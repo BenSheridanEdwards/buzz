@@ -146,8 +146,11 @@ export function HermesProfileField({
   const errorId = `${id}-error`;
   const pathId = `${id}-path`;
   const inheritedId = `${id}-inherited`;
+  const emptyId = `${id}-empty`;
+  const isEmpty = status === "ready" && profiles.length === 0;
   const describedBy = [
     status === "error" ? errorId : null,
+    isEmpty ? emptyId : null,
     isInherited ? inheritedId : null,
     selectedPath.length > 0 ? pathId : null,
     helpId,
@@ -162,8 +165,14 @@ export function HermesProfileField({
       </label>
       <PersonaDropdownField
         describedBy={describedBy}
-        disabled={disabled || isInherited || status === "loading"}
+        // An inherited pin is not editable here, but a `disabled` button is
+        // not focusable and its explanation ("Set by this agent's definition",
+        // and the way out through "Edit definition") would never be announced.
+        // `aria-disabled` keeps the control in the tab order with the same
+        // inert behaviour.
+        disabled={disabled || status === "loading"}
         id={id}
+        readOnly={isInherited}
         onValueChange={(nextValue) => {
           if (nextValue === NO_HERMES_PROFILE_VALUE) {
             onProfileChange(null);
@@ -185,8 +194,8 @@ export function HermesProfileField({
           Advanced.
         </p>
       ) : null}
-      {status === "ready" && profiles.length === 0 ? (
-        <p className="text-xs text-muted-foreground" id={`${id}-empty`}>
+      {isEmpty ? (
+        <p className="text-xs text-muted-foreground" id={emptyId}>
           No profiles found in ~/.hermes/profiles.
         </p>
       ) : null}
