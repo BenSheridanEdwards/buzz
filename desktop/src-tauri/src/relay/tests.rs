@@ -569,7 +569,7 @@ fn make_valid_auth_tag(agent_keys: &nostr::Keys) -> String {
 fn profile_event_with_valid_auth_tag() {
     let agent_keys = nostr::Keys::generate();
     let tag_json = make_valid_auth_tag(&agent_keys);
-    let event = build_profile_event(&agent_keys, "TestBot", None, None, Some(&tag_json))
+    let event = build_profile_event(&agent_keys, "TestBot", None, None, None, Some(&tag_json))
         .expect("should succeed with a valid auth tag");
 
     // Exactly one "auth" tag must be present.
@@ -587,7 +587,7 @@ fn profile_event_with_valid_auth_tag() {
 #[test]
 fn profile_event_without_auth_tag() {
     let agent_keys = nostr::Keys::generate();
-    let event = build_profile_event(&agent_keys, "TestBot", None, None, None)
+    let event = build_profile_event(&agent_keys, "TestBot", None, None, None, None)
         .expect("should succeed without an auth tag");
 
     // No "auth" tags should be present.
@@ -610,6 +610,7 @@ fn profile_event_includes_about_when_description_present() {
         None,
         Some("A meticulous code reviewer."),
         None,
+        None,
     )
     .expect("should succeed with an about");
     let content: serde_json::Value =
@@ -623,7 +624,7 @@ fn profile_event_includes_about_when_description_present() {
 #[test]
 fn profile_event_omits_about_when_absent() {
     let agent_keys = nostr::Keys::generate();
-    let event = build_profile_event(&agent_keys, "TestBot", None, None, None)
+    let event = build_profile_event(&agent_keys, "TestBot", None, None, None, None)
         .expect("should succeed without an about");
     let content: serde_json::Value =
         serde_json::from_str(&event.content).expect("kind:0 content is JSON");
@@ -631,11 +632,31 @@ fn profile_event_omits_about_when_absent() {
 }
 
 #[test]
+fn profile_event_carries_nip05_handle_verbatim() {
+    let agent_keys = nostr::Keys::generate();
+    let event = build_profile_event(
+        &agent_keys,
+        "TestBot",
+        None,
+        None,
+        Some("testbot@relay.example"),
+        None,
+    )
+    .expect("should succeed with a nip05");
+    let content: serde_json::Value =
+        serde_json::from_str(&event.content).expect("kind:0 content is JSON");
+    assert_eq!(
+        content.get("nip05").and_then(|v| v.as_str()),
+        Some("testbot@relay.example")
+    );
+}
+
+#[test]
 fn profile_event_rejects_invalid_auth_tag() {
     let agent_keys = nostr::Keys::generate();
     // Structurally valid JSON array but with a bogus signature — verification must fail.
     let bad_json = format!(r#"["auth","{}","","{}"]"#, "a".repeat(64), "b".repeat(128));
-    let result = build_profile_event(&agent_keys, "TestBot", None, None, Some(&bad_json));
+    let result = build_profile_event(&agent_keys, "TestBot", None, None, None, Some(&bad_json));
     assert!(result.is_err(), "should reject an invalid auth tag");
     assert!(
         result.unwrap_err().contains("verification failed"),

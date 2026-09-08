@@ -19,6 +19,8 @@ import { cn } from "@/shared/lib/cn";
 import { Button } from "@/shared/ui/button";
 import { AgentConfigPanel } from "./AgentConfigPanel";
 import { friendlyAgentLastError } from "@/features/agents/lib/friendlyAgentLastError";
+import { relayMembershipNotice } from "@/features/agents/lib/relayMembership";
+import { CopyButton } from "./CopyButton";
 import { ManagedAgentLogPanel } from "./ManagedAgentLogPanel";
 import { PubKey } from "@/shared/ui/PubKey";
 import { SubsectionLabel } from "@/shared/ui/PageHeader";
@@ -90,6 +92,10 @@ export function ManagedAgentRow({
     agent.lastError,
     agent.lastErrorCode,
   );
+  const membershipNotice = relayMembershipNotice(
+    agent.pubkey,
+    agent.relayMembership,
+  );
 
   return (
     <div
@@ -122,6 +128,7 @@ export function ManagedAgentRow({
               <StatusBlock
                 friendlyError={friendlyError}
                 isWorking={isWorking}
+                membershipLabel={membershipNotice?.badge ?? null}
                 presenceLoaded={presenceLoaded}
                 presenceStatus={presenceStatus}
                 processDetail={processDetail}
@@ -145,6 +152,7 @@ export function ManagedAgentRow({
               <StatusBlock
                 friendlyError={friendlyError}
                 isWorking={isWorking}
+                membershipLabel={membershipNotice?.badge ?? null}
                 presenceLoaded={presenceLoaded}
                 presenceStatus={presenceStatus}
                 processDetail={processDetail}
@@ -175,6 +183,12 @@ export function ManagedAgentRow({
           </Button>
         </div>
       </div>
+
+      {/* Sibling of the expansion button, like the restart badge above: the
+          block carries copy buttons, which must never nest inside it. */}
+      {membershipNotice ? (
+        <RelayMembershipBlock notice={membershipNotice} />
+      ) : null}
 
       {isLocal && isLogSelected ? (
         <div
@@ -356,6 +370,7 @@ function WorkingBadge({
 function StatusBlock({
   friendlyError,
   isWorking,
+  membershipLabel,
   presenceLoaded,
   presenceStatus,
   processDetail,
@@ -363,6 +378,8 @@ function StatusBlock({
 }: {
   friendlyError: ReturnType<typeof friendlyAgentLastError>;
   isWorking: boolean;
+  /** Relay-membership badge text, when the agent cannot publish yet. */
+  membershipLabel: string | null;
   presenceLoaded: boolean;
   presenceStatus: PresenceStatus | undefined;
   processDetail: string;
@@ -390,6 +407,88 @@ function StatusBlock({
         >
           {friendlyError.copy}
         </p>
+      ) : null}
+      {membershipLabel ? (
+        <p
+          className="text-xs text-amber-600 dark:text-amber-400"
+          data-testid="managed-agent-relay-membership-label"
+        >
+          {membershipLabel}
+        </p>
+      ) : null}
+    </div>
+  );
+}
+
+/**
+ * Shown when the desktop could not register the agent on a closed relay
+ * (or could not verify it). Gives the operator everything they need in one
+ * place: why, the agent's npub, and the exact `buzz-admin` command.
+ */
+function RelayMembershipBlock({
+  notice,
+}: {
+  notice: NonNullable<ReturnType<typeof relayMembershipNotice>>;
+}) {
+  const blocked = notice.severity === "blocked";
+  return (
+    <div
+      className={cn(
+        "mx-4 mb-3 space-y-2 rounded-md border p-2 text-xs",
+        blocked
+          ? "border-amber-500/40 bg-amber-500/5"
+          : "border-border bg-muted/30",
+      )}
+      data-testid={`managed-agent-relay-membership-${notice.severity}`}
+    >
+      <div className="flex items-center gap-1 font-medium">
+        <AlertTriangle
+          aria-hidden="true"
+          className={cn(
+            "h-3 w-3",
+            blocked
+              ? "text-amber-600 dark:text-amber-400"
+              : "text-muted-foreground",
+          )}
+        />
+        <span>{notice.badge}</span>
+      </div>
+      {notice.detail ? (
+        <p className="text-muted-foreground">{notice.detail}</p>
+      ) : null}
+      {notice.npub ? (
+        <div className="flex items-start gap-1.5">
+          <div className="min-w-0 flex-1">
+            <div className="text-2xs font-medium text-muted-foreground">
+              Agent npub
+            </div>
+            <div className="break-all font-mono">{notice.npub}</div>
+          </div>
+          <CopyButton
+            iconOnly
+            label="Copy agent npub"
+            size="icon-xs"
+            value={notice.npub}
+            variant="ghost"
+          />
+        </div>
+      ) : null}
+      {notice.command ? (
+        <div className="flex items-start gap-1.5">
+          <div className="min-w-0 flex-1">
+            <div className="text-2xs font-medium text-muted-foreground">
+              Ask the relay operator to run
+            </div>
+            <code className="block break-all font-mono">{notice.command}</code>
+          </div>
+          <CopyButton
+            iconOnly
+            label="Copy operator command"
+            size="icon-xs"
+            value={notice.command}
+            variant="ghost"
+          />
+        </div>
       ) : null}
     </div>
   );

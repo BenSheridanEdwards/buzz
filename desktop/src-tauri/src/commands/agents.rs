@@ -8,13 +8,14 @@ use crate::{
     managed_agents::{
         bestie_assignment::{recover_pending_assignment_cleanup, with_agent_assignments_cleared},
         build_managed_agent_summary, current_instance_id, ensure_persona_is_active,
-        find_managed_agent_mut, load_managed_agents, load_personas, load_teams,
-        managed_agents_base_dir, normalize_agent_args, resolve_provider_binary,
-        save_managed_agents, start_managed_agent_process, stop_managed_agent_process,
-        stop_managed_agent_workspace_pair, sync_managed_agent_processes, try_regenerate_nest,
-        validate_provider_config, BackendKind, CreateManagedAgentRequest,
-        CreateManagedAgentResponse, ManagedAgentRecord, ManagedAgentSummary, RelayMeshConfig,
-        DEFAULT_ACP_COMMAND, DEFAULT_AGENT_PARALLELISM, DEFAULT_AGENT_TURN_TIMEOUT_SECONDS,
+        find_managed_agent_mut, load_managed_agents, load_personas, load_relay_memberships,
+        load_teams, managed_agents_base_dir, normalize_agent_args,
+        preflight_managed_agent_relay_membership, resolve_provider_binary, save_managed_agents,
+        start_managed_agent_process, stop_managed_agent_process, stop_managed_agent_workspace_pair,
+        sync_managed_agent_processes, try_regenerate_nest, validate_provider_config, BackendKind,
+        CreateManagedAgentRequest, CreateManagedAgentResponse, ManagedAgentRecord,
+        ManagedAgentSummary, RelayMeshConfig, DEFAULT_ACP_COMMAND, DEFAULT_AGENT_PARALLELISM,
+        DEFAULT_AGENT_TURN_TIMEOUT_SECONDS,
     },
     relay::relay_ws_url_with_override,
     util::now_iso,
@@ -52,7 +53,28 @@ pub(super) fn summarize_from_disk(
         &load_personas(app).unwrap_or_default(),
         &load_teams(app).unwrap_or_default(),
         &crate::managed_agents::load_global_agent_config(app).unwrap_or_default(),
+        &load_relay_memberships(&managed_agents_base_dir(app)?),
     )
+}
+
+/// Register the agent on the relay before it starts, so a closed relay
+/// accepts its first publish. Never blocks the start: a relay/network failure
+/// is persisted as `Unknown` by the preflight and logged here; the agent is
+/// still spawned (the relay may admit it via NIP-OA delegation, and the next
+/// start or profile reconcile retries the registration).
+async fn preflight_relay_membership_for_start(
+    app: &AppHandle,
+    state: &AppState,
+    pubkey: &str,
+    relay_ws_url: &str,
+) {
+    if let Err(error) =
+        preflight_managed_agent_relay_membership(app, state, pubkey, relay_ws_url).await
+    {
+        eprintln!(
+            "buzz-desktop: relay membership preflight failed for agent {pubkey} on {relay_ws_url}: {error}"
+        );
+    }
 }
 
 #[path = "agents_create_fields.rs"]
@@ -106,6 +128,9 @@ pub(super) async fn start_local_agent_pairs_with_preflight(
             &global_for_preflight,
         );
     ensure_relay_mesh_for_record(app, mesh_model_id.as_deref(), false).await?;
+    for relay_url in relay_urls {
+        preflight_relay_membership_for_start(app, state, pubkey, relay_url).await;
+    }
 
     {
         let _store_guard = state
@@ -202,6 +227,13 @@ pub(super) async fn start_local_agent_with_preflight(
             &global,
         );
     ensure_relay_mesh_for_record(app, mesh_model_id.as_deref(), allow_fresh_create_start).await?;
+    // Membership preflight on the relay the caller scoped (or the current
+    // workspace). Runs BEFORE the scope bind below, like the mesh preflight,
+    // so the bind still covers every await on this path.
+    let membership_relay = expected_relay_url
+        .map(str::to_string)
+        .unwrap_or_else(|| crate::relay::relay_ws_url_with_override(state));
+    preflight_relay_membership_for_start(app, state, pubkey, &membership_relay).await;
 
     // The mesh preflight above is the suspension window Projects callbacks
     // capture their scope against: a community switch during that await
@@ -278,6 +310,7 @@ pub(super) async fn start_local_agent_with_preflight(
         &personas,
         &load_teams(app).unwrap_or_default(),
         &crate::managed_agents::load_global_agent_config(app).unwrap_or_default(),
+        &load_relay_memberships(&managed_agents_base_dir(app)?),
     )
 }
 
@@ -320,6 +353,7 @@ pub async fn list_managed_agents(app: AppHandle) -> Result<Vec<ManagedAgentSumma
         let teams = load_teams(&app).unwrap_or_default();
         let global_config =
             crate::managed_agents::load_global_agent_config(&app).unwrap_or_default();
+        let memberships = load_relay_memberships(&managed_agents_base_dir(&app)?);
         records
             .iter()
             .map(|record| {
@@ -330,6 +364,7 @@ pub async fn list_managed_agents(app: AppHandle) -> Result<Vec<ManagedAgentSumma
                     &personas,
                     &teams,
                     &global_config,
+                    &memberships,
                 )
             })
             .collect()
@@ -710,6 +745,18 @@ pub async fn create_managed_agent(
         )
     };
 
+    // ── Phase 3a: relay membership (async, outside store lock) ───────────────
+    // A closed relay refuses every publish from an unlisted pubkey, so the
+    // freshly minted agent key is registered as a member BEFORE its first
+    // start and before its kind:0 goes out. When this identity cannot add it,
+    // the sidecar records `NotMember` and the Agents view shows the npub to
+    // hand to the community owner; creation itself still succeeds.
+    let membership_relay = crate::relay::effective_agent_relay_url(
+        &resolved_relay_url,
+        &relay_ws_url_with_override(&state),
+    );
+    preflight_relay_membership_for_start(&app, &state, &pubkey, &membership_relay).await;
+
     // ── Phase 3b: local spawn (async preflight outside store lock) ───────────
     let mut spawn_error = None;
     let agent = if input.spawn_after_create && input.backend == BackendKind::Local {
@@ -789,8 +836,10 @@ pub async fn create_managed_agent(
         spawn_error
     };
 
-    // Rebuild summary if provider deploy may have updated backend_agent_id.
-    let final_agent = if input.backend != BackendKind::Local && spawn_error.is_none() {
+    // Rebuild the summary: a provider deploy may have updated
+    // backend_agent_id, and the Phase 3a membership preflight ran after the
+    // Phase 3 summary was built.
+    let final_agent = if input.backend == BackendKind::Local || spawn_error.is_none() {
         let _store_guard = state
             .managed_agents_store_lock
             .lock()
@@ -1136,6 +1185,10 @@ pub async fn delete_managed_agent(
                 save_managed_agents(&app, records)
             })?;
             crate::managed_agents::delete_agent_key(&pubkey);
+            // Derived relay-membership metadata goes with the record.
+            if let Err(error) = crate::managed_agents::clear_relay_membership(&base_dir, &pubkey) {
+                eprintln!("buzz-desktop: failed to clear relay membership for {pubkey}: {error}");
+            }
             // Tombstone after confirmed removal (inside lock; every published
             // agent tombstones). The NIP-IA kind:9035 archive request — which
             // stops the identity appearing in member pickers and autocomplete —

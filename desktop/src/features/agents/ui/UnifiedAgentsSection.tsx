@@ -8,6 +8,7 @@ import {
 import { resolveAgentCardModelLabel } from "@/features/agents/lib/agentCardModelLabel";
 import { effectiveAgentDescription } from "@/features/agents/lib/agentDescription";
 import { friendlyAgentLastError } from "@/features/agents/lib/friendlyAgentLastError";
+import { relayMembershipNotice } from "@/features/agents/lib/relayMembership";
 import type { AgentAvailabilityReader } from "@/features/agents/lib/useAgentAvailability";
 import { isManagedAgentActive } from "@/features/agents/lib/managedAgentControlActions";
 import { pickProfileAgent } from "@/features/agents/lib/pickProfileAgent";
@@ -361,9 +362,31 @@ function AgentPersonaCard({
             <AlertTriangle className="h-3 w-3" />
             Configuration missing
           </Badge>
+        ) : agent ? (
+          <RelayMembershipBadge agent={agent} />
         ) : null
       }
     />
+  );
+}
+
+/**
+ * Card-face badge for an agent a closed relay will not let publish. The
+ * full explanation, npub and operator command live in the agent's runtime
+ * row (`ManagedAgentRow`), which the card opens.
+ */
+function RelayMembershipBadge({ agent }: { agent: ManagedAgent }) {
+  const notice = relayMembershipNotice(agent.pubkey, agent.relayMembership);
+  if (!notice) return null;
+  return (
+    <Badge
+      className="gap-1"
+      data-testid={`agent-relay-membership-${notice.severity}-${agent.pubkey}`}
+      variant={notice.severity === "blocked" ? "warning" : "secondary"}
+    >
+      <AlertTriangle aria-hidden="true" className="h-3 w-3" />
+      {notice.badge}
+    </Badge>
   );
 }
 
@@ -455,7 +478,9 @@ function StandaloneAgentCard({
             <AlertTriangle className="h-3 w-3" />
             Configuration missing
           </Badge>
-        ) : null
+        ) : (
+          <RelayMembershipBadge agent={agent} />
+        )
       }
     />
   );

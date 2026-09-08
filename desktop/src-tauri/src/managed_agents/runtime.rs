@@ -140,6 +140,7 @@ pub fn build_managed_agent_summary(
     personas: &[crate::managed_agents::types::AgentDefinition],
     teams: &[crate::managed_agents::TeamRecord],
     global_config: &crate::managed_agents::GlobalAgentConfig,
+    memberships: &crate::managed_agents::RelayMembershipStore,
 ) -> Result<ManagedAgentSummary, String> {
     use crate::managed_agents::BackendKind;
 
@@ -334,6 +335,11 @@ pub fn build_managed_agent_summary(
         log_path,
         respond_to: record.respond_to,
         respond_to_allowlist: record.respond_to_allowlist.clone(),
+        // Same community scoping as `status` above: the pair on the active
+        // workspace relay, keyed canonically.
+        relay_membership: pair_key.as_ref().and_then(|key| {
+            crate::managed_agents::relay_membership_for(memberships, &record.pubkey, &key.relay_url)
+        }),
     })
 }
 

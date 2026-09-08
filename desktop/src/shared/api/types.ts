@@ -374,6 +374,25 @@ export type ManagedAgent = {
    * `"allowlist"`. Preserved across mode toggles.
    */
   respondToAllowlist: string[];
+  /**
+   * Last relay-membership check for this agent on the active workspace relay.
+   * `null` when the relay is open (no membership needed) or no check ran yet.
+   */
+  relayMembership: ManagedAgentRelayMembership | null;
+};
+
+/**
+ * Outcome of the desktop's attempt to register a managed agent as a member of
+ * a closed relay (`BUZZ_REQUIRE_RELAY_MEMBERSHIP`). `not_member` means the
+ * relay enforces membership, the agent is not listed, and the current identity
+ * could not add it; the card then shows the npub and the operator command.
+ */
+export type ManagedAgentRelayMembership = {
+  state: "member" | "not_member" | "unknown";
+  /** ISO timestamp of the check. */
+  checkedAt: string;
+  /** Human-readable detail for `not_member` / `unknown`. */
+  detail: string | null;
 };
 
 /** Inbound author gate mode. Mirrors buzz-acp's --respond-to CLI flag. */

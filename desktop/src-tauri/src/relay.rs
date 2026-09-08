@@ -478,9 +478,10 @@ fn build_profile_event(
     display_name: &str,
     avatar_url: Option<&str>,
     about: Option<&str>,
+    nip05: Option<&str>,
     auth_tag_json: Option<&str>,
 ) -> Result<nostr::Event, String> {
-    let builder = crate::events::build_profile(Some(display_name), None, avatar_url, about, None)?;
+    let builder = crate::events::build_profile(Some(display_name), None, avatar_url, about, nip05)?;
 
     let builder = if let Some(tag_json) = auth_tag_json {
         // Bridge nostr 0.37 PublicKey → nostr 0.36 PublicKey via hex encoding.
@@ -525,9 +526,62 @@ pub async fn sync_managed_agent_profile(
     about: Option<&str>,
     auth_tag: Option<&str>, // NIP-OA auth tag JSON
 ) -> Result<(), String> {
+    // Egress guard BEFORE any network round trip: the NIP-05 resolution
+    // below talks to the relay, and a key backup in the profile text must be
+    // refused without ever leaving the device.
+    for (bytes, context) in [
+        (display_name.as_bytes(), "agent profile sync"),
+        (about.unwrap_or("").as_bytes(), "agent profile sync"),
+    ] {
+        crate::egress_guard::assert_no_key_backup_bytes(bytes, context)?;
+    }
+    // kind:0 is absolute state on the relay, so EVERY managed-agent profile
+    // publish must carry the handle or the relay clears it. The existing
+    // handle is read back first so reconciles keep whatever the relay already
+    // attributes to this agent (see `nip05::stable_existing_handle`).
+    let agent_pubkey = agent_keys.public_key().to_hex();
+    let existing = query_agent_profile(state, relay_url, &agent_pubkey)
+        .await?
+        .and_then(|info| info.nip05);
+    let nip05 = nip05::resolve_managed_agent_nip05(
+        state,
+        relay_url,
+        &agent_pubkey,
+        display_name,
+        existing.as_deref(),
+    )
+    .await?;
+    sync_managed_agent_profile_with_nip05(
+        state,
+        relay_url,
+        agent_keys,
+        display_name,
+        avatar_url,
+        about,
+        nip05.as_deref(),
+        auth_tag,
+    )
+    .await
+}
+
+/// [`sync_managed_agent_profile`] with an already-resolved NIP-05 handle.
+/// Callers that computed the handle to decide whether a sync is needed at
+/// all (profile reconciliation) use this to publish exactly what they
+/// compared against.
+#[allow(clippy::too_many_arguments)]
+pub async fn sync_managed_agent_profile_with_nip05(
+    state: &AppState,
+    relay_url: &str,
+    agent_keys: &nostr::Keys,
+    display_name: &str,
+    avatar_url: Option<&str>,
+    about: Option<&str>,
+    nip05: Option<&str>,
+    auth_tag: Option<&str>, // NIP-OA auth tag JSON
+) -> Result<(), String> {
     crate::relay_admission::wait_for_rate_limit().await;
     // Build a signed kind:0 profile event (with optional NIP-OA auth tag).
-    let event = build_profile_event(agent_keys, display_name, avatar_url, about, auth_tag)?;
+    let event = build_profile_event(agent_keys, display_name, avatar_url, about, nip05, auth_tag)?;
     let event_json = event.as_json();
     let body_bytes = event_json.into_bytes();
     crate::egress_guard::assert_no_key_backup_bytes(&body_bytes, "agent profile sync")?;
@@ -605,6 +659,12 @@ pub async fn query_agent_profile(
             .get("about")
             .and_then(|v| v.as_str())
             .map(str::to_string),
+        nip05: content
+            .get("nip05")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .map(str::to_string),
     }))
 }
 
@@ -615,6 +675,41 @@ pub struct AgentProfileInfo {
     pub picture: Option<String>,
     /// Published public description (kind:0 `about`).
     pub about: Option<String>,
+    /// Published NIP-05 handle (`local@relay-host`), verbatim.
+    pub nip05: Option<String>,
+}
+
+// ── NIP-11 membership advertisement ─────────────────────────────────────────
+
+#[derive(serde::Deserialize)]
+struct RelayInformationDocument {
+    #[serde(default)]
+    supported_nips: Vec<u32>,
+}
+
+/// Whether the relay at `http_base_url` advertises NIP-43 (relay membership)
+/// in its NIP-11 document. A closed relay advertises it; an open relay does
+/// not, and no membership work is needed there.
+pub async fn relay_advertises_membership_at(
+    state: &AppState,
+    http_base_url: &str,
+) -> Result<bool, String> {
+    let url = format!("{}/info", http_base_url.trim_end_matches('/'));
+    let response = state
+        .http_client
+        .get(url)
+        .header("Accept", "application/nostr+json")
+        .timeout(std::time::Duration::from_secs(15))
+        .send()
+        .await
+        .map_err(|error| classify_request_error(&error))?;
+
+    if !response.status().is_success() {
+        return Err(relay_error_message(response).await);
+    }
+
+    let info = parse_json_response::<RelayInformationDocument>(response).await?;
+    Ok(info.supported_nips.contains(&43))
 }
 
 // ── Signed-event submission ─────────────────────────────────────────────────
@@ -622,10 +717,13 @@ pub struct AgentProfileInfo {
 mod get;
 pub use get::get_relay_json;
 
+pub mod nip05;
+
 mod submit;
 pub use submit::{
     submit_event, submit_event_at_created_at, submit_event_at_with_keys,
-    submit_event_with_keys_created_at, submit_signed_event_at_with_keys, SubmitEventResponse,
+    submit_event_with_keys_created_at, submit_signed_event_at_with_keys,
+    submit_signed_event_verdict_at_with_keys, SubmitEventResponse, SubmitVerdict,
 };
 
 /// Sign an event with explicit keys and POST it to `/events` with NIP-98 auth.

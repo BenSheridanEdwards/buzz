@@ -116,6 +116,24 @@ async fn boundary_sync_managed_agent_profile_blocks_ncryptsec() {
     assert_guard_error(&err);
 }
 
+/// Boundary 9: `relay/nip05.rs` `resolve_managed_agent_nip05`: the
+/// well-known lookup sends the slugified display name as a query parameter,
+/// and the profile reconcile calls it directly (not through boundary 2).
+#[tokio::test]
+async fn boundary_resolve_managed_agent_nip05_blocks_ncryptsec() {
+    let state = crate::app_state::build_app_state();
+    let err = crate::relay::nip05::resolve_managed_agent_nip05(
+        &state,
+        "ws://127.0.0.1:9",
+        &"a".repeat(64),
+        &format!("agent {NCRYPTSEC}"),
+        None,
+    )
+    .await
+    .unwrap_err();
+    assert_guard_error(&err);
+}
+
 /// Boundary 3: `relay/submit.rs` `submit_signed_event_at_with_keys` — the
 /// pre-signed entry into the boundary-1 funnel (main's submit refactor
 /// replaced `relay.rs` `submit_signed_event` with this scoped form).
@@ -263,10 +281,13 @@ fn src_rust_files() -> Vec<std::path::PathBuf> {
 /// guard + adding an injection test for the new site.
 const EVENTS_INVENTORY: &[(&str, usize, usize)] = &[
     // Production egress boundaries (see egress_guard.rs table):
-    ("src/relay.rs", 2, 2),                             // boundaries 2, 4
+    // Boundary 2 guards twice: once before the NIP-05 lookup egress that
+    // precedes the kind:0 publish, once on the serialized body.
+    ("src/relay.rs", 2, 3),                             // boundaries 2, 4
     ("src/relay/submit.rs", 1, 1),                      // boundaries 1 + 3 (shared funnel)
-    ("src/huddle/pipeline.rs", 1, 1),                   // boundary 5
-    ("src/commands/team_snapshot.rs", 1, 1),            // boundary 6
+    ("src/relay/nip05.rs", 0, 1), // boundary 9 (well-known lookup; no events URL)
+    ("src/huddle/pipeline.rs", 1, 1), // boundary 5
+    ("src/commands/team_snapshot.rs", 1, 1), // boundary 6
     ("src/commands/personas/snapshot/import.rs", 2, 1), // boundary 7 + its in-file injection-test fixture URL
     ("src/native_websocket.rs", 0, 2),                  // boundary 8 (WS frames; no events URL)
     // Test-only fixtures — no production egress, no guard:
@@ -291,6 +312,10 @@ const EVENTS_INVENTORY: &[(&str, usize, usize)] = &[
     // Stub-relay route in the tombstone-flush gate tests; production flush
     // publishes through the guarded boundary-1 funnel.
     ("src/commands/teams/pending/tests/gate.rs", 1, 0),
+    // Stub-relay route in the managed-agent relay-membership tests; the
+    // production kind:9030 registration publishes through the guarded
+    // boundary-1 funnel (`submit_event_at_with_keys`).
+    ("src/managed_agents/relay_membership.rs", 1, 0),
 ];
 
 // Needles are assembled at runtime so this scan file itself contains no

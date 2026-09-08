@@ -195,7 +195,7 @@ pub(crate) async fn reconcile_agent_profile(
     agent_pubkey: &str,
     data: &ProfileReconcileData,
 ) -> Result<ProfileReconcileOutcome, String> {
-    use crate::relay::{query_agent_profile, sync_managed_agent_profile};
+    use crate::relay::{query_agent_profile, sync_managed_agent_profile_with_nip05};
 
     // Resolved ONCE and used for both the read and the write-back. A pinned
     // `target_relay_url` wins unconditionally — see `resolve_reconcile_relay`.
@@ -211,6 +211,14 @@ pub(crate) async fn reconcile_agent_profile(
     {
         return Ok(ProfileReconcileOutcome::SkippedDisabled);
     }
+
+    // Closed relay: the agent must be a member BEFORE its kind:0 goes out,
+    // or the relay refuses it. This is also the retry seam for agents created
+    // before registration existed, for a creation whose registration was
+    // refused (the operator may have added the agent since), and for an
+    // `Unknown` check. A verified `Member` pair is skipped so the UI start
+    // path (which preflights before spawning) does not pay for it twice.
+    ensure_relay_membership_before_publish(state, app, agent_pubkey, &relay_url).await;
 
     // Query the relay for the agent's existing kind:0 profile.
     let existing = query_agent_profile(state, &relay_url, agent_pubkey).await?;
@@ -260,11 +268,27 @@ pub(crate) async fn reconcile_agent_profile(
         Some(expected_avatar)
     };
 
+    // The handle this agent should carry on this relay: whatever the relay
+    // already attributes to it when that is still derived from the current
+    // name (stable across reconciles), else the first free candidate. A
+    // lookup outage is an error here, never a silent `None`: kind:0 is
+    // absolute state on the relay and publishing without the handle would
+    // strip it.
+    let expected_nip05 = crate::relay::nip05::resolve_managed_agent_nip05(
+        state,
+        &relay_url,
+        agent_pubkey,
+        &data.name,
+        existing.as_ref().and_then(|info| info.nip05.as_deref()),
+    )
+    .await?;
+
     if !profile_needs_sync(
         existing.as_ref(),
         &data.name,
         expected_avatar.as_deref(),
         data.about.as_deref(),
+        expected_nip05.as_deref(),
     ) {
         return Ok(ProfileReconcileOutcome::Reconciled);
     }
@@ -279,17 +303,51 @@ pub(crate) async fn reconcile_agent_profile(
         return Ok(ProfileReconcileOutcome::SkippedDisabled);
     }
 
-    sync_managed_agent_profile(
+    sync_managed_agent_profile_with_nip05(
         state,
         &relay_url,
         &agent_keys,
         &data.name,
         expected_avatar.as_deref(),
         data.about.as_deref(),
+        expected_nip05.as_deref(),
         data.auth_tag.as_deref(),
     )
     .await?;
     Ok(ProfileReconcileOutcome::Reconciled)
+}
+
+/// Run the relay-membership preflight for a pair unless the sidecar already
+/// holds a verified `Member` record for it. Never blocks the reconcile: a
+/// relay/network failure is persisted as `Unknown` by the preflight and
+/// logged; the kind:0 publish that follows fails on its own if the relay is
+/// really down, and the next start or reconcile retries.
+async fn ensure_relay_membership_before_publish(
+    state: &AppState,
+    app: &AppHandle,
+    agent_pubkey: &str,
+    relay_url: &str,
+) {
+    use crate::managed_agents::{
+        load_relay_memberships, managed_agents_base_dir, preflight_managed_agent_relay_membership,
+        relay_membership_for, RelayMembershipState,
+    };
+
+    let verified_member = managed_agents_base_dir(app)
+        .map(|base_dir| load_relay_memberships(&base_dir))
+        .ok()
+        .and_then(|store| relay_membership_for(&store, agent_pubkey, relay_url))
+        .is_some_and(|membership| membership.state == RelayMembershipState::Member);
+    if verified_member {
+        return;
+    }
+    if let Err(error) =
+        preflight_managed_agent_relay_membership(app, state, agent_pubkey, relay_url).await
+    {
+        eprintln!(
+            "buzz-desktop: relay membership preflight failed for agent {agent_pubkey} on {relay_url}: {error}"
+        );
+    }
 }
 
 /// Decide whether a published profile is missing or stale relative to the
@@ -302,6 +360,7 @@ pub(super) fn profile_needs_sync(
     expected_name: &str,
     expected_avatar: Option<&str>,
     expected_about: Option<&str>,
+    expected_nip05: Option<&str>,
 ) -> bool {
     match existing {
         None => true,
@@ -309,7 +368,10 @@ pub(super) fn profile_needs_sync(
             let name_matches = info.display_name.as_deref() == Some(expected_name);
             let picture_matches = info.picture.as_deref() == expected_avatar;
             let about_matches = info.about.as_deref().unwrap_or("") == expected_about.unwrap_or("");
-            !name_matches || !picture_matches || !about_matches
+            // `query_agent_profile` already normalizes an empty handle to
+            // `None`, so a plain comparison is exact here.
+            let nip05_matches = info.nip05.as_deref() == expected_nip05;
+            !name_matches || !picture_matches || !about_matches || !nip05_matches
         }
     }
 }

@@ -8,6 +8,23 @@ pub struct SubmitEventResponse {
     pub message: String,
 }
 
+/// How the relay answered a submit, for callers that must tell a refusal
+/// apart from a transport failure (a refusal is the relay's definitive
+/// answer; a transport failure says nothing and must be retried).
+#[derive(Debug)]
+pub enum SubmitVerdict {
+    /// Stored / processed.
+    Accepted(SubmitEventResponse),
+    /// The relay answered with a structured client-side refusal: HTTP 4xx
+    /// with a JSON body, or HTTP 200 with `accepted: false`. `error` is the
+    /// caller-facing message [`submit_signed_event_at_with_keys`] returns for
+    /// the same response; `relay_message` is the relay's own reason.
+    Refused {
+        error: String,
+        relay_message: String,
+    },
+}
+
 /// POST an already-signed event to an explicit relay with an explicit owner.
 ///
 /// Deferred/scoped publication uses this form so a workspace or identity
@@ -19,6 +36,22 @@ pub async fn submit_signed_event_at_with_keys(
     api_base_url: &str,
     keys: &nostr::Keys,
 ) -> Result<SubmitEventResponse, String> {
+    match submit_signed_event_verdict_at_with_keys(event, state, api_base_url, keys).await? {
+        SubmitVerdict::Accepted(response) => Ok(response),
+        SubmitVerdict::Refused { error, .. } => Err(error),
+    }
+}
+
+/// [`submit_signed_event_at_with_keys`] that keeps a structured refusal as an
+/// `Ok` verdict. Rate limiting (429), server errors, proxy interceptions and
+/// transport failures stay `Err`, exactly as before, so a caller can never
+/// mistake an outage for a refusal.
+pub async fn submit_signed_event_verdict_at_with_keys(
+    event: &nostr::Event,
+    state: &AppState,
+    api_base_url: &str,
+    keys: &nostr::Keys,
+) -> Result<SubmitVerdict, String> {
     if event.pubkey != keys.public_key() {
         return Err("signed event does not match the publishing identity".to_string());
     }
@@ -38,16 +71,40 @@ pub async fn submit_signed_event_at_with_keys(
         .await
         .map_err(|e| classify_request_error(&e))?;
 
-    if !response.status().is_success() {
-        return Err(relay_error_message(response).await);
+    let status = response.status();
+    if !status.is_success() {
+        let structured_refusal = status.is_client_error()
+            && status != reqwest::StatusCode::TOO_MANY_REQUESTS
+            && response
+                .headers()
+                .get(reqwest::header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok())
+                .is_some_and(|content_type| content_type.contains("json"));
+        let error = relay_error_message(response).await;
+        if structured_refusal {
+            // `relay_error_message` renders a JSON refusal as
+            // `relay returned <status>: <relay message>`.
+            let relay_message = error
+                .split_once(": ")
+                .map(|(_, message)| message.to_string())
+                .unwrap_or_else(|| error.clone());
+            return Ok(SubmitVerdict::Refused {
+                error,
+                relay_message,
+            });
+        }
+        return Err(error);
     }
 
     let result: SubmitEventResponse = parse_json_response(response).await?;
     if !result.accepted {
-        return Err(format!("relay rejected event: {}", result.message));
+        return Ok(SubmitVerdict::Refused {
+            error: format!("relay rejected event: {}", result.message),
+            relay_message: result.message,
+        });
     }
 
-    Ok(result)
+    Ok(SubmitVerdict::Accepted(result))
 }
 
 /// Sign with an explicit identity and POST the event to an explicit relay.

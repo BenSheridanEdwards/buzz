@@ -31,6 +31,7 @@ mod personas;
 mod process_lifecycle;
 pub(crate) mod readiness;
 pub(crate) mod reconcile;
+mod relay_membership;
 mod relay_mesh;
 mod repos;
 mod restore;
@@ -95,6 +96,10 @@ pub use process_lifecycle::*;
 pub(crate) use readiness::{
     agent_readiness, resolve_effective_agent_env, resolve_effective_harness_descriptor,
     AgentReadiness, Requirement,
+};
+pub use relay_membership::{
+    clear_relay_membership, load_relay_memberships, preflight_managed_agent_relay_membership,
+    relay_membership_for, ManagedAgentRelayMembership, RelayMembershipState, RelayMembershipStore,
 };
 pub use relay_mesh::*;
 pub use repos::{
