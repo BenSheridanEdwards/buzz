@@ -1,4 +1,5 @@
 import * as React from "react";
+import { ArrowUp, RotateCcw } from "lucide-react";
 import { toast } from "sonner";
 
 import {
@@ -6,27 +7,115 @@ import {
   isVoiceNoteFile,
   VOICE_NOTE_MAX_DURATION_SECONDS,
 } from "@/features/messages/lib/audioAttachment";
-import { useVoiceNoteRecorder } from "@/features/messages/lib/useVoiceNoteRecorder";
 import type { MediaUploadController } from "@/features/messages/lib/useMediaUpload";
+import { useVoiceNoteRecorder } from "@/features/messages/lib/useVoiceNoteRecorder";
+import { useVoiceNoteReviewEnabled } from "@/features/messages/lib/voiceNoteReviewPreference";
+import { useEscapeKey } from "@/shared/hooks/useEscapeKey";
+import { Button } from "@/shared/ui/button";
 import { VoiceNoteRecorder } from "./VoiceNoteRecorder";
+
+/**
+ * How a hold-to-record session was started. Pointer holds end on the matching
+ * pointer release; keyboard holds end when Space is released. Both end when
+ * the window loses focus (the hold cannot be observed any more), sending the
+ * note unless it was locked first.
+ */
+export type VoiceNoteHoldSource = "pointer" | "keyboard";
+
+/**
+ * A press released sooner than this is a tap, not a hold: it locks the
+ * recording hands free instead of sending a fraction of a second of audio.
+ */
+export const VOICE_NOTE_TAP_TO_LOCK_MS = 300;
+
+type Hold = {
+  release: () => void;
+  source: VoiceNoteHoldSource;
+  startedAt: number;
+};
+
+/**
+ * Why a hold ended. A `release` is the user letting go (pointer up, Space
+ * up) and may be a tap; an `interruption` (window blur, page hidden) is not a
+ * gesture, so it never locks.
+ */
+type HoldEnd = "release" | "interruption";
+
+type Outcome = "discarded" | "finished";
+
+function isPlainKey(event: {
+  altKey: boolean;
+  ctrlKey: boolean;
+  metaKey: boolean;
+  shiftKey: boolean;
+}): boolean {
+  return !event.altKey && !event.ctrlKey && !event.metaKey && !event.shiftKey;
+}
+
+function isSpaceKey(event: { code: string; key: string }): boolean {
+  return event.key === " " || event.code === "Space";
+}
+
+function isLockKey(event: { key: string }): boolean {
+  return event.key === "l" || event.key === "L";
+}
+
+function isEditableTarget(target: EventTarget | null): boolean {
+  if (!(target instanceof HTMLElement)) return false;
+  return (
+    target.isContentEditable ||
+    target instanceof HTMLInputElement ||
+    target instanceof HTMLTextAreaElement ||
+    target instanceof HTMLSelectElement
+  );
+}
 
 export function useComposerVoiceNote({
   draftKey,
   editTargetId,
+  focusEditor,
   media,
   setEmojiPickerOpen,
   setFormattingOpen,
+  submit,
 }: {
   draftKey: string | null | undefined;
   editTargetId: string | null;
+  /** Put the caret back in the editor (keyboard starts and row unmounts). */
+  focusEditor: () => void;
   media: MediaUploadController;
   setEmojiPickerOpen: (open: boolean) => void;
   setFormattingOpen: (open: boolean) => void;
+  /** Submit the composer once a finished note has been queued (review off). */
+  submit: () => void;
 }) {
   const recorder = useVoiceNoteRecorder();
+  const reviewEnabled = useVoiceNoteReviewEnabled();
+  const reviewEnabledRef = React.useRef(reviewEnabled);
+  reviewEnabledRef.current = reviewEnabled;
+  const submitRef = React.useRef(submit);
+  submitRef.current = submit;
+  const focusEditorRef = React.useRef(focusEditor);
+  focusEditorRef.current = focusEditor;
   const limitReachedRef = React.useRef(false);
   const statusRef = React.useRef(recorder.status);
   statusRef.current = recorder.status;
+  const startRef = React.useRef(recorder.start);
+  startRef.current = recorder.start;
+  // Mirrors `recorder.locked`, but set eagerly by `lock()` so a release that
+  // lands in the same tick as the lock never sends.
+  const lockedRef = React.useRef(recorder.locked);
+  lockedRef.current = recorder.locked;
+  const holdRef = React.useRef<Hold | null>(null);
+  // Rendered twin of `holdRef.current?.source`: the recorder row changes its
+  // lock affordance depending on which hand is busy.
+  const [holdSource, setHoldSource] =
+    React.useState<VoiceNoteHoldSource | null>(null);
+  const lockKeyHeldRef = React.useRef(false);
+  const pendingSubmitRef = React.useRef(false);
+  const outcomeRef = React.useRef<Outcome | null>(null);
+  const recorderRef = React.useRef<HTMLFieldSetElement | null>(null);
+  const [announcement, setAnnouncement] = React.useState("");
   const getAttachments = React.useCallback(
     () => ({
       pending: media.pendingImetaRef.current,
@@ -45,9 +134,26 @@ export function useComposerVoiceNote({
   currentContextRef.current = { draftKey, editTargetId };
   const recordingContextRef = React.useRef({ draftKey, editTargetId });
 
+  const releaseHold = React.useCallback(() => {
+    const hold = holdRef.current;
+    if (!hold) return null;
+    holdRef.current = null;
+    setHoldSource(null);
+    hold.release();
+    return hold;
+  }, []);
+
+  const discard = React.useCallback(() => {
+    releaseHold();
+    lockKeyHeldRef.current = false;
+    pendingSubmitRef.current = false;
+    if (statusRef.current !== "idle") outcomeRef.current = "discarded";
+    recorder.cancel();
+  }, [recorder.cancel, releaseHold]);
+
   // biome-ignore lint/correctness/useExhaustiveDependencies: composer identity fields are the cancellation triggers
   React.useEffect(() => {
-    recorder.cancel();
+    discard();
   }, [draftKey, editTargetId]);
 
   React.useEffect(() => {
@@ -68,6 +174,26 @@ export function useComposerVoiceNote({
     return recording;
   }, [recorder.stop, media.uploadFile]);
 
+  /**
+   * Finish the recording and, unless the review setting is on, submit the
+   * composer as soon as the queued note is visible to the send path.
+   */
+  const send = React.useCallback(async () => {
+    releaseHold();
+    lockKeyHeldRef.current = false;
+    // A flag left over from a note whose upload never materialised must not
+    // auto-send the next one past review.
+    pendingSubmitRef.current = false;
+    const status = statusRef.current;
+    if (status !== "recording" && status !== "paused") return null;
+    outcomeRef.current = "finished";
+    const recording = await finish();
+    pendingSubmitRef.current = recording !== null && !reviewEnabledRef.current;
+    return recording;
+  }, [finish, releaseHold]);
+  const sendRef = React.useRef(send);
+  sendRef.current = send;
+
   React.useEffect(() => {
     if (recorder.status === "idle") limitReachedRef.current = false;
     if (
@@ -76,26 +202,277 @@ export function useComposerVoiceNote({
       !limitReachedRef.current
     ) {
       limitReachedRef.current = true;
-      void finish();
+      void send();
     }
-  }, [finish, recorder.elapsedSeconds, recorder.status]);
+  }, [send, recorder.elapsedSeconds, recorder.status]);
 
-  const toggle = React.useCallback(() => {
-    if (statusRef.current === "recording") {
-      void finish();
-      return;
-    }
+  /** A voice note must be the only attachment. */
+  const canStart = React.useCallback(() => {
     const attachments = getAttachmentsRef.current();
-    if (attachments.pending.length > 0 || attachments.queued.length > 0) {
-      toast.error("A voice note must be the only attachment.");
-      return;
-    }
-    recordingContextRef.current = currentContextRef.current;
-    onBeforeStartRef.current();
-    void recorder.start();
-  }, [finish, recorder.start]);
+    return attachments.pending.length === 0 && attachments.queued.length === 0;
+  }, []);
 
-  const cancel = recorder.cancel;
+  const acceptsStart = React.useCallback(() => {
+    if (canStart()) return true;
+    toast.error("A voice note must be the only attachment.");
+    return false;
+  }, [canStart]);
+
+  const beginRecording = React.useCallback(
+    ({ locked }: { locked: boolean }) => {
+      recordingContextRef.current = currentContextRef.current;
+      outcomeRef.current = null;
+      onBeforeStartRef.current();
+      lockedRef.current = locked;
+      void startRef.current();
+      if (locked) recorder.lock();
+    },
+    [recorder.lock],
+  );
+
+  const lock = React.useCallback(() => {
+    const status = statusRef.current;
+    if (status !== "recording" && status !== "requesting") return;
+    if (lockedRef.current) return;
+    lockedRef.current = true;
+    recorder.lock();
+  }, [recorder.lock]);
+
+  const endHold = React.useCallback(
+    (end: HoldEnd = "release") => {
+      const hold = releaseHold();
+      if (!hold) return;
+      if (lockedRef.current) return;
+      const status = statusRef.current;
+      const isTap =
+        end === "release" &&
+        performance.now() - hold.startedAt < VOICE_NOTE_TAP_TO_LOCK_MS;
+      if (status === "requesting") {
+        // A tap means "record hands free": the lock takes effect the moment
+        // the microphone arrives. An interrupted hold has nothing to keep.
+        if (isTap) lock();
+        else recorder.cancel();
+        return;
+      }
+      if (status !== "recording" && status !== "paused") return;
+      if (isTap) lock();
+      else void sendRef.current();
+    },
+    [lock, recorder.cancel, releaseHold],
+  );
+  const endHoldRef = React.useRef(endHold);
+  endHoldRef.current = endHold;
+  const endPointerHold = React.useCallback(() => endHold("release"), [endHold]);
+
+  const beginHold = React.useCallback(
+    (source: VoiceNoteHoldSource) => {
+      if (holdRef.current || statusRef.current !== "idle") return;
+      if (!acceptsStart()) return;
+      const onRelease = () => endHoldRef.current("release");
+      const onInterruption = () => endHoldRef.current("interruption");
+      const onKeyUp = (event: KeyboardEvent) => {
+        if (isSpaceKey(event)) endHoldRef.current("release");
+      };
+      const onVisibilityChange = () => {
+        if (document.visibilityState === "hidden") onInterruption();
+      };
+      window.addEventListener("blur", onInterruption);
+      document.addEventListener("visibilitychange", onVisibilityChange);
+      if (source === "pointer") {
+        window.addEventListener("pointerup", onRelease);
+        window.addEventListener("pointercancel", onRelease);
+      } else {
+        window.addEventListener("keyup", onKeyUp);
+      }
+      holdRef.current = {
+        release: () => {
+          window.removeEventListener("blur", onInterruption);
+          document.removeEventListener("visibilitychange", onVisibilityChange);
+          window.removeEventListener("pointerup", onRelease);
+          window.removeEventListener("pointercancel", onRelease);
+          window.removeEventListener("keyup", onKeyUp);
+        },
+        source,
+        startedAt: performance.now(),
+      };
+      setHoldSource(source);
+      beginRecording({ locked: false });
+    },
+    [acceptsStart, beginRecording],
+  );
+
+  const beginPointerHold = React.useCallback(
+    () => beginHold("pointer"),
+    [beginHold],
+  );
+
+  /**
+   * Click activation (Enter or Space on the focused mic, or assistive
+   * technology) has no release to wait for, so it starts hands free. The mic
+   * leaves the toolbar with the recorder's arrival, so focus moves to the
+   * editor instead of dying with it.
+   */
+  const startLocked = React.useCallback(() => {
+    if (holdRef.current || statusRef.current !== "idle") return;
+    if (!acceptsStart()) return;
+    beginRecording({ locked: true });
+    focusEditorRef.current();
+  }, [acceptsStart, beginRecording]);
+
+  const releaseKeyboardHold = React.useCallback(() => {
+    if (holdRef.current?.source === "keyboard") {
+      endHoldRef.current("interruption");
+    }
+  }, []);
+
+  /**
+   * Editor key path. Space (plain, editor empty) holds to record; Esc discards;
+   * L locks a keyboard hold. Returns true when the key was consumed.
+   */
+  const handleEditorKeyDown = React.useCallback(
+    (
+      event: React.KeyboardEvent<HTMLElement>,
+      { editorEmpty }: { editorEmpty: boolean },
+    ): boolean => {
+      // Mid-composition keys belong to the IME (Space picks a candidate).
+      if (event.nativeEvent.isComposing) return false;
+      const status = statusRef.current;
+      if (isSpaceKey(event)) {
+        // Shift+Space and other chords are not Space: they keep typing.
+        if (!isPlainKey(event)) return false;
+        if (holdRef.current?.source === "keyboard") {
+          // Auto-repeat while the hold lasts must not type spaces.
+          event.preventDefault();
+          return true;
+        }
+        if (status !== "idle" || !editorEmpty || event.repeat) return false;
+        // Beside another attachment Space is just a space: no toast, no swallow.
+        if (!canStart()) return false;
+        event.preventDefault();
+        beginHold("keyboard");
+        return true;
+      }
+      if (status === "idle") return false;
+      if (event.key === "Escape") {
+        event.preventDefault();
+        discard();
+        return true;
+      }
+      if (isLockKey(event) && isPlainKey(event)) {
+        if (lockKeyHeldRef.current) {
+          // Holding L: swallow the auto-repeat instead of typing "l".
+          event.preventDefault();
+          return true;
+        }
+        // Only a Space hold makes L a shortcut here: Space is down, so the
+        // key cannot be typing. During a pointer hold "l" is a letter.
+        if (holdRef.current?.source !== "keyboard") return false;
+        if (event.repeat || lockedRef.current) return false;
+        if (status !== "recording" && status !== "requesting") return false;
+        event.preventDefault();
+        lockKeyHeldRef.current = true;
+        lock();
+        return true;
+      }
+      return false;
+    },
+    [beginHold, canStart, discard, lock],
+  );
+
+  // Esc discards from anywhere: the recorder is a closable surface, so the
+  // app-level Esc shortcut (mark channel read) yields to it instead of
+  // winning on listener order.
+  const active = recorder.status !== "idle";
+  useEscapeKey(discard, active);
+
+  // Outside the editor (a focused chip, toolbar control, or nothing at all
+  // during a pointer hold), L still locks; the editor path handles typing.
+  React.useEffect(() => {
+    if (!active) return;
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.defaultPrevented || event.isComposing) return;
+      if (
+        isLockKey(event) &&
+        isPlainKey(event) &&
+        !event.repeat &&
+        !isEditableTarget(event.target)
+      ) {
+        lockKeyHeldRef.current = true;
+        lock();
+      }
+    };
+    const onKeyUp = (event: KeyboardEvent) => {
+      if (isLockKey(event)) lockKeyHeldRef.current = false;
+    };
+    window.addEventListener("keydown", onKeyDown);
+    window.addEventListener("keyup", onKeyUp);
+    return () => {
+      window.removeEventListener("keydown", onKeyDown);
+      window.removeEventListener("keyup", onKeyUp);
+      lockKeyHeldRef.current = false;
+    };
+  }, [active, lock]);
+
+  React.useEffect(
+    () => () => {
+      releaseHold();
+    },
+    [releaseHold],
+  );
+
+  // Announce transitions, never the ticking clock. The region itself lives in
+  // the composer (always mounted) so "sent" and "discarded" are still heard
+  // after the row is gone.
+  const previousStatusRef = React.useRef(recorder.status);
+  const previousLockedRef = React.useRef(recorder.locked);
+  React.useEffect(() => {
+    const previousStatus = previousStatusRef.current;
+    const previousLocked = previousLockedRef.current;
+    previousStatusRef.current = recorder.status;
+    previousLockedRef.current = recorder.locked;
+    const status = recorder.status;
+    let next: string | null = null;
+    if (status !== previousStatus) {
+      if (status === "requesting") next = "Waiting for microphone";
+      else if (status === "recording" && previousStatus === "paused") {
+        next = "Recording resumed";
+      } else if (status === "recording") {
+        next = recorder.locked
+          ? "Recording voice note, hands free"
+          : "Recording voice note, release to send";
+      } else if (status === "paused") next = "Recording paused";
+      else if (status === "processing") next = "Preparing voice note";
+      else if (status === "idle") {
+        const outcome = outcomeRef.current;
+        outcomeRef.current = null;
+        if (outcome === "discarded") next = "Voice note discarded";
+        else if (outcome === "finished") {
+          next = reviewEnabledRef.current
+            ? "Voice note ready to review"
+            : "Voice note sent";
+        }
+      }
+    } else if (status === "recording" && recorder.locked && !previousLocked) {
+      next = "Recording locked, hands free";
+    }
+    if (next !== null) setAnnouncement(next);
+  }, [recorder.locked, recorder.status]);
+
+  // Focus never dies with a control that just left (rule 7): a lock replaces
+  // the chip with pause, and the row's departure hands focus to the editor.
+  React.useEffect(() => {
+    if (recorder.status !== "idle") return;
+    const activeElement = document.activeElement;
+    const row = recorderRef.current;
+    if (
+      activeElement === null ||
+      activeElement === document.body ||
+      row?.contains(activeElement)
+    ) {
+      focusEditorRef.current();
+    }
+  }, [recorder.status]);
+
   const attachments = getAttachments();
   const hasAttachment =
     attachments.pending.some((attachment) =>
@@ -106,6 +483,15 @@ export function useComposerVoiceNote({
     ) || attachments.queued.some(({ file }) => isVoiceNoteFile(file));
   const hasAttachmentRef = React.useRef(hasAttachment);
   hasAttachmentRef.current = hasAttachment;
+
+  // With review off, the note sends itself once the recorder is idle and the
+  // queued file is visible to the send path (both land after `finish`).
+  React.useEffect(() => {
+    if (!pendingSubmitRef.current) return;
+    if (recorder.status !== "idle" || !hasAttachment) return;
+    pendingSubmitRef.current = false;
+    submitRef.current();
+  }, [hasAttachment, recorder.status]);
 
   const acceptsNewAttachment = React.useCallback(() => {
     const attachments = getAttachmentsRef.current();
@@ -141,27 +527,99 @@ export function useComposerVoiceNote({
     [acceptsNewAttachment, media.setPendingImeta],
   );
 
+  const rerecord = React.useCallback(() => {
+    if (statusRef.current !== "idle") return;
+    const attachments = getAttachmentsRef.current();
+    for (const attachment of attachments.queued) {
+      if (isVoiceNoteFile(attachment.file)) {
+        media.removeQueuedAttachment(attachment.id);
+      }
+    }
+    for (const attachment of attachments.pending) {
+      if (
+        isVoiceNoteAttachment({
+          filename: attachment.filename,
+          m: attachment.type,
+        })
+      ) {
+        media.removeAttachment(attachment.url);
+      }
+    }
+    beginRecording({ locked: true });
+  }, [beginRecording, media.removeAttachment, media.removeQueuedAttachment]);
+
+  const submitReview = React.useCallback(() => submitRef.current(), []);
+
+  const reviewElement =
+    reviewEnabled && hasAttachment && recorder.status === "idle" ? (
+      <div
+        className="mb-2 flex items-center gap-2"
+        data-testid="voice-note-review"
+      >
+        <Button onClick={rerecord} size="sm" type="button" variant="outline">
+          <RotateCcw aria-hidden="true" className="h-3.5 w-3.5" />
+          Re-record
+        </Button>
+        <Button
+          data-testid="voice-note-review-send"
+          onClick={submitReview}
+          size="sm"
+          type="button"
+        >
+          <ArrowUp aria-hidden="true" className="h-3.5 w-3.5" />
+          Send voice note
+        </Button>
+      </div>
+    ) : null;
+
+  const liveRegionElement = (
+    <div
+      aria-live="polite"
+      className="sr-only"
+      data-testid="voice-note-live-status"
+      role="status"
+    >
+      {announcement}
+    </div>
+  );
+
   return {
     ...recorder,
     acceptsAttachment: recorder.status === "idle" && !hasAttachment,
+    beginPointerHold,
+    discard,
+    endHold: endPointerHold,
+    finish,
+    handleEditorKeyDown,
     hasAttachment,
     hasAttachmentRef,
     isIdle: recorder.status === "idle",
+    liveRegionElement,
+    lock,
     recorderElement:
       recorder.status === "idle" ? null : (
         <VoiceNoteRecorder
+          containerRef={recorderRef}
           elapsedSeconds={recorder.elapsedSeconds}
+          holdSource={holdSource}
           levels={recorder.levels}
+          locked={recorder.locked}
           maxDurationSeconds={VOICE_NOTE_MAX_DURATION_SECONDS}
-          onCancel={cancel}
+          onCancel={discard}
+          onLock={lock}
+          onPause={recorder.pause}
+          onResume={recorder.resume}
+          paused={recorder.status === "paused"}
           processing={recorder.status === "processing"}
           requesting={recorder.status === "requesting"}
         />
       ),
-    statusRef,
+    releaseKeyboardHold,
+    reviewElement,
+    send,
     setPendingImetaWhenIdle,
-    finish,
-    toggle,
+    startLocked,
+    statusRef,
     uploadFileWhenIdle,
   };
 }

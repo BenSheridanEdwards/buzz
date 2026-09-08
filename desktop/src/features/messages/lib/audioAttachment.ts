@@ -1,4 +1,6 @@
 export type AudioAttachmentImetaEntry = {
+  /** NIP-92 `alt`: for a voice note, the sender-supplied transcript. */
+  alt?: string;
   duration?: number;
   filename?: string;
   m?: string;
@@ -66,7 +68,7 @@ export function formatVoiceNoteDuration(seconds: number): string {
   return `${minutes}:${String(rounded % 60).padStart(2, "0")}`;
 }
 
-export const VOICE_NOTE_PLAYBACK_RATES = [1, 1.5, 2, 0.5] as const;
+export const VOICE_NOTE_PLAYBACK_RATES = [1, 1.5, 2] as const;
 
 export function nextVoiceNotePlaybackRate(currentRate: number): number {
   const currentIndex = VOICE_NOTE_PLAYBACK_RATES.indexOf(
@@ -75,6 +77,83 @@ export function nextVoiceNotePlaybackRate(currentRate: number): number {
   return VOICE_NOTE_PLAYBACK_RATES[
     (currentIndex + 1) % VOICE_NOTE_PLAYBACK_RATES.length
   ];
+}
+
+/** Where a received voice note is shown; decides the transcript default. */
+export type VoiceNoteConversationContext = "dm" | "channel";
+
+export const VOICE_NOTE_TRANSCRIPT_STORAGE_KEY =
+  "buzz.voiceNote.transcriptOpen";
+
+type TranscriptPreferenceStorage = Pick<Storage, "getItem" | "setItem">;
+
+function defaultTranscriptStorage(): TranscriptPreferenceStorage | undefined {
+  try {
+    return globalThis.localStorage ?? undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/** Transcripts start open in DMs and folded in channels. */
+export function transcriptDefaultOpen(
+  context: VoiceNoteConversationContext,
+): boolean {
+  return context === "dm";
+}
+
+/**
+ * Last transcript fold choice on this device, or `null` when nothing was
+ * stored or storage is unavailable (WKWebView can throw on `getItem`).
+ */
+export function readTranscriptPreference(
+  storage: TranscriptPreferenceStorage | undefined = defaultTranscriptStorage(),
+): boolean | null {
+  try {
+    const stored = storage?.getItem(VOICE_NOTE_TRANSCRIPT_STORAGE_KEY);
+    if (stored === "open") return true;
+    if (stored === "closed") return false;
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+/** Remember the transcript fold choice; persistence is best-effort. */
+export function writeTranscriptPreference(
+  open: boolean,
+  storage: TranscriptPreferenceStorage | undefined = defaultTranscriptStorage(),
+): void {
+  try {
+    storage?.setItem(
+      VOICE_NOTE_TRANSCRIPT_STORAGE_KEY,
+      open ? "open" : "closed",
+    );
+  } catch {
+    // Storage denied or full: the in-memory state still applies.
+  }
+}
+
+/** The transcript starts from the remembered choice, else the context default. */
+export function resolveTranscriptOpen(
+  context: VoiceNoteConversationContext,
+  storage: TranscriptPreferenceStorage | undefined = defaultTranscriptStorage(),
+): boolean {
+  return readTranscriptPreference(storage) ?? transcriptDefaultOpen(context);
+}
+
+/**
+ * The transcript of a received voice note is the attachment's own `alt`
+ * text (NIP-92 imeta), written by the sender or its transcriber. Prose in the
+ * message body is a caption, not a transcript: it stays in the body. Returns
+ * `undefined` for anything that is not a voice note or carries no `alt`.
+ */
+export function voiceNoteTranscript(
+  entry: AudioAttachmentImetaEntry | undefined,
+): string | undefined {
+  if (!isVoiceNoteAttachment(entry)) return undefined;
+  const transcript = entry?.alt?.trim();
+  return transcript ? transcript : undefined;
 }
 
 const QUIET_LEVEL_THRESHOLD = 0.16;

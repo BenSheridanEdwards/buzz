@@ -7,12 +7,19 @@ import {
   isVoiceNoteAttachment,
   isVoiceNoteFile,
   nextVoiceNotePlaybackRate,
+  readTranscriptPreference,
   resolveAudioAttachment,
+  resolveTranscriptOpen,
   summarizeWaveform,
+  transcriptDefaultOpen,
   VOICE_NOTE_MAX_DURATION_SECONDS,
+  VOICE_NOTE_PLAYBACK_RATES,
+  VOICE_NOTE_TRANSCRIPT_STORAGE_KEY,
   voiceNoteBarHeight,
+  voiceNoteTranscript,
   waveformPeaks,
   WAVEFORM_SUMMARY_RESOLUTION,
+  writeTranscriptPreference,
 } from "./audioAttachment.ts";
 
 test("isVoiceNoteFile scopes deferred audio uploads to recorder output", () => {
@@ -141,12 +148,94 @@ test("voice notes have a five-minute recording limit", () => {
   );
 });
 
-test("nextVoiceNotePlaybackRate follows the voice-note speed cycle", () => {
+test("nextVoiceNotePlaybackRate cycles 1x, 1.5x, 2x and back", () => {
+  assert.deepEqual([...VOICE_NOTE_PLAYBACK_RATES], [1, 1.5, 2]);
   assert.equal(nextVoiceNotePlaybackRate(1), 1.5);
   assert.equal(nextVoiceNotePlaybackRate(1.5), 2);
-  assert.equal(nextVoiceNotePlaybackRate(2), 0.5);
+  assert.equal(nextVoiceNotePlaybackRate(2), 1);
+  // A rate outside the cycle (the retired 0.5x) resumes from 1x.
   assert.equal(nextVoiceNotePlaybackRate(0.5), 1);
   assert.equal(nextVoiceNotePlaybackRate(99), 1);
+});
+
+test("transcripts default open in DMs and folded in channels", () => {
+  assert.equal(transcriptDefaultOpen("dm"), true);
+  assert.equal(transcriptDefaultOpen("channel"), false);
+  assert.equal(resolveTranscriptOpen("dm", undefined), true);
+  assert.equal(resolveTranscriptOpen("channel", undefined), false);
+});
+
+test("transcript preference round-trips through storage", () => {
+  const store = new Map();
+  const storage = {
+    getItem: (key) => store.get(key) ?? null,
+    setItem: (key, value) => store.set(key, value),
+  };
+  assert.equal(readTranscriptPreference(storage), null);
+
+  writeTranscriptPreference(false, storage);
+  assert.equal(store.get(VOICE_NOTE_TRANSCRIPT_STORAGE_KEY), "closed");
+  assert.equal(readTranscriptPreference(storage), false);
+  // The remembered choice wins over the DM default.
+  assert.equal(resolveTranscriptOpen("dm", storage), false);
+
+  writeTranscriptPreference(true, storage);
+  assert.equal(readTranscriptPreference(storage), true);
+  assert.equal(resolveTranscriptOpen("channel", storage), true);
+
+  store.set(VOICE_NOTE_TRANSCRIPT_STORAGE_KEY, "garbage");
+  assert.equal(readTranscriptPreference(storage), null);
+});
+
+test("a throwing localStorage never breaks the transcript default", () => {
+  const throwing = {
+    getItem() {
+      throw new DOMException("denied", "SecurityError");
+    },
+    setItem() {
+      throw new DOMException("denied", "SecurityError");
+    },
+  };
+  assert.equal(readTranscriptPreference(throwing), null);
+  assert.doesNotThrow(() => writeTranscriptPreference(true, throwing));
+  assert.equal(resolveTranscriptOpen("dm", throwing), true);
+  assert.equal(resolveTranscriptOpen("channel", throwing), false);
+});
+
+test("the transcript is the voice note's own alt text, never the body", () => {
+  const voiceNote = {
+    alt: "  Status is green on the Studio.\nSay the word.  ",
+    filename: "voice-note-1.mp4",
+    m: "video/mp4",
+  };
+  assert.equal(
+    voiceNoteTranscript(voiceNote),
+    "Status is green on the Studio.\nSay the word.",
+  );
+  // No alt, or a blank one: no transcript row.
+  assert.equal(
+    voiceNoteTranscript({ filename: "voice-note-1.mp4", m: "video/mp4" }),
+    undefined,
+  );
+  assert.equal(voiceNoteTranscript({ ...voiceNote, alt: "   " }), undefined);
+  // Alt text on other media is a description, not a transcript.
+  assert.equal(
+    voiceNoteTranscript({
+      alt: "A photo",
+      filename: "pic.png",
+      m: "image/png",
+    }),
+    undefined,
+  );
+  assert.equal(
+    voiceNoteTranscript({
+      alt: "Lyrics",
+      filename: "song.mp3",
+      m: "audio/mpeg",
+    }),
+    undefined,
+  );
+  assert.equal(voiceNoteTranscript(undefined), undefined);
 });
 
 test("waveformPeaks produces normalized accessible-height bars", () => {

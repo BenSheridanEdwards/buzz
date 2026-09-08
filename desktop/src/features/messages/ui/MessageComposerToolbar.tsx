@@ -44,6 +44,7 @@ export const MessageComposerToolbar = React.memo(
     isFormattingOpen,
     isSending,
     isUploading,
+    isVoiceNoteLocked = false,
     isVoiceNoteProcessing = false,
     isVoiceNoteRecording = false,
     hasVoiceNoteAttachment = false,
@@ -58,8 +59,10 @@ export const MessageComposerToolbar = React.memo(
     onLinkButton,
     onOpenMentionPicker,
     onPaperclip,
-    onFinishVoiceNote,
+    onSendVoiceNote,
     onVoiceNote,
+    onVoiceNoteHoldEnd,
+    onVoiceNoteHoldStart,
     onRemoveAddressedAgent = ignoreAddressRemoval,
     pulseVersionByPubkey,
     sendDisabled,
@@ -76,6 +79,9 @@ export const MessageComposerToolbar = React.memo(
     isFormattingOpen: boolean;
     isSending: boolean;
     isUploading: boolean;
+    /** Hands-free recording: the send slot becomes a full-width Send. */
+    isVoiceNoteLocked?: boolean;
+    /** Waiting for the microphone or encoding: Send is not yet possible. */
     isVoiceNoteProcessing?: boolean;
     isVoiceNoteRecording?: boolean;
     hasVoiceNoteAttachment?: boolean;
@@ -90,14 +96,41 @@ export const MessageComposerToolbar = React.memo(
     onLinkButton: () => void;
     onOpenMentionPicker: () => void;
     onPaperclip: () => void;
-    onFinishVoiceNote?: () => void;
+    /** Finish the live recording and send it (Send slot, Enter on it). */
+    onSendVoiceNote?: () => void;
+    /** Click activation without a pointer hold: keyboard or assistive tech. */
     onVoiceNote?: () => void;
+    /** Pointer released; the composer decides whether that sends. */
+    onVoiceNoteHoldEnd?: () => void;
+    /** Primary pointer pressed on the mic: hold to record. */
+    onVoiceNoteHoldStart?: () => void;
     onRemoveAddressedAgent?: (pubkey: string) => void;
     pulseVersionByPubkey?: Readonly<Record<string, number>>;
     sendDisabled: boolean;
     shakeVersionByPubkey?: Readonly<Record<string, number>>;
   }) {
     const shouldReduceMotion = useReducedMotion();
+    const handleMicPointerDown = React.useCallback(
+      (event: React.PointerEvent<HTMLButtonElement>) => {
+        if (event.button !== 0 || event.currentTarget.disabled) return;
+        // Keep focus in the editor so Esc and L reach the recorder keys.
+        event.preventDefault();
+        onVoiceNoteHoldStart?.();
+      },
+      [onVoiceNoteHoldStart],
+    );
+    const handleMicPointerUp = React.useCallback(() => {
+      onVoiceNoteHoldEnd?.();
+    }, [onVoiceNoteHoldEnd]);
+    const handleMicClick = React.useCallback(
+      (event: React.MouseEvent<HTMLButtonElement>) => {
+        // Pointer clicks (detail >= 1) already ran as a hold; keyboard and
+        // assistive activation arrive with detail 0 and start hands free.
+        if (event.detail > 0) return;
+        onVoiceNote?.();
+      },
+      [onVoiceNote],
+    );
 
     return (
       <div
@@ -265,9 +298,14 @@ export const MessageComposerToolbar = React.memo(
                     <TooltipTrigger asChild>
                       <Button
                         aria-label="Record voice note"
+                        className="touch-none select-none"
+                        data-testid="record-voice-note"
                         disabled={composerDisabled || isUploading}
-                        onClick={onVoiceNote}
+                        onClick={handleMicClick}
                         onMouseDown={onCaptureSelection}
+                        onPointerCancel={handleMicPointerUp}
+                        onPointerDown={handleMicPointerDown}
+                        onPointerUp={handleMicPointerUp}
                         size="icon"
                         type="button"
                         variant="ghost"
@@ -323,12 +361,11 @@ export const MessageComposerToolbar = React.memo(
           {extraActions}
           <ComposerSendButton
             isSending={isSending}
-            onFinishVoiceNote={
-              isVoiceNoteRecording ? onFinishVoiceNote : undefined
-            }
+            onSendVoiceNote={isVoiceNoteRecording ? onSendVoiceNote : undefined}
             sendDisabled={
               isVoiceNoteRecording ? isVoiceNoteProcessing : sendDisabled
             }
+            voiceNoteLocked={isVoiceNoteRecording && isVoiceNoteLocked}
           />
         </div>
       </div>

@@ -41,6 +41,10 @@ import { parseImetaTags } from "@/shared/ui/markdown/parseImeta";
 import { useMessageEmoji } from "@/features/messages/lib/useMessageEmoji";
 import { parseWaveMessageContent } from "@/features/messages/lib/waveMessage";
 import { resolveSnapshotSharedBy } from "@/features/messages/lib/snapshotSharedBy";
+import { isVoiceNoteAttachment } from "@/features/messages/lib/audioAttachment";
+import { getChannelIdFromTags } from "@/features/messages/lib/threading";
+import { Markdown } from "@/shared/ui/markdown";
+import type { VoiceNoteCardContext } from "@/shared/ui/markdown/types";
 import { resolveMentionProps } from "@/shared/lib/resolveMentionNames";
 import type { VideoReviewContext } from "@/shared/ui/VideoPlayer";
 import { VideoReviewCommentMarkdown } from "@/shared/ui/VideoReviewCommentMarkdown";
@@ -302,7 +306,55 @@ export const MessageRow = React.memo(
     );
     const bodyOffsetClass = emojiOnly ? "mt-1" : "mt-conversation-body";
 
-    const { nonDmChannelNames: channelNames } = useChannelNavigation();
+    const { channels, nonDmChannelNames: channelNames } =
+      useChannelNavigation();
+    // A received voice note's transcript (its imeta `alt`) renders through the
+    // same Markdown pipeline as the body; the body itself is left untouched so
+    // captions and other attachments in the message keep rendering normally.
+    const renderVoiceNoteTranscript = React.useCallback(
+      (transcript: string) => (
+        <Markdown
+          content={transcript}
+          customEmoji={customEmoji}
+          interactive={false}
+          mentionNames={mentionNames}
+        />
+      ),
+      [customEmoji, mentionNames],
+    );
+    // Search results and other hosts render rows without a `channelId`; the
+    // event's own `h` tag still says which conversation it belongs to.
+    const conversationChannelId =
+      channelId ?? getChannelIdFromTags(message.tags ?? []);
+    const voiceNoteCard = React.useMemo<
+      VoiceNoteCardContext | undefined
+    >(() => {
+      if (!imetaByUrl) return undefined;
+      let hasVoiceNote = false;
+      for (const entry of imetaByUrl.values()) {
+        if (isVoiceNoteAttachment(entry)) {
+          hasVoiceNote = true;
+          break;
+        }
+      }
+      if (!hasVoiceNote) return undefined;
+      const conversation =
+        channels.find((channel) => channel.id === conversationChannelId)
+          ?.channelType === "dm"
+          ? "dm"
+          : "channel";
+      return {
+        conversation,
+        renderTranscript: renderVoiceNoteTranscript,
+        sender: message.author,
+      };
+    }, [
+      channels,
+      conversationChannelId,
+      imetaByUrl,
+      message.author,
+      renderVoiceNoteTranscript,
+    ]);
 
     const indentRem = getThreadReplyIndentRem(message.depth);
     const descendantGuideOffsetRem = connectDescendants
@@ -445,6 +497,7 @@ export const MessageRow = React.memo(
               snapshotSharedBy={snapshotSharedBy}
               videoReviewCommentRootId={videoReviewCommentRootId}
               videoReviewContext={videoReviewContext}
+              voiceNoteCard={voiceNoteCard}
             />
           );
         }

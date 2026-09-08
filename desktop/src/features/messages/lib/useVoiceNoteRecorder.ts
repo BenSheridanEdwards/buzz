@@ -19,15 +19,35 @@ export type VoiceNoteRecording = {
   file: File;
 };
 
+export type VoiceNoteRecorderStatus =
+  | "idle"
+  | "requesting"
+  | "recording"
+  | "paused"
+  | "processing";
+
 type RecordingSession = {
   cancelled: boolean;
   chunks: Blob[];
   context: AudioContext | null;
+  /** `performance.now()` when the current pause began, or null while live. */
+  pausedAt: number | null;
+  /** Total milliseconds spent paused; subtracted from the elapsed clock. */
+  pausedTotal: number;
   recorder: MediaRecorder | null;
   resolveStop: ((recording: VoiceNoteRecording | null) => void) | null;
   startedAt: number;
   stream: MediaStream | null;
 };
+
+function sessionElapsedSeconds(session: RecordingSession, now: number): number {
+  const pausedNow =
+    session.pausedAt === null ? 0 : Math.max(0, now - session.pausedAt);
+  return Math.max(
+    0,
+    (now - session.startedAt - session.pausedTotal - pausedNow) / 1000,
+  );
+}
 
 function releaseSessionAudio(session: RecordingSession) {
   session.stream?.getTracks().forEach((track) => {
@@ -42,12 +62,13 @@ function releaseSessionAudio(session: RecordingSession) {
 export function useVoiceNoteRecorder() {
   const mountedRef = React.useRef(true);
   const sessionRef = React.useRef<RecordingSession | null>(null);
-  const [status, setStatus] = React.useState<
-    "idle" | "requesting" | "recording" | "processing"
-  >("idle");
+  const [status, setStatus] = React.useState<VoiceNoteRecorderStatus>("idle");
   const [elapsedSeconds, setElapsedSeconds] = React.useState(0);
   const [levels, setLevels] = React.useState<number[]>([]);
   const [error, setError] = React.useState<string | null>(null);
+  // Hands-free mode: the recording keeps going after the hold is released and
+  // waits for an explicit Send, pause, or discard.
+  const [locked, setLocked] = React.useState(false);
 
   const cancel = React.useCallback(() => {
     const session = sessionRef.current;
@@ -62,6 +83,7 @@ export function useVoiceNoteRecorder() {
     if (mountedRef.current) {
       setStatus("idle");
       setElapsedSeconds(0);
+      setLocked(false);
     }
   }, []);
 
@@ -77,12 +99,15 @@ export function useVoiceNoteRecorder() {
       cancelled: false,
       chunks: [],
       context: null,
+      pausedAt: null,
+      pausedTotal: 0,
       recorder: null,
       resolveStop: null,
       startedAt: 0,
       stream: null,
     };
     sessionRef.current = session;
+    setLocked(false);
     setStatus("requesting");
 
     try {
@@ -166,6 +191,7 @@ export function useVoiceNoteRecorder() {
             if (mountedRef.current) {
               setStatus("idle");
               setElapsedSeconds(0);
+              setLocked(false);
             }
           }
           session.resolveStop?.(recording);
@@ -183,13 +209,16 @@ export function useVoiceNoteRecorder() {
       const samples = new Uint8Array(analyser.fftSize);
       const levelTimer = window.setInterval(() => {
         if (
-          recorder.state !== "recording" ||
+          recorder.state === "inactive" ||
           session.cancelled ||
           sessionRef.current !== session
         ) {
           window.clearInterval(levelTimer);
           return;
         }
+        // A paused recording keeps its timer so resume continues the same
+        // session, but neither the clock nor the waveform advances.
+        if (recorder.state === "paused" || session.pausedAt !== null) return;
         analyser.getByteTimeDomainData(samples);
         let sumSquares = 0;
         for (const sample of samples) {
@@ -200,7 +229,7 @@ export function useVoiceNoteRecorder() {
         const level = Math.min(1, rms * 5.5);
         if (!mountedRef.current) return;
         setLevels((previous) => [...previous, level]);
-        setElapsedSeconds((performance.now() - session.startedAt) / 1000);
+        setElapsedSeconds(sessionElapsedSeconds(session, performance.now()));
       }, 90);
     } catch (cause) {
       releaseSessionAudio(session);
@@ -213,6 +242,7 @@ export function useVoiceNoteRecorder() {
       }
       sessionRef.current = null;
       setStatus("idle");
+      setLocked(false);
       const denied =
         cause instanceof DOMException &&
         (cause.name === "NotAllowedError" || cause.name === "SecurityError");
@@ -244,6 +274,34 @@ export function useVoiceNoteRecorder() {
     [cancel],
   );
 
+  const pause = React.useCallback(() => {
+    const session = sessionRef.current;
+    const recorder = session?.recorder;
+    if (!session || !recorder || recorder.state !== "recording") return;
+    if (session.pausedAt !== null) return;
+    session.pausedAt = performance.now();
+    recorder.pause();
+    setElapsedSeconds(sessionElapsedSeconds(session, session.pausedAt));
+    setStatus("paused");
+  }, []);
+
+  const resume = React.useCallback(() => {
+    const session = sessionRef.current;
+    const recorder = session?.recorder;
+    if (!session || !recorder || recorder.state !== "paused") return;
+    if (session.pausedAt !== null) {
+      session.pausedTotal += Math.max(0, performance.now() - session.pausedAt);
+      session.pausedAt = null;
+    }
+    recorder.resume();
+    setStatus("recording");
+  }, []);
+
+  const lock = React.useCallback(() => {
+    if (!sessionRef.current) return;
+    setLocked(true);
+  }, []);
+
   React.useEffect(() => {
     mountedRef.current = true;
     return () => {
@@ -257,6 +315,10 @@ export function useVoiceNoteRecorder() {
     elapsedSeconds,
     error,
     levels,
+    lock,
+    locked,
+    pause,
+    resume,
     start,
     status,
     stop,

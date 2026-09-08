@@ -1,5 +1,5 @@
 import { AgentManagementMarker } from "@/features/agents/ui/OtherSetupAgentMarker";
-import { ArrowUp, AtSign, Square, X } from "lucide-react";
+import { ArrowUp, AtSign, X } from "lucide-react";
 import {
   AnimatePresence,
   motion,
@@ -314,36 +314,43 @@ export function ComposerMentionButton({
 
 export function ComposerSendButton({
   isSending,
-  onFinishVoiceNote,
+  onSendVoiceNote,
   sendDisabled,
+  voiceNoteLocked = false,
 }: {
   isSending: boolean;
-  onFinishVoiceNote?: () => void;
+  /** Present while a voice note is live: the slot sends the recording. */
+  onSendVoiceNote?: () => void;
   sendDisabled: boolean;
+  /** Hands-free recording widens the slot into a labelled Send. */
+  voiceNoteLocked?: boolean;
 }) {
-  const isFinishingVoiceNote = onFinishVoiceNote != null;
+  const isSendingVoiceNote = onSendVoiceNote != null;
   return (
     <button
       aria-label={
-        isFinishingVoiceNote
-          ? "Finish voice note"
+        isSendingVoiceNote
+          ? "Send voice note"
           : isSending
             ? "Sending"
             : "Send message"
       }
-      className="inline-flex h-8 w-8 items-center justify-center rounded-full bg-primary text-primary-foreground shadow transition-colors hover:bg-primary/90 focus-visible:outline-hidden focus-visible:ring-1 focus-visible:ring-ring disabled:pointer-events-none disabled:opacity-50"
-      data-testid={isFinishingVoiceNote ? "finish-voice-note" : "send-message"}
+      className={cn(
+        "inline-flex h-8 items-center justify-center rounded-full bg-primary text-primary-foreground shadow transition-[background-color,width] hover:bg-primary/90 focus-visible:outline-hidden focus-visible:ring-1 focus-visible:ring-ring disabled:pointer-events-none disabled:opacity-50",
+        voiceNoteLocked ? "min-w-24 gap-1.5 px-4 text-xs font-medium" : "w-8",
+      )}
+      data-testid={isSendingVoiceNote ? "send-voice-note" : "send-message"}
+      data-voice-note-locked={voiceNoteLocked ? "true" : undefined}
       disabled={sendDisabled || isSending}
-      onClick={onFinishVoiceNote}
-      type={isFinishingVoiceNote ? "button" : "submit"}
+      onClick={onSendVoiceNote}
+      type={isSendingVoiceNote ? "button" : "submit"}
     >
-      {isFinishingVoiceNote ? (
-        <Square aria-hidden className="h-3.5 w-3.5 fill-current" />
-      ) : isSending ? (
+      {isSending && !isSendingVoiceNote ? (
         <SendSpinner />
       ) : (
         <ArrowUp aria-hidden className="h-4 w-4" />
       )}
+      {voiceNoteLocked ? <span>Send</span> : null}
     </button>
   );
 }
