@@ -9,12 +9,21 @@ import 'package:lucide_icons_flutter/lucide_icons.dart';
 
 import '../../shared/relay/relay.dart';
 import '../../shared/theme/theme.dart';
+import '../../shared/voice_notes/voice_note_preferences.dart';
 import '../../shared/widgets/buzz_loading_indicator.dart';
 import 'voice_note_play_pause_icon.dart';
 import 'voice_note_recording.dart';
 import 'voice_note_waveform.dart';
 
+part 'voice_note_attachment/controls.dart';
+part 'voice_note_attachment/header.dart';
+part 'voice_note_attachment/transcript_row.dart';
+
 /// Displays a recorded or remote voice note with playback controls.
+///
+/// Remote cards title themselves with the sender, show `current / total`
+/// time, cycle playback speed through the mobile rates, and fold a
+/// transcript row whose last state is remembered per device.
 class VoiceNoteAttachment extends HookConsumerWidget {
   const VoiceNoteAttachment.local({
     super.key,
@@ -23,13 +32,19 @@ class VoiceNoteAttachment extends HookConsumerWidget {
     required this.waveform,
     this.onRemove,
   }) : source = path,
-       isRemote = false;
+       isRemote = false,
+       senderName = null,
+       transcript = null,
+       transcriptOpenByDefault = false;
 
   const VoiceNoteAttachment.remote({
     super.key,
     required String url,
     required this.duration,
     this.waveform = const [],
+    this.senderName,
+    this.transcript,
+    this.transcriptOpenByDefault = false,
   }) : source = url,
        isRemote = true,
        onRemove = null;
@@ -39,6 +54,15 @@ class VoiceNoteAttachment extends HookConsumerWidget {
   final Duration duration;
   final List<double> waveform;
   final VoidCallback? onRemove;
+
+  /// Display name shown as the card title on received notes.
+  final String? senderName;
+
+  /// Transcript body from the imeta `alt` tag; the row is hidden when absent.
+  final String? transcript;
+
+  /// Fold default used until this device remembers a choice (open in DMs).
+  final bool transcriptOpenByDefault;
 
   @override
   Widget build(BuildContext context, WidgetRef ref) {
@@ -114,27 +138,9 @@ class VoiceNoteAttachment extends HookConsumerWidget {
     final radius = isComposer
         ? Radii.dialog + Grid.quarter - Grid.twelve
         : Radii.md;
-
-    final canCancelLoading = state.isLoading && state.canCancelLoading;
-    final onPlaybackPressed = state.isLoading && !canCancelLoading
-        ? null
-        : state.hasError && !isRemote
-        ? null
-        : () {
-            unawaited(HapticFeedback.selectionClick());
-            unawaited(player.toggle());
-          };
-    final playbackControlLabel = state.isLoading
-        ? state.isPlaying
-              ? 'Pause voice note'
-              : canCancelLoading
-              ? 'Cancel voice note loading'
-              : 'Loading voice note'
-        : state.hasError && isRemote
-        ? 'Retry voice note'
-        : state.isPlaying
-        ? 'Pause voice note'
-        : 'Play voice note';
+    final transcriptBody = transcript?.trim();
+    final hasTranscript =
+        isRemote && transcriptBody != null && transcriptBody.isNotEmpty;
 
     return Container(
       key: ValueKey('voice-note-attachment:$source'),
@@ -149,189 +155,103 @@ class VoiceNoteAttachment extends HookConsumerWidget {
         borderRadius: BorderRadius.circular(radius),
         border: Border.all(color: context.colors.outlineVariant),
       ),
-      child: Row(
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        crossAxisAlignment: CrossAxisAlignment.stretch,
         children: [
-          SizedBox.square(
-            dimension: 40,
-            child: Semantics(
-              container: true,
-              button: true,
-              label: playbackControlLabel,
-              onTap: onPlaybackPressed,
-              excludeSemantics: true,
-              child: ExcludeSemantics(
-                child: IconButton.filledTonal(
-                  key: const ValueKey('voice-note-play-pause'),
-                  tooltip: playbackControlLabel,
-                  onPressed: onPlaybackPressed,
-                  style: IconButton.styleFrom(
-                    minimumSize: const Size.square(40),
-                    maximumSize: const Size.square(40),
-                    padding: EdgeInsets.zero,
-                    tapTargetSize: MaterialTapTargetSize.shrinkWrap,
-                  ),
-                  icon: state.isLoading
-                      ? ExcludeSemantics(
-                          child: BuzzLoadingIndicator(
-                            size: 18,
-                            color: context.colors.onSecondaryContainer,
+          Row(
+            children: [
+              _VoiceNotePlaybackButton(
+                state: state,
+                isRemote: isRemote,
+                player: player,
+              ),
+              const SizedBox(width: Grid.xxs),
+              Expanded(
+                child: Column(
+                  mainAxisAlignment: MainAxisAlignment.center,
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    if (senderName case final title?
+                        when title.trim().isNotEmpty)
+                      _VoiceNoteCardTitle(title: title.trim()),
+                    AnimatedBuilder(
+                      animation: progressAnimation,
+                      builder: (context, _) => VoiceNoteWaveform(
+                        samples: samples,
+                        progress: progressAnimation.value,
+                        height: 24,
+                        onSeek: (fraction) {
+                          animateProgressFrom(fraction);
+                          unawaited(
+                            player.seek(
+                              Duration(
+                                milliseconds:
+                                    (resolvedDuration.inMilliseconds * fraction)
+                                        .round(),
+                              ),
+                            ),
+                          );
+                        },
+                      ),
+                    ),
+                    Row(
+                      children: [
+                        Expanded(
+                          child: _VoiceNoteTimeLabel(
+                            state: state,
+                            position: state.position,
+                            total: resolvedDuration,
                           ),
-                        )
-                      : state.hasError && isRemote
-                      ? Icon(
-                          LucideIcons.refreshCcw,
-                          key: const ValueKey('voice-note-retry-icon'),
-                          size: 18,
-                          color: context.colors.onSecondaryContainer,
-                        )
-                      : VoiceNotePlayPauseIcon(
-                          isPlaying: state.isPlaying,
-                          color: context.colors.onSecondaryContainer,
                         ),
+                        if (isRemote)
+                          _VoiceNotePlaybackRateButton(
+                            key: const ValueKey('voice-note-playback-rate'),
+                            rate: playbackRate.value,
+                            onPressed: () {
+                              unawaited(HapticFeedback.selectionClick());
+                              final next = nextVoiceNotePlaybackRate(
+                                playbackRate.value,
+                                rates: voiceNoteMobilePlaybackRates,
+                              );
+                              playbackRate.value = next;
+                              unawaited(player.setSpeed(next));
+                            },
+                          ),
+                      ],
+                    ),
+                  ],
                 ),
               ),
-            ),
-          ),
-          const SizedBox(width: Grid.xxs),
-          Expanded(
-            child: Column(
-              mainAxisAlignment: MainAxisAlignment.center,
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                AnimatedBuilder(
-                  animation: progressAnimation,
-                  builder: (context, _) => VoiceNoteWaveform(
-                    samples: samples,
-                    progress: progressAnimation.value,
-                    height: 24,
-                    onSeek: (fraction) {
-                      animateProgressFrom(fraction);
-                      unawaited(
-                        player.seek(
-                          Duration(
-                            milliseconds:
-                                (resolvedDuration.inMilliseconds * fraction)
-                                    .round(),
-                          ),
-                        ),
-                      );
-                    },
-                  ),
-                ),
-                Text(
-                  key: const ValueKey('voice-note-duration'),
-                  state.hasError
-                      ? 'Voice note unavailable'
-                      : formatVoiceNoteDuration(
-                          state.position > Duration.zero
-                              ? state.position
-                              : resolvedDuration,
-                        ),
-                  style: context.textTheme.labelSmall?.copyWith(
-                    color: context.colors.onSurfaceVariant,
+              if (onRemove != null) ...[
+                const SizedBox(width: Grid.xxs),
+                SizedBox.square(
+                  dimension: 40,
+                  child: IconButton(
+                    key: const ValueKey('composer-voice-note-remove'),
+                    tooltip: 'Remove voice note',
+                    onPressed: onRemove,
+                    style: IconButton.styleFrom(
+                      minimumSize: const Size.square(40),
+                      maximumSize: const Size.square(40),
+                      padding: EdgeInsets.zero,
+                      tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                    ),
+                    icon: const Icon(LucideIcons.x, size: 18),
                   ),
                 ),
               ],
-            ),
+            ],
           ),
-          if (isRemote) ...[
-            const SizedBox(width: Grid.xxs),
-            _VoiceNotePlaybackRateButton(
-              key: const ValueKey('voice-note-playback-rate'),
-              rate: playbackRate.value,
-              onPressed: () {
-                unawaited(HapticFeedback.selectionClick());
-                final next = nextVoiceNotePlaybackRate(playbackRate.value);
-                playbackRate.value = next;
-                unawaited(player.setSpeed(next));
-              },
+          if (hasTranscript)
+            _VoiceNoteTranscriptRow(
+              transcript: transcriptBody,
+              openByDefault: transcriptOpenByDefault,
             ),
-          ] else if (onRemove != null) ...[
-            const SizedBox(width: Grid.xxs),
-            SizedBox.square(
-              dimension: 40,
-              child: IconButton(
-                key: const ValueKey('composer-voice-note-remove'),
-                tooltip: 'Remove voice note',
-                onPressed: onRemove,
-                style: IconButton.styleFrom(
-                  minimumSize: const Size.square(40),
-                  maximumSize: const Size.square(40),
-                  padding: EdgeInsets.zero,
-                  tapTargetSize: MaterialTapTargetSize.shrinkWrap,
-                ),
-                icon: const Icon(LucideIcons.x, size: 18),
-              ),
-            ),
-          ],
         ],
       ),
     );
   }
-}
-
-class _VoiceNotePlaybackRateButton extends StatelessWidget {
-  const _VoiceNotePlaybackRateButton({
-    super.key,
-    required this.rate,
-    required this.onPressed,
-  });
-
-  final double rate;
-  final VoidCallback onPressed;
-
-  @override
-  Widget build(BuildContext context) => Semantics(
-    button: true,
-    label: 'Playback speed ${formatVoiceNotePlaybackRate(rate)}',
-    hint:
-        'Double tap to change to ${formatVoiceNotePlaybackRate(nextVoiceNotePlaybackRate(rate))}.',
-    child: Tooltip(
-      message: 'Playback speed',
-      child: Material(
-        color: context.colors.primary,
-        borderRadius: BorderRadius.circular(Radii.full),
-        child: InkWell(
-          onTap: onPressed,
-          borderRadius: BorderRadius.circular(Radii.full),
-          child: Padding(
-            padding: const EdgeInsets.symmetric(
-              horizontal: Grid.xxs,
-              vertical: Grid.half + Grid.quarter,
-            ),
-            child: Stack(
-              alignment: Alignment.center,
-              children: [
-                ExcludeSemantics(
-                  child: Opacity(
-                    opacity: 0,
-                    child: Text('1.5×', style: _rateStyle(context)),
-                  ),
-                ),
-                Positioned.fill(
-                  child: Center(
-                    child: Text(
-                      formatVoiceNotePlaybackRate(rate),
-                      key: const ValueKey('voice-note-playback-rate-value'),
-                      textAlign: TextAlign.center,
-                      style: _rateStyle(context),
-                    ),
-                  ),
-                ),
-              ],
-            ),
-          ),
-        ),
-      ),
-    ),
-  );
-
-  TextStyle? _rateStyle(BuildContext context) =>
-      context.textTheme.labelSmall?.copyWith(
-        color: context.colors.onPrimary,
-        fontWeight: FontWeight.w700,
-        fontFeatures: const [FontFeature.tabularFigures()],
-      );
 }
 
 List<double> _seededWaveform(String seed) {

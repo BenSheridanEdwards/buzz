@@ -14,6 +14,8 @@ class _DelayedRecorderBackend implements VoiceNoteRecorderBackend {
   final nativeStop = Completer<String?>();
   final amplitudes = StreamController<Amplitude>.broadcast();
   bool startCalled = false;
+  bool pauseCalled = false;
+  bool resumeCalled = false;
   bool stopCalled = false;
   bool stopCompleted = false;
   bool cancelCalled = false;
@@ -31,6 +33,16 @@ class _DelayedRecorderBackend implements VoiceNoteRecorderBackend {
 
   @override
   Stream<Amplitude> onAmplitudeChanged(Duration interval) => amplitudes.stream;
+
+  @override
+  Future<void> pause() async {
+    pauseCalled = true;
+  }
+
+  @override
+  Future<void> resume() async {
+    resumeCalled = true;
+  }
 
   @override
   Future<String?> stop() async {
@@ -299,6 +311,46 @@ void main() {
     await startupExpectation;
 
     expect(backend.cancelCalled, isTrue);
+    await recorder.dispose();
+  });
+
+  test('pause and resume forward to the backend and gate samples', () async {
+    final backend = _DelayedRecorderBackend();
+    final directory = await Directory.systemTemp.createTemp('voice-note-test');
+    addTearDown(() => directory.delete(recursive: true));
+    final recorder = DeviceVoiceNoteRecorder(
+      backend: backend,
+      temporaryDirectory: () async => directory,
+    );
+    final levels = <double>[];
+    recorder.levels.listen(levels.add);
+    backend.permission.complete(true);
+    backend.nativeStart.complete();
+    await recorder.start();
+
+    backend.amplitudes.add(Amplitude(current: -6, max: 0));
+    await Future<void>.delayed(Duration.zero);
+    expect(levels, hasLength(1));
+
+    await recorder.pause();
+    expect(backend.pauseCalled, isTrue);
+    backend.amplitudes.add(Amplitude(current: -6, max: 0));
+    await Future<void>.delayed(Duration.zero);
+    expect(levels, hasLength(1));
+
+    // Pausing twice is idempotent and resuming re-enables levels.
+    await recorder.pause();
+    await recorder.resume();
+    expect(backend.resumeCalled, isTrue);
+    backend.amplitudes.add(Amplitude(current: -6, max: 0));
+    await Future<void>.delayed(Duration.zero);
+    expect(levels, hasLength(2));
+
+    final stopping = recorder.stop();
+    backend.nativeStop.complete('/tmp/voice-note-test.m4a');
+    final recording = await stopping;
+    expect(recording.waveform, hasLength(2));
+    expect(recording.duration, greaterThanOrEqualTo(Duration.zero));
     await recorder.dispose();
   });
 

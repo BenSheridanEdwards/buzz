@@ -24,13 +24,19 @@ const voiceNoteMaxDownloadBytes = 32 * 1024 * 1024;
 /// Playback rates offered by the voice-note player, in selection order.
 const voiceNotePlaybackRates = <double>[1, 1.5, 2, 0.5];
 
+/// Playback rates cycled by the mobile voice-note card (desktop keeps 0.5x).
+const voiceNoteMobilePlaybackRates = <double>[1, 1.5, 2];
+
 /// Route observer used to cancel recording when its composer is covered.
 final voiceNoteRouteObserver = RouteObserver<ModalRoute<void>>();
 
-/// Returns the playback rate following [current] in the supported rate cycle.
-double nextVoiceNotePlaybackRate(double current) {
-  final index = voiceNotePlaybackRates.indexOf(current);
-  return voiceNotePlaybackRates[(index + 1) % voiceNotePlaybackRates.length];
+/// Returns the playback rate following [current] in the [rates] cycle.
+double nextVoiceNotePlaybackRate(
+  double current, {
+  List<double> rates = voiceNotePlaybackRates,
+}) {
+  final index = rates.indexOf(current);
+  return rates[(index + 1) % rates.length];
 }
 
 /// Formats a supported voice-note playback rate for display.
@@ -57,6 +63,12 @@ abstract interface class VoiceNoteRecorder {
 
   Future<void> start();
 
+  /// Suspends capture; paused time is excluded from the recording duration.
+  Future<void> pause();
+
+  /// Resumes capture after [pause].
+  Future<void> resume();
+
   Future<VoiceNoteRecording> stop();
 
   Future<void> cancel();
@@ -76,6 +88,10 @@ abstract interface class VoiceNoteRecorderBackend {
   Future<void> start(RecordConfig config, {required String path});
 
   Stream<Amplitude> onAmplitudeChanged(Duration interval);
+
+  Future<void> pause();
+
+  Future<void> resume();
 
   Future<String?> stop();
 
@@ -97,6 +113,12 @@ class _DeviceVoiceNoteRecorderBackend implements VoiceNoteRecorderBackend {
   @override
   Stream<Amplitude> onAmplitudeChanged(Duration interval) =>
       _recorder.onAmplitudeChanged(interval);
+
+  @override
+  Future<void> pause() => _recorder.pause();
+
+  @override
+  Future<void> resume() => _recorder.resume();
 
   @override
   Future<String?> stop() => _recorder.stop();
@@ -124,6 +146,8 @@ class DeviceVoiceNoteRecorder implements VoiceNoteRecorder {
   Future<void>? _startup;
   Future<void>? _terminalOperation;
   DateTime? _startedAt;
+  DateTime? _pausedAt;
+  Duration _pausedTotal = Duration.zero;
   String? _path;
   int _lifecycleGeneration = 0;
   bool _nativeStarted = false;
@@ -192,9 +216,30 @@ class DeviceVoiceNoteRecorder implements VoiceNoteRecorder {
                           .toDouble() *
                       4)
                   .clamp(0.04, 1.0);
+          if (_pausedAt != null) return;
           _samples.add(normalized);
           if (!_levels.isClosed) _levels.add(normalized);
         });
+  }
+
+  @override
+  Future<void> pause() async {
+    if (_finished || !_nativeStarted || _nativeEnded || _pausedAt != null) {
+      return;
+    }
+    _pausedAt = DateTime.now();
+    await _recorder.pause();
+  }
+
+  @override
+  Future<void> resume() async {
+    final pausedAt = _pausedAt;
+    if (_finished || !_nativeStarted || _nativeEnded || pausedAt == null) {
+      return;
+    }
+    _pausedTotal += DateTime.now().difference(pausedAt);
+    _pausedAt = null;
+    await _recorder.resume();
   }
 
   @override
@@ -222,9 +267,15 @@ class DeviceVoiceNoteRecorder implements VoiceNoteRecorder {
       throw StateError('Buzz could not finish the voice note.');
     }
     final startedAt = _startedAt;
+    final pausedAt = _pausedAt;
+    final pausedTotal =
+        _pausedTotal +
+        (pausedAt == null
+            ? Duration.zero
+            : DateTime.now().difference(pausedAt));
     final duration = startedAt == null
         ? Duration.zero
-        : DateTime.now().difference(startedAt);
+        : DateTime.now().difference(startedAt) - pausedTotal;
     return VoiceNoteRecording(
       file: XFile(recordedPath, mimeType: 'audio/mp4'),
       duration: duration,

@@ -34,6 +34,15 @@ class _MessageBubble extends HookConsumerWidget {
         ref.watch(userCacheProvider.select((cache) => cache[pk])) ??
         ref.read(userCacheProvider.notifier).get(pk);
     final displayName = profile?.label ?? shortPubkey(message.pubkey);
+    final isDmChannel = ref.watch(
+      channelsProvider.select(
+        (channels) =>
+            channels.value?.any(
+              (channel) => channel.id == currentChannelId && channel.isDm,
+            ) ??
+            false,
+      ),
+    );
     final isAgent =
         ref.watch(agentMentionPubkeysProvider(currentChannelId)).contains(pk) ||
         profile?.ownerPubkey != null;
@@ -222,6 +231,8 @@ class _MessageBubble extends HookConsumerWidget {
                                 agentMentionPubkeys: agentMentionPubkeys,
                                 channelNames: channelNames,
                                 tags: message.tags,
+                                voiceNoteSenderName: displayName,
+                                voiceNoteTranscriptOpenByDefault: isDmChannel,
                                 baseStyle: messageBodyTextStyle.copyWith(
                                   color: context.colors.onSurface,
                                 ),

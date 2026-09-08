@@ -46,6 +46,7 @@ import 'mentions/mention_ranking.dart';
 import 'photo_library.dart';
 import 'voice_note_attachment.dart';
 import 'voice_note_composer_recorder.dart';
+import 'voice_note_recorder_phase.dart';
 import 'voice_note_recording.dart';
 
 part 'compose_bar/helpers.dart';
@@ -61,6 +62,7 @@ part 'compose_bar/ios_photo_picker.dart';
 part 'compose_bar/ios_attachment_popover.dart';
 part 'compose_bar/camera_preview.dart';
 part 'compose_bar/send_button.dart';
+part 'compose_bar/trailing_slot.dart';
 part 'compose_bar/voice_note.dart';
 part 'compose_bar/layout.dart';
 part 'compose_bar/dock.dart';

@@ -134,6 +134,13 @@ class MessageContent extends HookConsumerWidget {
   /// gutter while keeping its first image and count aligned with the body.
   final double mediaCarouselTrailingOverflow;
 
+  /// Display name of the message author, used as the voice-note card title.
+  final String? voiceNoteSenderName;
+
+  /// Whether voice-note transcripts start unfolded (true in DMs) until the
+  /// device remembers a choice.
+  final bool voiceNoteTranscriptOpenByDefault;
+
   const MessageContent({
     super.key,
     required this.content,
@@ -151,6 +158,8 @@ class MessageContent extends HookConsumerWidget {
     this.scaleEmojiOnly = false,
     this.mediaCarouselLeadingOverflow = 0,
     this.mediaCarouselTrailingOverflow = 0,
+    this.voiceNoteSenderName,
+    this.voiceNoteTranscriptOpenByDefault = false,
   });
 
   @override
@@ -333,6 +342,9 @@ class MessageContent extends HookConsumerWidget {
           duration: Duration(
             milliseconds: ((imeta?.duration ?? 0) * 1000).round(),
           ),
+          senderName: voiceNoteSenderName,
+          transcript: imeta?.alt,
+          transcriptOpenByDefault: voiceNoteTranscriptOpenByDefault,
         ),
       );
     }
