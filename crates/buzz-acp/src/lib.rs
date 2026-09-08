@@ -1,9 +1,13 @@
 #![deny(unsafe_code)]
 
 mod acp;
+mod attachments;
+mod blossom;
 mod config;
 mod engram_fetch;
+mod ffmpeg;
 mod filter;
+mod media_publish;
 mod observer;
 mod pi_launcher;
 mod pool;
@@ -2802,7 +2806,24 @@ async fn tokio_main() -> Result<()> {
         );
     }
 
+    // Attachment blobs and reply scratch files live under the daemon's temp
+    // root, keyed by agent so two harnesses never share a directory.
+    let attachment_dir = std::env::temp_dir()
+        .join("buzz-acp")
+        .join(pubkey_hex.get(..16).unwrap_or(pubkey_hex.as_str()))
+        .join("attachments");
+    let ffmpeg = crate::ffmpeg::find_ffmpeg();
+    tracing::info!(
+        target: "acp::media",
+        attachment_dir = %attachment_dir.display(),
+        ffmpeg = ffmpeg.as_deref().map(|p| p.display().to_string()).unwrap_or_else(|| "none".into()),
+        "attachment handling ready"
+    );
+
     let ctx = Arc::new(PromptContext {
+        attachment_dir,
+        audio_support: crate::blossom::AudioSupportCache::default(),
+        ffmpeg,
         mcp_servers: build_mcp_servers(&config),
         initial_message: config.initial_message.clone(),
         idle_timeout: Duration::from_secs(config.idle_timeout_secs),

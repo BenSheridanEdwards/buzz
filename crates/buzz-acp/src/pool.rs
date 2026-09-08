@@ -812,6 +812,16 @@ pub struct PromptContext {
     /// the desktop keys per (agent, relay) pair, e.g. `session_config_captured`,
     /// mirroring the `managed_agent_runtime_lifecycle` frames.
     pub relay_url: String,
+    /// Per-agent temp root for inbound attachment blobs and outbound scratch
+    /// files. One subdirectory per turn; the oldest are pruned so the root
+    /// stays bounded (see `attachments::prepare_turn_dir`).
+    pub attachment_dir: std::path::PathBuf,
+    /// Cached NIP-11 `buzz-audio` answer shared by every reply.
+    pub audio_support: crate::blossom::AudioSupportCache,
+    /// ffmpeg binary found at startup, if any. Without it voice-note
+    /// envelopes are passed through unextracted and outbound audio that the
+    /// relay refuses falls back to a generic file.
+    pub ffmpeg: Option<std::path::PathBuf>,
 }
 
 impl AgentPool {
@@ -2074,6 +2084,131 @@ fn with_canvas(prompt: Option<String>, canvas: Option<&str>) -> Option<String> {
     }
 }
 
+/// Fetch every `imeta` attachment on a batch (cancelled events first, then
+/// the live ones) into this turn's directory under the per-agent temp root.
+///
+/// When the directory cannot be created the attachments are still named in
+/// the prompt, each with that reason, so the engine knows what it did not get.
+async fn collect_batch_attachments(
+    ctx: &PromptContext,
+    batch: &FlushBatch,
+    turn_id: &str,
+) -> crate::attachments::InboundAttachments {
+    let events: Vec<&nostr::Event> = batch
+        .cancelled_events
+        .iter()
+        .chain(batch.events.iter())
+        .map(|be| &be.event)
+        .collect();
+    let has_imeta = events.iter().any(|event| {
+        event
+            .tags
+            .iter()
+            .any(|t| t.as_slice().first().map(String::as_str) == Some("imeta"))
+    });
+    if !has_imeta {
+        return crate::attachments::InboundAttachments::default();
+    }
+    match crate::attachments::prepare_turn_dir(&ctx.attachment_dir, turn_id) {
+        Ok(turn_dir) => {
+            crate::attachments::collect_inbound_attachments(
+                &ctx.rest_client,
+                &events,
+                &turn_dir,
+                ctx.ffmpeg.as_deref(),
+            )
+            .await
+        }
+        Err(e) => {
+            tracing::warn!(
+                target: "acp::media",
+                dir = %ctx.attachment_dir.display(),
+                "attachment directory unavailable: {e}"
+            );
+            crate::attachments::InboundAttachments::unavailable(
+                &events,
+                &format!("attachment storage unavailable: {e}"),
+            )
+        }
+    }
+}
+
+/// Publish any files the engine's reply named for a completed channel turn.
+///
+/// Always takes the capture (so it cannot leak into the next turn), then
+/// uploads and posts one kind-9 when the turn had a channel to answer in.
+/// Failures are logged and emitted as an observer frame; the engine's own
+/// text reply is unaffected because the harness never publishes it.
+async fn publish_reply_media(
+    ctx: &PromptContext,
+    agent: &mut OwnedAgent,
+    batch: Option<&FlushBatch>,
+    turn_id: &str,
+) {
+    let capture = agent.acp.take_turn_media();
+    let Some(batch) = batch else {
+        return;
+    };
+    if capture.is_empty() {
+        return;
+    }
+    let Some(trigger) = batch.events.last() else {
+        return;
+    };
+    let scratch = match crate::attachments::prepare_turn_dir(&ctx.attachment_dir, turn_id) {
+        Ok(dir) => dir.join("out"),
+        Err(e) => {
+            tracing::warn!(
+                target: "acp::media",
+                dir = %ctx.attachment_dir.display(),
+                "reply media scratch directory unavailable: {e}"
+            );
+            agent.acp.observe(
+                "turn_media_published",
+                serde_json::json!({
+                    "published": 0,
+                    "failed": [format!("scratch directory unavailable: {e}")],
+                    "eventId": serde_json::Value::Null,
+                }),
+            );
+            return;
+        }
+    };
+    let target = crate::media_publish::ReplyTarget::for_trigger(batch.channel_id, &trigger.event);
+    let publisher = crate::media_publish::MediaPublisher {
+        rest: &ctx.rest_client,
+        audio_support: &ctx.audio_support,
+        ffmpeg: ctx.ffmpeg.as_deref(),
+    };
+    if let Some(report) = publisher
+        .publish_turn_media(&target, &capture, &scratch)
+        .await
+    {
+        if !report.is_clean() {
+            tracing::warn!(
+                target: "acp::media",
+                channel = %batch.channel_id,
+                published = report.published.len(),
+                "reply media partially failed: {}",
+                report.failed.join("; ")
+            );
+        }
+        agent.acp.observe(
+            "turn_media_published",
+            serde_json::json!({
+                "published": report.published.len(),
+                "failed": report.failed,
+                "eventId": report.event_id,
+                "audioDelivery": report
+                    .published
+                    .iter()
+                    .filter_map(|p| p.delivery.map(|d| format!("{d:?}")))
+                    .collect::<Vec<_>>(),
+            }),
+        );
+    }
+}
+
 /// Return `agent` to the pool via `result_tx`, clearing any steer receiver first.
 ///
 /// Every path that returns an `OwnedAgent` to the pool via `PromptResult` goes
@@ -2695,6 +2830,9 @@ pub async fn run_prompt_task(
     // Event IDs represented by this prompt. Commit only after ACP reports a
     // successful turn; failed/cancelled prompts must be retryable without loss.
     let mut pending_delivered_event_ids = HashSet::new();
+    // `resource_link` blocks for inbound attachments fetched for this batch.
+    // They ride in the same `session/prompt` as the text sections.
+    let mut inbound_blocks: Vec<crate::acp::PromptBlock> = Vec::new();
     let prompt_sections: Vec<String> = if let Some(text) = prompt_text {
         // Heartbeats create their session before this point, so a Goose method-not-found
         // probe has already selected the correct framing for this process.
@@ -2773,7 +2911,7 @@ pub async fn run_prompt_task(
             );
         }
 
-        crate::queue::format_prompt(
+        let mut sections = crate::queue::format_prompt(
             b,
             &crate::queue::FormatPromptArgs {
                 agent_core: standing.agent_core,
@@ -2789,7 +2927,36 @@ pub async fn run_prompt_task(
                 agent_canvas: standing.agent_canvas,
                 standing_context_sent,
             },
-        )
+        );
+
+        // Inbound attachments: fetch every `imeta` blob on the batch with the
+        // agent key and hand the engine local paths. Rendered after the event
+        // sections so the section headers the observer trimmer keys on are
+        // unchanged. Every failure is named in the section (rule 1).
+        let inbound = collect_batch_attachments(&ctx, b, &turn_id).await;
+        if let Some(section) = inbound.section() {
+            sections.push(section);
+        }
+        inbound_blocks = inbound.prompt_blocks();
+        if !inbound.is_empty() {
+            let stored = inbound.stored().count();
+            let total = inbound.outcomes.len();
+            tracing::info!(
+                target: "acp::media",
+                channel = %b.channel_id,
+                stored,
+                failed = total - stored,
+                "inbound attachments resolved for prompt"
+            );
+            agent.acp.observe(
+                "inbound_attachments",
+                serde_json::json!({
+                    "stored": stored,
+                    "failed": total - stored,
+                }),
+            );
+        }
+        sections
     } else {
         // Should not happen — batch is None only for heartbeats which have prompt_text.
         // Return the agent to the pool to prevent a permanent slot leak.
@@ -2821,13 +2988,24 @@ pub async fn run_prompt_task(
     // own block. Per-section blocks let the observer size trimmer elide a
     // section body in place while every `[Header]` line survives at the head
     // of its own leaf — so the "Prompt context" panel counts every section.
-    let prompt_blocks: Vec<&str> = match slash_command {
-        Some(ref cmd) => std::iter::once(cmd.as_str())
-            .chain(prompt_sections.iter().map(String::as_str))
+    let mut prompt_blocks: Vec<crate::acp::PromptBlock> = match slash_command {
+        Some(ref cmd) => std::iter::once(cmd.clone())
+            .chain(prompt_sections.iter().cloned())
+            .map(crate::acp::PromptBlock::Text)
             .collect(),
-        None => prompt_sections.iter().map(String::as_str).collect(),
+        None => prompt_sections
+            .iter()
+            .cloned()
+            .map(crate::acp::PromptBlock::Text)
+            .collect(),
     };
-    let prompt_bytes: usize = prompt_blocks.iter().map(|block| block.len()).sum();
+    // Attachment links follow every text section so the slash-command and
+    // header-first invariants above are untouched.
+    prompt_blocks.extend(inbound_blocks);
+    let prompt_bytes: usize = prompt_blocks
+        .iter()
+        .map(crate::acp::PromptBlock::text_len)
+        .sum();
     let has_standing_context = match &source {
         PromptSource::Channel(_) => !standing.sections().is_empty(),
         PromptSource::Heartbeat => ctx.base_prompt.is_some(),
@@ -2871,7 +3049,7 @@ pub async fn run_prompt_task(
             // Heartbeat / non-cancellable path.
             tokio::select! {
                 biased;
-                result = agent.acp.session_prompt_blocks_with_idle_timeout(
+                result = agent.acp.session_prompt_content_with_idle_timeout(
                     &session_id,
                     &prompt_blocks,
                     ctx.idle_timeout,
@@ -2882,7 +3060,7 @@ pub async fn run_prompt_task(
         Some(rx) => {
             tokio::select! {
                 biased;
-                result = agent.acp.session_prompt_blocks_with_idle_timeout(
+                result = agent.acp.session_prompt_content_with_idle_timeout(
                     &session_id,
                     &prompt_blocks,
                     ctx.idle_timeout,
@@ -3020,6 +3198,7 @@ pub async fn run_prompt_task(
                             &source,
                             &control_signal,
                         );
+                        publish_reply_media(&ctx, &mut agent, batch.as_ref(), &turn_id).await;
                         let usage = agent.acp.take_turn_usage();
                         publish_agent_turn_metric(
                             &ctx,
@@ -3091,6 +3270,15 @@ pub async fn run_prompt_task(
                     "rotating session for {source:?} after {stop_reason:?}",
                 );
                 agent.state.invalidate(&source);
+            }
+
+            // Files the reply named are published only for a turn the engine
+            // finished on its own terms; a cancelled or refused turn's capture
+            // is discarded with it.
+            if matches!(stop_reason, StopReason::Cancelled | StopReason::Refusal) {
+                let _ = agent.acp.take_turn_media();
+            } else {
+                publish_reply_media(&ctx, &mut agent, batch.as_ref(), &turn_id).await;
             }
 
             let core_stop = acp_stop_to_core(&stop_reason);
@@ -8970,6 +9158,9 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
             memory_enabled: false,
             harness_name: "goose".to_string(),
             relay_url: "ws://127.0.0.1:3000".to_string(),
+            attachment_dir: std::env::temp_dir().join("buzz-acp-test-attachments"),
+            audio_support: crate::blossom::AudioSupportCache::default(),
+            ffmpeg: None,
         }
     }
 
