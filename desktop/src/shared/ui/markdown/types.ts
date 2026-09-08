@@ -7,13 +7,17 @@ import type { CustomEmoji } from "@/shared/lib/remarkCustomEmoji";
 import type { VoiceNoteConversationContext } from "@/features/messages/lib/audioAttachment";
 import type { VideoReviewContext } from "../VideoPlayer";
 
-/** Card context for a received voice note: who sent it and what was said. */
+/** Card context for a received voice note: who sent it and where. */
 export type VoiceNoteCardContext = {
   conversation: VoiceNoteConversationContext;
+  /**
+   * Renders the attachment's transcript (its imeta `alt`) through the message
+   * Markdown pipeline so emoji, mentions and emphasis match the body. Must be
+   * referentially stable: it travels through the Markdown runtime context.
+   */
+  renderTranscript?: (transcript: string) => React.ReactNode;
   /** Display name of the message author, shown as the card title. */
   sender?: string;
-  /** Prose that accompanied the attachment, shown in the Transcript row. */
-  transcript?: string;
 };
 
 export type ImetaEntry = {

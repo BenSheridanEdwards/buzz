@@ -24,9 +24,27 @@ function readStoredReviewEnabled(): boolean {
   }
 }
 
+// Another window (or the settings pane in a second window) can flip the
+// preference; the `storage` event is how localStorage reports that here.
+function handleStorage(event: StorageEvent) {
+  if (event.key !== null && event.key !== VOICE_NOTE_REVIEW_STORAGE_KEY) return;
+  const next = readStoredReviewEnabled();
+  if (next === reviewEnabled) return;
+  reviewEnabled = next;
+  for (const listener of listeners) listener();
+}
+
 function subscribe(listener: () => void): () => void {
+  if (listeners.size === 0 && typeof window !== "undefined") {
+    window.addEventListener("storage", handleStorage);
+  }
   listeners.add(listener);
-  return () => listeners.delete(listener);
+  return () => {
+    listeners.delete(listener);
+    if (listeners.size === 0 && typeof window !== "undefined") {
+      window.removeEventListener("storage", handleStorage);
+    }
+  };
 }
 
 export function getVoiceNoteReviewEnabled(): boolean {

@@ -109,7 +109,40 @@ before(() => {
   dom.window.AudioContext = FakeAudioContext;
 });
 
-const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+/**
+ * Deterministic clock for the elapsed-time tests: `performance.now()` and the
+ * recorder's level interval both run off it, so `advance` moves the recorder's
+ * idea of time without waiting on the real timer (no CI-load flake).
+ */
+function installFakeClock() {
+  const originalNow = performance.now;
+  const originalSetInterval = dom.window.setInterval;
+  const originalClearInterval = dom.window.clearInterval;
+  const intervals = new Map();
+  let nextId = 1;
+  let now = 10_000;
+  performance.now = () => now;
+  dom.window.setInterval = (callback) => {
+    const id = nextId;
+    nextId += 1;
+    intervals.set(id, callback);
+    return id;
+  };
+  dom.window.clearInterval = (id) => {
+    intervals.delete(id);
+  };
+  return {
+    advance(ms) {
+      now += ms;
+      for (const callback of [...intervals.values()]) callback();
+    },
+    restore() {
+      performance.now = originalNow;
+      dom.window.setInterval = originalSetInterval;
+      dom.window.clearInterval = originalClearInterval;
+    },
+  };
+}
 
 after(() => dom.window.close());
 
@@ -205,6 +238,7 @@ test("a cancelled decode cannot stop or attach over a newer recording", async ()
 test("pause and resume keep one file and freeze the elapsed clock", async () => {
   const { act, cleanup, renderHook } = await import("@testing-library/react");
   const { useVoiceNoteRecorder } = await import("./useVoiceNoteRecorder.ts");
+  const clock = installFakeClock();
   const { result, unmount } = renderHook(() => useVoiceNoteRecorder());
 
   try {
@@ -213,11 +247,12 @@ test("pause and resume keep one file and freeze the elapsed clock", async () => 
     assert.equal(result.current.locked, false);
     const recorder = recorders.at(-1);
 
-    await act(async () => {
-      await wait(220);
-    });
-    const beforePause = result.current.elapsedSeconds;
-    assert.ok(beforePause > 0.1, `clock runs while recording (${beforePause})`);
+    act(() => clock.advance(200));
+    assert.equal(
+      result.current.elapsedSeconds,
+      0.2,
+      "clock runs while recording",
+    );
 
     act(() => result.current.lock());
     assert.equal(result.current.locked, true);
@@ -225,33 +260,28 @@ test("pause and resume keep one file and freeze the elapsed clock", async () => 
     act(() => result.current.pause());
     assert.equal(result.current.status, "paused");
     assert.equal(recorder.state, "paused");
-    const atPause = result.current.elapsedSeconds;
-    await act(async () => {
-      await wait(250);
-    });
+    assert.equal(result.current.elapsedSeconds, 0.2);
+    act(() => clock.advance(250));
     assert.equal(
       result.current.elapsedSeconds,
-      atPause,
+      0.2,
       "the clock does not advance while paused",
     );
 
     act(() => result.current.resume());
     assert.equal(result.current.status, "recording");
     assert.equal(recorder.state, "recording");
-    await act(async () => {
-      await wait(220);
-    });
-    const afterResume = result.current.elapsedSeconds;
-    assert.ok(afterResume > atPause, "the clock continues after resume");
-    assert.ok(
-      afterResume < atPause + 0.4,
-      `paused time is not counted (${afterResume} vs ${atPause})`,
+    act(() => clock.advance(200));
+    assert.equal(
+      result.current.elapsedSeconds,
+      0.4,
+      "the clock continues after resume without the paused time",
     );
 
     let finish;
     await act(async () => {
       finish = result.current.stop();
-      await wait(0);
+      await new Promise((resolve) => setTimeout(resolve, 0));
     });
     assert.equal(recorder.starts, 1, "resume never starts a second file");
     await act(async () => {
@@ -271,6 +301,7 @@ test("pause and resume keep one file and freeze the elapsed clock", async () => 
   } finally {
     unmount();
     cleanup();
+    clock.restore();
   }
 });
 

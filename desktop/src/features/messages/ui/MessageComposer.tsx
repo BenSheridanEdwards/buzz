@@ -164,9 +164,16 @@ function MessageComposerImpl({
     () => voiceNoteSubmitRef.current(),
     [],
   );
+  // Same shape for focus: the editor is created further down.
+  const voiceNoteFocusEditorRef = React.useRef<() => void>(() => {});
+  const focusEditorForVoiceNote = React.useCallback(
+    () => voiceNoteFocusEditorRef.current(),
+    [],
+  );
   const voiceNote = useComposerVoiceNote({
     draftKey: effectiveDraftKey,
     editTargetId: editTarget?.id ?? null,
+    focusEditor: focusEditorForVoiceNote,
     media,
     setFormattingOpen: setIsFormattingOpen,
     setEmojiPickerOpen: setIsEmojiPickerOpen,
@@ -702,6 +709,7 @@ function MessageComposerImpl({
   ]);
   submitMessageRef.current = submitMessage;
   voiceNoteSubmitRef.current = () => void submitMessage();
+  voiceNoteFocusEditorRef.current = richText.focusPreserve;
   // Draft auto-submit runs once after persisted editor state loads.
   const onAutoSubmitCompleteRef = React.useRef(onAutoSubmitComplete);
   onAutoSubmitCompleteRef.current = onAutoSubmitComplete;
@@ -978,6 +986,7 @@ function MessageComposerImpl({
               </div>
             )}
             {voiceNote.reviewElement}
+            {voiceNote.liveRegionElement}
             {/* biome-ignore lint/a11y/noStaticElementInteractions: keydown handler bridges Tiptap editor to autocomplete and submit */}
             <div
               className="rich-text-composer relative max-h-32 overflow-y-auto"

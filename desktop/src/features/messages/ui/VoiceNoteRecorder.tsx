@@ -9,8 +9,11 @@ import {
 import { cn } from "@/shared/lib/cn";
 import { Button } from "@/shared/ui/button";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/shared/ui/tooltip";
+import type { VoiceNoteHoldSource } from "./useComposerVoiceNote";
 
 const BAR_PITCH_PX = 5;
+const chipClassName =
+  "inline-flex shrink-0 items-center gap-1.5 rounded-full border border-border/70 px-2.5 py-1 text-xs text-muted-foreground";
 
 type WaveformSample = {
   id: string;
@@ -19,7 +22,9 @@ type WaveformSample = {
 };
 
 export function VoiceNoteRecorder({
+  containerRef,
   elapsedSeconds,
+  holdSource,
   levels,
   locked,
   maxDurationSeconds,
@@ -31,7 +36,14 @@ export function VoiceNoteRecorder({
   processing,
   requesting,
 }: {
+  /** The row itself, so the composer can tell whether focus lived in it. */
+  containerRef?: React.Ref<HTMLFieldSetElement>;
   elapsedSeconds: number;
+  /**
+   * Which hand is busy holding. A pointer hold cannot click the chip (the
+   * button is down on the mic), so the chip becomes a slide-to-lock target.
+   */
+  holdSource: VoiceNoteHoldSource | null;
   levels: number[];
   /** Hands-free: the hold was released and the recording waits for Send. */
   locked: boolean;
@@ -46,9 +58,42 @@ export function VoiceNoteRecorder({
 }) {
   const waveformRef = React.useRef<HTMLDivElement | null>(null);
   const trackRef = React.useRef<HTMLDivElement | null>(null);
+  const rowRef = React.useRef<HTMLFieldSetElement | null>(null);
+  const pauseResumeRef = React.useRef<HTMLButtonElement | null>(null);
   const previousFrameRef = React.useRef({ barCount: 0, levelCount: 0 });
   const prefersReducedMotion = useReducedMotion();
   const [barCount, setBarCount] = React.useState(1);
+
+  const setRowRef = React.useCallback(
+    (node: HTMLFieldSetElement | null) => {
+      rowRef.current = node;
+      if (typeof containerRef === "function") containerRef(node);
+      else if (containerRef) containerRef.current = node;
+    },
+    [containerRef],
+  );
+
+  // Locking swaps the chip for a read-only badge. If the chip had focus
+  // (Enter on it), focus moves to pause/resume, the control that took the
+  // chip's place, rather than dying on the document body. Focus elsewhere
+  // (the editor, or nowhere during a pointer hold) is left alone. The chip's
+  // own focus events remember this: by the time the lock effect runs the chip
+  // has unmounted and `document.activeElement` is already the body.
+  const chipHadFocusRef = React.useRef(false);
+  const handleChipFocus = React.useCallback(() => {
+    chipHadFocusRef.current = true;
+  }, []);
+  const handleChipBlur = React.useCallback(() => {
+    chipHadFocusRef.current = false;
+  }, []);
+  const wasLockedRef = React.useRef(locked);
+  React.useEffect(() => {
+    const wasLocked = wasLockedRef.current;
+    wasLockedRef.current = locked;
+    if (!locked || wasLocked || !chipHadFocusRef.current) return;
+    chipHadFocusRef.current = false;
+    pauseResumeRef.current?.focus();
+  }, [locked]);
 
   React.useEffect(() => {
     const waveform = waveformRef.current;
@@ -115,6 +160,7 @@ export function VoiceNoteRecorder({
     <fieldset
       className="flex min-w-0 flex-1 items-center gap-1"
       data-testid="voice-note-recorder"
+      ref={setRowRef}
       data-voice-note-state={
         requesting
           ? "requesting"
@@ -140,7 +186,10 @@ export function VoiceNoteRecorder({
         <TooltipTrigger asChild>
           <Button
             aria-label="Discard voice note"
-            className="shrink-0"
+            className={cn(
+              "shrink-0",
+              locked && "text-destructive hover:text-destructive",
+            )}
             data-testid="voice-note-discard"
             onClick={onCancel}
             size="icon"
@@ -161,6 +210,7 @@ export function VoiceNoteRecorder({
               className="shrink-0 rounded-full bg-muted"
               data-testid="voice-note-pause-resume"
               onClick={paused ? onResume : onPause}
+              ref={pauseResumeRef}
               size="icon"
               type="button"
               variant="ghost"
@@ -234,20 +284,43 @@ export function VoiceNoteRecorder({
             <Lock aria-hidden="true" className="h-3 w-3" />
             {paused ? "Paused" : "Locked"}
           </span>
+        ) : holdSource === "pointer" ? (
+          // The mouse button is down on the mic, so a click here is
+          // impossible (releasing sends). Sliding the held pointer onto the
+          // chip locks instead; L still works from the keyboard.
+          <span
+            className={cn(chipClassName, "cursor-default")}
+            data-testid="voice-note-lock-chip"
+            data-locked="false"
+            data-lock-target="slide"
+            onPointerEnter={onLock}
+          >
+            <Lock aria-hidden="true" className="h-3 w-3" />
+            <span>
+              Slide here or press{" "}
+              <kbd className="font-semibold text-foreground">L</kbd> to lock
+            </span>
+          </span>
         ) : (
           <Tooltip disableHoverableContent>
             <TooltipTrigger asChild>
               <button
-                className="inline-flex shrink-0 items-center gap-1.5 rounded-full border border-border/70 px-2.5 py-1 text-xs text-muted-foreground transition-colors hover:bg-accent hover:text-accent-foreground focus-visible:outline-hidden focus-visible:ring-1 focus-visible:ring-ring"
+                className={cn(
+                  chipClassName,
+                  "transition-colors hover:bg-accent hover:text-accent-foreground focus-visible:outline-hidden focus-visible:ring-1 focus-visible:ring-ring",
+                )}
                 data-testid="voice-note-lock-chip"
                 data-locked="false"
+                data-lock-target="press"
+                onBlur={handleChipBlur}
                 onClick={onLock}
+                onFocus={handleChipFocus}
                 type="button"
               >
                 <Lock aria-hidden="true" className="h-3 w-3" />
                 <span>
-                  Hold <kbd className="font-semibold text-foreground">L</kbd> to
-                  lock
+                  Press <kbd className="font-semibold text-foreground">L</kbd>{" "}
+                  to lock
                 </span>
               </button>
             </TooltipTrigger>

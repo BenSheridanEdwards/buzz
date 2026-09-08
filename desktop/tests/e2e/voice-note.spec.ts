@@ -6,6 +6,7 @@ import { installMockBridge } from "../helpers/bridge";
 import { expectSmoothCorners } from "../helpers/css";
 
 const AUDIO_URL = "http://127.0.0.1:4173/sounds/ping.mp3";
+const IMAGE_URL = "http://127.0.0.1:4173/app-icon@2x.png";
 
 async function openMoreActionsMenu(page: Page, messageId: string) {
   const row = page.locator(`[data-message-id="${messageId}"]`);
@@ -26,19 +27,30 @@ async function startLockedRecording(page: Page) {
   await expect(page.getByTestId("voice-note-recorder")).toBeVisible();
 }
 
+/**
+ * A received voice note. The transcript travels as the attachment's imeta
+ * `alt` (what the sender or its transcriber heard); `caption` is ordinary
+ * message prose alongside the link and stays in the body.
+ */
 async function emitVoiceNoteMessage(
   page: Page,
   channelName: string,
   audioUrl: string,
   transcript?: string,
+  { caption, imageUrl }: { caption?: string; imageUrl?: string } = {},
 ) {
   await page.evaluate(
-    ({ audioUrl, channelName, transcript }) => {
+    ({ audioUrl, caption, channelName, imageUrl, transcript }) => {
       const emit = window.__BUZZ_E2E_EMIT_MOCK_MESSAGE__;
       if (!emit) throw new Error("Mock message emitter is unavailable.");
+      const lines = [
+        caption,
+        imageUrl ? `![pic](${imageUrl})` : undefined,
+        `[voice-note-123.mp4](${audioUrl})`,
+      ].filter((line): line is string => line !== undefined);
       emit({
         channelName,
-        content: `${transcript ? `${transcript}\n` : ""}[voice-note-123.mp4](${audioUrl})`,
+        content: lines.join("\n"),
         extraTags: [
           [
             "imeta",
@@ -46,11 +58,23 @@ async function emitVoiceNoteMessage(
             "m video/mp4",
             "duration 9.4",
             "filename voice-note-123.mp4",
+            ...(transcript ? [`alt ${transcript}`] : []),
           ],
+          ...(imageUrl
+            ? [
+                [
+                  "imeta",
+                  `url ${imageUrl}`,
+                  "m image/png",
+                  "dim 128x128",
+                  "filename pic.png",
+                ],
+              ]
+            : []),
         ],
       });
     },
-    { audioUrl, channelName, transcript },
+    { audioUrl, caption, channelName, imageUrl, transcript },
   );
 }
 
@@ -649,9 +673,15 @@ test("records from the composer and renders an inline waveform card", async ({
     "data-locked",
     "true",
   );
-  await expect(
-    page.getByRole("status", { name: "Recording voice note" }),
-  ).toHaveCount(0);
+  // One polite live region announces transitions; the ticking timer is
+  // not read out.
+  await expect(page.getByTestId("voice-note-live-status")).toHaveText(
+    "Recording voice note, hands free",
+  );
+  await expect(page.getByTestId("voice-note-live-status")).toHaveAttribute(
+    "aria-live",
+    "polite",
+  );
   await expect(attach).toBeHidden();
   const discard = page.getByRole("button", { name: "Discard voice note" });
   await expect(discard).toBeVisible();
@@ -1035,8 +1065,12 @@ test("received card titles the sender and folds the transcript in a channel", as
   await page.goto("/");
   await page.getByTestId("channel-general").click();
   await waitForMockLiveSubscription(page, "general");
-  const transcript = "Status is green on the Studio. Say the word.";
-  await emitVoiceNoteMessage(page, "general", AUDIO_URL, transcript);
+  const transcript = "Status is **green** on the Studio. Say the word.";
+  const caption = "Hey **team**, here is the update";
+  await emitVoiceNoteMessage(page, "general", AUDIO_URL, transcript, {
+    caption,
+    imageUrl: IMAGE_URL,
+  });
 
   const card = page.getByTestId("audio-message-attachment").last();
   await expect(card).toBeVisible();
@@ -1051,8 +1085,18 @@ test("received card titles the sender and folds the transcript in a channel", as
   await expect(card.getByTestId("voice-note-time")).toHaveText(
     /^0:00 \/ 0:0\d$/,
   );
-  // The prose lives in the card, not as a separate paragraph above it.
-  await expect(row.locator("p").filter({ hasText: transcript })).toHaveCount(1);
+  // The caption is body prose: rendered as Markdown above the cards, not
+  // demoted into the transcript row. The image beside the note is its own
+  // card, and only one voice-note card is drawn.
+  await expect(row.getByText("here is the update")).toHaveCount(1);
+  await expect(row.locator("strong").filter({ hasText: "team" })).toHaveCount(
+    1,
+  );
+  await expect(card.getByText("here is the update")).toHaveCount(0);
+  await expect(row.getByTestId("message-image-lightbox-trigger")).toHaveCount(
+    1,
+  );
+  await expect(row.getByTestId("audio-message-attachment")).toHaveCount(1);
 
   const toggle = card.getByRole("button", { name: "Transcript" });
   const text = card.getByTestId("voice-note-transcript-text");
@@ -1068,7 +1112,10 @@ test("received card titles the sender and folds the transcript in a channel", as
   await page.keyboard.press("Enter");
   await expect(toggle).toHaveAttribute("aria-expanded", "true");
   await expect(text).toBeVisible();
-  await expect(text).toHaveText(transcript);
+  // The transcript renders through Markdown too: emphasis is real emphasis,
+  // not literal asterisks.
+  await expect(text).toHaveText("Status is green on the Studio. Say the word.");
+  await expect(text.locator("strong")).toHaveText("green");
   expect(
     await page.evaluate(() =>
       window.localStorage.getItem("buzz.voiceNote.transcriptOpen"),
@@ -1095,11 +1142,16 @@ test("received card titles the sender and folds the transcript in a channel", as
     ),
   ).toBe("closed");
 
-  // No accompanying text: no Transcript row at all.
-  await emitVoiceNoteMessage(page, "general", AUDIO_URL);
+  // No transcript on the attachment: no Transcript row, even with a caption.
+  await emitVoiceNoteMessage(page, "general", AUDIO_URL, undefined, {
+    caption: "Just a caption",
+  });
   const bareCard = page.getByTestId("audio-message-attachment").last();
   await expect(bareCard).toBeVisible();
   await expect(bareCard.getByTestId("voice-note-transcript")).toHaveCount(0);
+  const bareRow = page.locator("[data-message-id]").filter({ has: bareCard });
+  await expect(bareRow.getByText("Just a caption")).toHaveCount(1);
+  await expect(bareCard.getByText("Just a caption")).toHaveCount(0);
 });
 
 test("received card opens the transcript by default in a DM", async ({

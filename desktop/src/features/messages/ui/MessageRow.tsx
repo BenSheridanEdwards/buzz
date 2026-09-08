@@ -41,10 +41,9 @@ import { parseImetaTags } from "@/shared/ui/markdown/parseImeta";
 import { useMessageEmoji } from "@/features/messages/lib/useMessageEmoji";
 import { parseWaveMessageContent } from "@/features/messages/lib/waveMessage";
 import { resolveSnapshotSharedBy } from "@/features/messages/lib/snapshotSharedBy";
-import {
-  isVoiceNoteAttachment,
-  splitVoiceNoteTranscript,
-} from "@/features/messages/lib/audioAttachment";
+import { isVoiceNoteAttachment } from "@/features/messages/lib/audioAttachment";
+import { getChannelIdFromTags } from "@/features/messages/lib/threading";
+import { Markdown } from "@/shared/ui/markdown";
 import type { VoiceNoteCardContext } from "@/shared/ui/markdown/types";
 import { resolveMentionProps } from "@/shared/lib/resolveMentionNames";
 import type { VideoReviewContext } from "@/shared/ui/VideoPlayer";
@@ -309,13 +308,28 @@ export const MessageRow = React.memo(
 
     const { channels, nonDmChannelNames: channelNames } =
       useChannelNavigation();
-    // A voice note carries its accompanying prose inside the card as the
-    // transcript, so the body handed to Markdown keeps only the link.
-    const voiceNotePresentation = React.useMemo<{
-      content: string;
-      voiceNoteCard: VoiceNoteCardContext;
-    } | null>(() => {
-      if (!imetaByUrl) return null;
+    // A received voice note's transcript (its imeta `alt`) renders through the
+    // same Markdown pipeline as the body; the body itself is left untouched so
+    // captions and other attachments in the message keep rendering normally.
+    const renderVoiceNoteTranscript = React.useCallback(
+      (transcript: string) => (
+        <Markdown
+          content={transcript}
+          customEmoji={customEmoji}
+          interactive={false}
+          mentionNames={mentionNames}
+        />
+      ),
+      [customEmoji, mentionNames],
+    );
+    // Search results and other hosts render rows without a `channelId`; the
+    // event's own `h` tag still says which conversation it belongs to.
+    const conversationChannelId =
+      channelId ?? getChannelIdFromTags(message.tags ?? []);
+    const voiceNoteCard = React.useMemo<
+      VoiceNoteCardContext | undefined
+    >(() => {
+      if (!imetaByUrl) return undefined;
       let hasVoiceNote = false;
       for (const entry of imetaByUrl.values()) {
         if (isVoiceNoteAttachment(entry)) {
@@ -323,24 +337,24 @@ export const MessageRow = React.memo(
           break;
         }
       }
-      if (!hasVoiceNote) return null;
-      const split = splitVoiceNoteTranscript(message.body, (url) =>
-        isVoiceNoteAttachment(imetaByUrl.get(url)),
-      );
+      if (!hasVoiceNote) return undefined;
       const conversation =
-        channels.find((channel) => channel.id === channelId)?.channelType ===
-        "dm"
+        channels.find((channel) => channel.id === conversationChannelId)
+          ?.channelType === "dm"
           ? "dm"
           : "channel";
       return {
-        content: split?.content ?? message.body,
-        voiceNoteCard: {
-          conversation,
-          sender: message.author,
-          transcript: split?.transcript,
-        },
+        conversation,
+        renderTranscript: renderVoiceNoteTranscript,
+        sender: message.author,
       };
-    }, [channelId, channels, imetaByUrl, message.author, message.body]);
+    }, [
+      channels,
+      conversationChannelId,
+      imetaByUrl,
+      message.author,
+      renderVoiceNoteTranscript,
+    ]);
 
     const indentRem = getThreadReplyIndentRem(message.depth);
     const descendantGuideOffsetRem = connectDescendants
@@ -468,7 +482,7 @@ export const MessageRow = React.memo(
                 message,
                 isKnownAgentPubkey,
               )}
-              content={voiceNotePresentation?.content ?? message.body}
+              content={message.body}
               messageId={message.id}
               linkPreviewsSuppressed={linkPreviewsSuppressed}
               linkPreviewTags={message.tags}
@@ -483,7 +497,7 @@ export const MessageRow = React.memo(
               snapshotSharedBy={snapshotSharedBy}
               videoReviewCommentRootId={videoReviewCommentRootId}
               videoReviewContext={videoReviewContext}
-              voiceNoteCard={voiceNotePresentation?.voiceNoteCard}
+              voiceNoteCard={voiceNoteCard}
             />
           );
         }

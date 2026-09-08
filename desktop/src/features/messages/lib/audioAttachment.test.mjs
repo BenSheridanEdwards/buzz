@@ -10,13 +10,13 @@ import {
   readTranscriptPreference,
   resolveAudioAttachment,
   resolveTranscriptOpen,
-  splitVoiceNoteTranscript,
   summarizeWaveform,
   transcriptDefaultOpen,
   VOICE_NOTE_MAX_DURATION_SECONDS,
   VOICE_NOTE_PLAYBACK_RATES,
   VOICE_NOTE_TRANSCRIPT_STORAGE_KEY,
   voiceNoteBarHeight,
+  voiceNoteTranscript,
   waveformPeaks,
   WAVEFORM_SUMMARY_RESOLUTION,
   writeTranscriptPreference,
@@ -202,43 +202,40 @@ test("a throwing localStorage never breaks the transcript default", () => {
   assert.equal(resolveTranscriptOpen("channel", throwing), false);
 });
 
-test("splitVoiceNoteTranscript lifts accompanying prose out of the body", () => {
-  const url = "https://relay.example/media/voice-note-1.mp4";
-  const isVoiceNote = (candidate) => candidate === url;
-  assert.deepEqual(
-    splitVoiceNoteTranscript(
-      `Status is green on the Studio.\nSay the word.\n[voice-note-1.mp4](${url})`,
-      isVoiceNote,
-    ),
-    {
-      content: `[voice-note-1.mp4](${url})`,
-      transcript: "Status is green on the Studio.\nSay the word.",
-    },
-  );
-  // Only the link: no transcript row.
+test("the transcript is the voice note's own alt text, never the body", () => {
+  const voiceNote = {
+    alt: "  Status is green on the Studio.\nSay the word.  ",
+    filename: "voice-note-1.mp4",
+    m: "video/mp4",
+  };
   assert.equal(
-    splitVoiceNoteTranscript(`[voice-note-1.mp4](${url})`, isVoiceNote),
-    null,
+    voiceNoteTranscript(voiceNote),
+    "Status is green on the Studio.\nSay the word.",
   );
-  // No voice-note link: the body renders untouched.
+  // No alt, or a blank one: no transcript row.
   assert.equal(
-    splitVoiceNoteTranscript(
-      "Just words [notes.pdf](https://relay.example/media/notes.pdf)",
-      isVoiceNote,
-    ),
-    null,
+    voiceNoteTranscript({ filename: "voice-note-1.mp4", m: "video/mp4" }),
+    undefined,
   );
-  // Other attachments in the same body stay in the content.
-  assert.deepEqual(
-    splitVoiceNoteTranscript(
-      `Hello\n![image](https://relay.example/media/pic.png)\n[voice-note-1.mp4](${url})`,
-      isVoiceNote,
-    ),
-    {
-      content: `[voice-note-1.mp4](${url})`,
-      transcript: "Hello\n![image](https://relay.example/media/pic.png)",
-    },
+  assert.equal(voiceNoteTranscript({ ...voiceNote, alt: "   " }), undefined);
+  // Alt text on other media is a description, not a transcript.
+  assert.equal(
+    voiceNoteTranscript({
+      alt: "A photo",
+      filename: "pic.png",
+      m: "image/png",
+    }),
+    undefined,
   );
+  assert.equal(
+    voiceNoteTranscript({
+      alt: "Lyrics",
+      filename: "song.mp3",
+      m: "audio/mpeg",
+    }),
+    undefined,
+  );
+  assert.equal(voiceNoteTranscript(undefined), undefined);
 });
 
 test("waveformPeaks produces normalized accessible-height bars", () => {

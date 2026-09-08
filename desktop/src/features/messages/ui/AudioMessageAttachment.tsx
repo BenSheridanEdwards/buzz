@@ -18,6 +18,7 @@ import {
   resolveTranscriptOpen,
   summarizeWaveform,
   voiceNoteBarHeight,
+  voiceNoteTranscript,
   waveformPeaks,
   writeTranscriptPreference,
   type AudioAttachmentImetaEntry,
@@ -74,12 +75,17 @@ export function renderAudioMessageAttachment(
   const attachment = resolveAudioAttachment(entry, href, label);
   if (!attachment) return null;
   const voiceNote = isVoiceNoteAttachment(entry);
+  const transcript = voiceNoteTranscript(entry);
   return (
     <AudioMessageAttachment
       {...attachment}
       downloadUrl={voiceNote ? undefined : downloadUrl}
       sender={voiceNoteCard?.sender}
-      transcript={voiceNote ? voiceNoteCard?.transcript : undefined}
+      transcript={
+        transcript === undefined
+          ? undefined
+          : (voiceNoteCard?.renderTranscript?.(transcript) ?? transcript)
+      }
       transcriptContext={voiceNoteCard?.conversation}
     />
   );
@@ -153,8 +159,8 @@ export function AudioMessageAttachment({
   onRemove?: () => void;
   /** Display name of the sender, shown as the card title. */
   sender?: string;
-  /** Accompanying prose shown in the Transcript row; omitted when empty. */
-  transcript?: string;
+  /** The attachment's transcript, already rendered; no row when absent. */
+  transcript?: React.ReactNode;
   /** Decides the transcript default: open in DMs, folded in channels. */
   transcriptContext?: VoiceNoteConversationContext;
 }) {
@@ -165,11 +171,12 @@ export function AudioMessageAttachment({
     resolveTranscriptOpen(transcriptContext),
   );
   const toggleTranscript = React.useCallback(() => {
-    setTranscriptOpen((open) => {
-      writeTranscriptPreference(!open);
-      return !open;
-    });
-  }, []);
+    // The write lives in the handler, not the updater: updaters must stay
+    // pure (StrictMode replays them).
+    const next = !transcriptOpen;
+    setTranscriptOpen(next);
+    writeTranscriptPreference(next);
+  }, [transcriptOpen]);
   const mediaRef = React.useRef<HTMLDivElement | null>(null);
   const playbackRateRef = React.useRef<HTMLButtonElement | null>(null);
   const waveformRef = React.useRef<HTMLDivElement | null>(null);
@@ -680,7 +687,7 @@ export function AudioMessageAttachment({
           </AttachmentActions>
         ) : null}
       </div>
-      {!composer && transcript ? (
+      {!composer && transcript !== undefined ? (
         <div
           className="w-full border-t border-border/60 pt-2"
           data-testid="voice-note-transcript"
@@ -705,14 +712,14 @@ export function AudioMessageAttachment({
               )}
             />
           </button>
-          <p
-            className="mt-1.5 whitespace-pre-wrap pl-[1.375rem] text-xs leading-relaxed text-muted-foreground"
+          <div
+            className="mt-1.5 pl-[1.375rem] text-xs leading-relaxed text-muted-foreground [&_p]:whitespace-pre-wrap"
             data-testid="voice-note-transcript-text"
             hidden={!transcriptOpen}
             id={transcriptId}
           >
             {transcript}
-          </p>
+          </div>
         </div>
       ) : null}
       {/* biome-ignore lint/a11y/useMediaCaption: voice notes are user-provided audio */}

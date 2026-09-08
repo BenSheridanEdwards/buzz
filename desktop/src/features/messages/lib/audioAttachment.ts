@@ -1,4 +1,6 @@
 export type AudioAttachmentImetaEntry = {
+  /** NIP-92 `alt`: for a voice note, the sender-supplied transcript. */
+  alt?: string;
   duration?: number;
   filename?: string;
   m?: string;
@@ -140,33 +142,18 @@ export function resolveTranscriptOpen(
   return readTranscriptPreference(storage) ?? transcriptDefaultOpen(context);
 }
 
-const MARKDOWN_LINK_PATTERN = /!?\[(?:[^\]\\]|\\.)*\]\(([^\s)]+)\)/g;
-
 /**
- * Split a message body into the voice-note attachment links and the prose
- * that accompanies them. The prose becomes the card's transcript; the links
- * stay in the body so the renderer still draws the card. Returns `null` when
- * the body has no voice-note link or no accompanying text, so callers render
- * the message unchanged.
+ * The transcript of a received voice note is the attachment's own `alt`
+ * text (NIP-92 imeta), written by the sender or its transcriber. Prose in the
+ * message body is a caption, not a transcript: it stays in the body. Returns
+ * `undefined` for anything that is not a voice note or carries no `alt`.
  */
-export function splitVoiceNoteTranscript(
-  body: string,
-  isVoiceNoteUrl: (url: string) => boolean,
-): { content: string; transcript: string } | null {
-  const links: string[] = [];
-  let transcript = body.replace(MARKDOWN_LINK_PATTERN, (match, url: string) => {
-    if (!isVoiceNoteUrl(url)) return match;
-    links.push(match);
-    return "";
-  });
-  if (links.length === 0) return null;
-  transcript = transcript
-    .split("\n")
-    .map((line) => line.trimEnd())
-    .join("\n")
-    .trim();
-  if (!transcript) return null;
-  return { content: links.join("\n"), transcript };
+export function voiceNoteTranscript(
+  entry: AudioAttachmentImetaEntry | undefined,
+): string | undefined {
+  if (!isVoiceNoteAttachment(entry)) return undefined;
+  const transcript = entry?.alt?.trim();
+  return transcript ? transcript : undefined;
 }
 
 const QUIET_LEVEL_THRESHOLD = 0.16;
