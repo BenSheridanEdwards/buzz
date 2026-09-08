@@ -15,8 +15,12 @@ import { describe, it } from "node:test";
 import { fromRawHermesProfile } from "@/shared/api/tauriHermesProfiles.ts";
 import {
   applyHermesProfileToDraft,
+  clearHermesProfileFromDraft,
   envVarsWithoutHermesProfile,
   HERMES_PROFILE_DEFAULT_INSTRUCTIONS,
+  hermesDraftOnHarnessChange,
+  hermesInstanceEnvVarsForPick,
+  hermesInstanceProfileState,
   hermesProfileEnvVars,
   hermesProfilePickerState,
   isHermesHarness,
@@ -104,13 +108,28 @@ describe("env var round-trip", () => {
     });
   });
 
-  it("reuses a hand-typed lowercase key instead of adding a duplicate row", () => {
+  it("rewrites a hand-typed lowercase key to the canonical spelling", () => {
+    // POSIX env is case-sensitive and `merged_user_env` passes keys verbatim to
+    // Command::env, so a pin left under `hermes_home` is a pin the agent never
+    // sees while the picker happily shows it as selected.
     const next = hermesProfileEnvVars({ hermes_home: "/old" }, bond.path);
     assert.deepEqual(next, {
-      hermes_home: bond.path,
+      HERMES_HOME: bond.path,
       HERMES_ACP_SKIP_CONFIGURED_MCP: "0",
     });
+    assert.equal(next.hermes_home, undefined);
     assert.equal(selectedHermesProfilePath(next), bond.path);
+  });
+
+  it("collapses every case variant of the MCP flag onto one key", () => {
+    const next = hermesProfileEnvVars(
+      { Hermes_Acp_Skip_Configured_Mcp: "1" },
+      bond.path,
+    );
+    assert.deepEqual(next, {
+      HERMES_HOME: bond.path,
+      HERMES_ACP_SKIP_CONFIGURED_MCP: "0",
+    });
   });
 
   it("clears only the profile pin", () => {
@@ -145,6 +164,23 @@ describe("isSameProfilePath", () => {
   it("never treats two empty pins as the same profile", () => {
     assert.equal(isSameProfilePath("", ""), false);
     assert.equal(isSameProfilePath("  ", "/"), false);
+  });
+
+  it("case-folds Windows paths and only Windows paths", () => {
+    // Windows filesystems case-fold, so a hand-typed pin matches the scanner's
+    // spelling and no spurious "Custom:" entry appears.
+    assert.equal(
+      isSameProfilePath(
+        "c:\\users\\me\\.hermes\\profiles\\bond",
+        "C:/Users/me/.hermes/profiles/bond",
+      ),
+      true,
+    );
+    // POSIX paths do not: /Users/me and /users/me can be two directories.
+    assert.equal(
+      isSameProfilePath("/users/me/.hermes/profiles/bond", bond.path),
+      false,
+    );
   });
 });
 
@@ -205,6 +241,183 @@ describe("applyHermesProfileToDraft", () => {
   });
 });
 
+describe("clearHermesProfileFromDraft", () => {
+  it("drops the pin and everything the pick seeded but the user never owned", () => {
+    const seeded = applyHermesProfileToDraft(emptyDraft(), bond);
+    const cleared = clearHermesProfileFromDraft(seeded, { parallelism: "" });
+    assert.deepEqual(cleared.envVars, {});
+    // Instructions that still say "your Hermes profile" and a parallelism of 1
+    // that only existed for a Hermes engine must not outlive the profile.
+    assert.equal(cleared.systemPrompt, "");
+    assert.equal(cleared.parallelism, "");
+    // Identity is the agent's now, not the profile's.
+    assert.equal(cleared.displayName, "Bond");
+    assert.equal(cleared.description, "Executor of the Fleet");
+    assert.equal(cleared.avatarUrl, bond.avatarDataUrl);
+  });
+
+  it("keeps instructions and parallelism the user chose", () => {
+    const draft = emptyDraft({
+      systemPrompt: "Be terse.",
+      envVars: { HERMES_HOME: bond.path, OPENAI_API_KEY: "sk" },
+      parallelism: "4",
+    });
+    const cleared = clearHermesProfileFromDraft(draft, { parallelism: "" });
+    assert.deepEqual(cleared.envVars, { OPENAI_API_KEY: "sk" });
+    assert.equal(cleared.systemPrompt, "Be terse.");
+    assert.equal(cleared.parallelism, "4");
+  });
+
+  it("restores the form's own parallelism default", () => {
+    const seeded = applyHermesProfileToDraft(emptyDraft(), bond);
+    assert.equal(
+      clearHermesProfileFromDraft(seeded, { parallelism: "3" }).parallelism,
+      "3",
+    );
+  });
+});
+
+describe("hermesDraftOnHarnessChange", () => {
+  const seeded = () => applyHermesProfileToDraft(emptyDraft(), bond);
+  const hermesPreset = { runtimeId: "hermes", command: null };
+  const hermesCustom = { runtimeId: "custom", command: "/opt/bin/hermes-acp" };
+  const otherPreset = { runtimeId: "claude", command: "claude-agent-acp" };
+  const otherCustom = { runtimeId: "custom", command: "/usr/bin/goose" };
+  const addedHarness = { runtimeId: "my-harness", command: "/usr/bin/aider" };
+
+  const cases = [
+    ["preset to preset", hermesPreset, otherPreset, true],
+    [
+      "preset to a custom command that is not Hermes",
+      hermesPreset,
+      otherCustom,
+      true,
+    ],
+    [
+      "custom Hermes command to another preset",
+      hermesCustom,
+      otherPreset,
+      true,
+    ],
+    [
+      "custom Hermes command to a freshly added harness",
+      hermesCustom,
+      addedHarness,
+      true,
+    ],
+    [
+      "preset to a custom command that is still Hermes",
+      hermesPreset,
+      hermesCustom,
+      false,
+    ],
+    [
+      "custom Hermes command to the Hermes preset",
+      hermesCustom,
+      hermesPreset,
+      false,
+    ],
+    ["a harness that was never Hermes", otherPreset, otherCustom, false],
+  ];
+
+  for (const [name, previous, next, drops] of cases) {
+    it(`${drops ? "drops" : "keeps"} the pin: ${name}`, () => {
+      const result = hermesDraftOnHarnessChange(seeded(), previous, next, {
+        parallelism: "",
+      });
+      assert.equal(
+        selectedHermesProfilePath(result.envVars),
+        drops ? "" : bond.path,
+      );
+      assert.equal(
+        result.systemPrompt,
+        drops ? "" : HERMES_PROFILE_DEFAULT_INSTRUCTIONS,
+      );
+      assert.equal(result.parallelism, drops ? "" : "1");
+    });
+  }
+
+  it("returns the draft untouched when nothing is dropped", () => {
+    const draft = seeded();
+    assert.equal(
+      hermesDraftOnHarnessChange(draft, hermesPreset, hermesCustom, {
+        parallelism: "",
+      }),
+      draft,
+    );
+  });
+});
+
+describe("hermes instance override layer", () => {
+  const inherited = {
+    HERMES_HOME: bond.path,
+    HERMES_ACP_SKIP_CONFIGURED_MCP: "0",
+    OPENAI_API_KEY: "definition-key",
+  };
+
+  it("reports a definition pin as inherited when nothing overrides it", () => {
+    const state = hermesInstanceProfileState({ FOO: "1" }, inherited);
+    assert.equal(state.isInherited, true);
+    assert.equal(
+      selectedHermesProfilePath(state.effectiveEnvVars),
+      bond.path,
+      "an instance created from a definition must not report No profile",
+    );
+    assert.equal(state.effectiveEnvVars.FOO, "1");
+  });
+
+  it("reports an instance pin as its own, not inherited", () => {
+    const state = hermesInstanceProfileState(
+      { HERMES_HOME: sky.path },
+      inherited,
+    );
+    assert.equal(state.isInherited, false);
+    assert.equal(selectedHermesProfilePath(state.effectiveEnvVars), sky.path);
+  });
+
+  it("writes no override when the pick is what the definition already gives", () => {
+    const nextEffective = hermesProfileEnvVars({ ...inherited }, bond.path);
+    assert.deepEqual(
+      hermesInstanceEnvVarsForPick({ FOO: "1" }, inherited, nextEffective),
+      { FOO: "1" },
+    );
+  });
+
+  it("writes an override only for a genuine change", () => {
+    const nextEffective = hermesProfileEnvVars({ ...inherited }, sky.path);
+    assert.deepEqual(
+      hermesInstanceEnvVarsForPick({ FOO: "1" }, inherited, nextEffective),
+      { FOO: "1", HERMES_HOME: sky.path },
+    );
+  });
+
+  it("removes an override that returns to the inherited profile", () => {
+    const nextEffective = hermesProfileEnvVars({ ...inherited }, bond.path);
+    assert.deepEqual(
+      hermesInstanceEnvVarsForPick(
+        { HERMES_HOME: sky.path, HERMES_ACP_SKIP_CONFIGURED_MCP: "1" },
+        inherited,
+        nextEffective,
+      ),
+      {},
+    );
+  });
+
+  it("keeps the whole pin on an instance with no definition underneath", () => {
+    const nextEffective = hermesProfileEnvVars({}, bond.path);
+    assert.deepEqual(hermesInstanceEnvVarsForPick({}, {}, nextEffective), {
+      HERMES_HOME: bond.path,
+      HERMES_ACP_SKIP_CONFIGURED_MCP: "0",
+    });
+  });
+
+  it("never copies unrelated definition env vars into the override layer", () => {
+    const nextEffective = hermesProfileEnvVars({ ...inherited }, sky.path);
+    const override = hermesInstanceEnvVarsForPick({}, inherited, nextEffective);
+    assert.equal(override.OPENAI_API_KEY, undefined);
+  });
+});
+
 describe("hermesProfilePickerState", () => {
   it("offers No profile plus every discovered profile", () => {
     const state = hermesProfilePickerState([bond, sky], {});
@@ -235,6 +448,54 @@ describe("hermesProfilePickerState", () => {
     assert.deepEqual(state.options.at(-1), {
       label: "Custom: /gone/profile",
       value: "/gone/profile",
+    });
+  });
+
+  it("does not flash a Custom entry while the scan is still running", () => {
+    const loading = hermesProfilePickerState(
+      [],
+      { HERMES_HOME: bond.path },
+      {
+        status: "loading",
+      },
+    );
+    assert.ok(
+      !loading.options.some((option) => option.label.startsWith("Custom:")),
+    );
+    // No option to point at yet: the placeholder shows instead of claiming the
+    // agent has no profile.
+    assert.equal(loading.value, "");
+
+    const ready = hermesProfilePickerState(
+      [bond],
+      { HERMES_HOME: bond.path },
+      {
+        status: "ready",
+      },
+    );
+    assert.equal(ready.value, bond.path);
+  });
+
+  it("still offers the Custom entry when the scan failed", () => {
+    const state = hermesProfilePickerState(
+      [],
+      { HERMES_HOME: "/gone" },
+      {
+        status: "error",
+      },
+    );
+    assert.equal(state.value, "/gone");
+  });
+
+  it("names the definition's profile on the fall-back option", () => {
+    const state = hermesProfilePickerState(
+      [bond, sky],
+      { HERMES_HOME: sky.path },
+      { inheritedPath: bond.path },
+    );
+    assert.deepEqual(state.options[0], {
+      label: "Definition default: Bond",
+      value: NO_HERMES_PROFILE_VALUE,
     });
   });
 });

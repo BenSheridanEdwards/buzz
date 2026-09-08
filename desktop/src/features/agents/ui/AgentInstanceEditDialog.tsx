@@ -74,7 +74,7 @@ import { RunOnSummarySection } from "./RunOnSummarySection";
 import { EditAgentRuntimeField } from "./EditAgentRuntimeField";
 import { useHermesProfilePicker } from "./HermesProfileField";
 import {
-  envVarsWithoutHermesProfile,
+  hermesDraftOnHarnessChange,
   isHermesHarness,
 } from "./hermesProfileSelection";
 import {
@@ -326,11 +326,16 @@ export function AgentInstanceEditDialog({
   const prospectiveRuntime = runtimes.find(
     (r) => r.id === prospectiveRuntimeId,
   );
+  const harnessSelection = {
+    runtimeId: prospectiveRuntimeId,
+    command: prospectiveRuntime?.command ?? agentCommand,
+  };
   const isHermesSelected = isHermesHarness(
-    prospectiveRuntimeId,
-    prospectiveRuntime?.command ?? agentCommand,
+    harnessSelection.runtimeId,
+    harnessSelection.command,
   );
   const hermesPicker = useHermesProfilePicker({
+    defaultParallelism: String(agent.parallelism),
     // Avatar and description are definition-level identity here; the
     // instance prompt is only editable when no definition owns it.
     draft: {
@@ -342,6 +347,11 @@ export function AgentInstanceEditDialog({
       parallelism,
     },
     enabled: open && isHermesSelected,
+    // Instance env vars are an override layer over the definition's; the
+    // picker must show what the process will actually see, not just the
+    // overrides, or every agent created from a profile-backed definition
+    // reports "No profile".
+    inheritedEnvVars: inheritedEnvVars,
     onApply: (next) => {
       setName(next.displayName);
       if (linkedPersona == null) setSystemPrompt(next.systemPrompt);
@@ -349,6 +359,51 @@ export function AgentInstanceEditDialog({
       setParallelism(next.parallelism);
     },
   });
+
+  // Every route out of Hermes drops the pin, not just the harness dropdown: a
+  // hand-typed custom command that stops being a Hermes binary hides the field
+  // while `HERMES_HOME` would otherwise stay in the env. Watching the harness
+  // itself keeps one owner for all of them, and reuses the same transform the
+  // definition dialog applies.
+  const hermesDraft = {
+    displayName: name,
+    description: "",
+    avatarUrl: "",
+    systemPrompt,
+    envVars,
+    parallelism,
+  };
+  const previousHarnessRef = React.useRef(harnessSelection);
+  const hermesDraftRef = React.useRef(hermesDraft);
+  hermesDraftRef.current = hermesDraft;
+  // biome-ignore lint/correctness/useExhaustiveDependencies: the draft is read through a ref so an env edit does not re-run the harness watch
+  React.useEffect(() => {
+    const previousHarness = previousHarnessRef.current;
+    previousHarnessRef.current = harnessSelection;
+    if (!open) {
+      return;
+    }
+    const next = hermesDraftOnHarnessChange(
+      hermesDraftRef.current,
+      previousHarness,
+      harnessSelection,
+      { parallelism: String(agent.parallelism) },
+    );
+    if (next === hermesDraftRef.current) {
+      return;
+    }
+    setEnvVars(next.envVars);
+    setParallelism(next.parallelism);
+    if (linkedPersona == null) {
+      setSystemPrompt(next.systemPrompt);
+    }
+  }, [
+    agent.parallelism,
+    harnessSelection.command,
+    harnessSelection.runtimeId,
+    linkedPersona,
+    open,
+  ]);
   const runtimeCatalogStatus = runtimesQuery.isLoading
     ? ("loading" as const)
     : runtimesQuery.isError
@@ -578,28 +633,17 @@ export function AgentInstanceEditDialog({
       setAgentArgs(newArgs);
     }
 
-    // Leaving Hermes drops the profile pin; it means nothing elsewhere.
-    const leavingHermes =
-      isHermesSelected &&
-      !isCustomCommand &&
-      !isHermesHarness(nextRuntimeId, nextRuntime?.command);
+    // The profile pin is dropped by the "left Hermes" effect above, which also
+    // covers the custom-command path this handler cannot see.
     applySelection(
-      selectionOnRuntimeChange(
-        leavingHermes
-          ? {
-              ...selection,
-              envVars: envVarsWithoutHermesProfile(selection.envVars),
-            }
-          : selection,
-        {
-          previousRuntime: previousRuntimeId,
-          nextRuntime: nextRuntime?.id ?? nextRuntimeId,
-          nextRuntimeCanChooseProvider: runtimeSupportsLlmProviderSelection(
-            nextRuntime?.id ?? nextRuntimeId,
-          ),
-          lockedRuntimeReset: "full",
-        },
-      ),
+      selectionOnRuntimeChange(selection, {
+        previousRuntime: previousRuntimeId,
+        nextRuntime: nextRuntime?.id ?? nextRuntimeId,
+        nextRuntimeCanChooseProvider: runtimeSupportsLlmProviderSelection(
+          nextRuntime?.id ?? nextRuntimeId,
+        ),
+        lockedRuntimeReset: "full",
+      }),
     );
   }
 
@@ -1052,10 +1096,17 @@ export function AgentInstanceEditDialog({
 
             <EditAgentRuntimeField
               disabled={isSaving}
-              envVars={envVars}
+              // The picker shows the effective env (definition layer plus this
+              // instance's overrides), never the override layer alone.
+              envVars={hermesPicker.effectiveEnvVars}
               hermes={
                 isHermesSelected
                   ? {
+                      inherited: {
+                        isInherited: hermesPicker.isInherited,
+                        onEditDefinition: onEditLinkedPersona,
+                        path: hermesPicker.inheritedPath,
+                      },
                       onProfileChange: hermesPicker.handleProfileChange,
                       profiles: hermesPicker.profiles,
                       status: hermesPicker.status,

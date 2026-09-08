@@ -76,7 +76,7 @@ import {
   useHermesProfilePicker,
 } from "./HermesProfileField";
 import {
-  envVarsWithoutHermesProfile,
+  hermesDraftOnHarnessChange,
   isHermesHarness,
 } from "./hermesProfileSelection";
 import {
@@ -408,6 +408,9 @@ export function AgentDefinitionDialog({
   const selectedRuntime = runtimes.find((p) => p.id === runtime);
   const isHermesSelected = isHermesHarness(runtime, selectedRuntime?.command);
   const hermesPicker = useHermesProfilePicker({
+    // A definition with no profile has no parallelism preference either; the
+    // blank field means "use the harness default".
+    defaultParallelism: "",
     draft: {
       displayName,
       description: descriptionDraft,
@@ -711,15 +714,29 @@ export function AgentDefinitionDialog({
     isRuntimeAutoSeededRef.current = false;
     setRuntime(nextRuntime);
     const nextRuntimeEntry = runtimes.find((p) => p.id === nextRuntime);
-    // Leaving Hermes drops the profile pin; it means nothing elsewhere.
-    const envVarsForNext =
-      isHermesSelected &&
-      !isHermesHarness(nextRuntime, nextRuntimeEntry?.command)
-        ? envVarsWithoutHermesProfile(selection.envVars)
-        : selection.envVars;
+    // Leaving Hermes drops the profile pin and everything the pick seeded but
+    // the user never made their own; it all means nothing to another harness.
+    const afterHarnessChange = hermesDraftOnHarnessChange(
+      {
+        displayName,
+        description: descriptionDraft,
+        avatarUrl,
+        systemPrompt,
+        envVars: selection.envVars,
+        parallelism: behaviorDraft.parallelism,
+      },
+      { runtimeId: runtime, command: selectedRuntime?.command },
+      { runtimeId: nextRuntime, command: nextRuntimeEntry?.command },
+      { parallelism: "" },
+    );
+    setSystemPrompt(afterHarnessChange.systemPrompt);
+    setBehaviorDraft({
+      ...behaviorDraft,
+      parallelism: afterHarnessChange.parallelism,
+    });
     applySelection(
       selectionOnRuntimeChange(
-        { ...selection, envVars: envVarsForNext },
+        { ...selection, envVars: afterHarnessChange.envVars },
         {
           previousRuntime: runtime,
           nextRuntime,

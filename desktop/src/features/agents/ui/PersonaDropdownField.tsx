@@ -17,6 +17,7 @@ import {
 
 export function PersonaDropdownField({
   contentClassName,
+  describedBy,
   disabled,
   id,
   onValueChange,
@@ -25,6 +26,8 @@ export function PersonaDropdownField({
   value,
 }: {
   contentClassName?: string;
+  /** Space-separated ids of the help/error text describing this control. */
+  describedBy?: string;
   disabled?: boolean;
   id: string;
   onValueChange: (value: string) => void;
@@ -40,6 +43,7 @@ export function PersonaDropdownField({
       <DropdownMenu modal={false} onOpenChange={setOpen} open={open}>
         <DropdownMenuTrigger asChild>
           <button
+            aria-describedby={describedBy}
             className={cn(
               "flex h-11 w-full items-center justify-between gap-3 px-3 py-2 text-left text-sm leading-6",
               PERSONA_FIELD_CONTROL_CLASS,

@@ -28,6 +28,11 @@ export function EditAgentRuntimeField({
   envVars: Record<string, string>;
   /** Present only while the prospective harness is Hermes. */
   hermes: {
+    inherited: {
+      isInherited: boolean;
+      onEditDefinition?: () => void;
+      path: string;
+    };
     onProfileChange: (profile: HermesProfile | null) => void;
     profiles: readonly HermesProfile[];
     status: HermesProfilesStatus;
@@ -78,6 +83,7 @@ export function EditAgentRuntimeField({
           disabled={disabled}
           envVars={envVars}
           id="edit-agent-hermes-profile"
+          inherited={hermes.inherited}
           onProfileChange={hermes.onProfileChange}
           profiles={hermes.profiles}
           status={hermes.status}

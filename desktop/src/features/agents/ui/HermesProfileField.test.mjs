@@ -86,10 +86,22 @@ after(() => {
 const flush = () => new Promise((resolve) => setTimeout(resolve, 0));
 
 /** Mount the production hook and expose its latest return value. */
-function mountPicker({ draft, enabled, onApply }) {
+function mountPicker({
+  defaultParallelism = "",
+  draft,
+  enabled,
+  inheritedEnvVars,
+  onApply,
+}) {
   const latest = { current: null };
   function Probe() {
-    latest.current = useHermesProfilePicker({ draft, enabled, onApply });
+    latest.current = useHermesProfilePicker({
+      defaultParallelism,
+      draft,
+      enabled,
+      inheritedEnvVars,
+      onApply,
+    });
     return React.createElement("span", null, latest.current.status);
   }
   const container = dom.window.document.createElement("div");
@@ -197,10 +209,94 @@ describe("useHermesProfilePicker", () => {
     act(() => mounted.latest.current.handleProfileChange(null));
     assert.equal(applied.length, 1);
     assert.deepEqual(applied[0].envVars, { OPENAI_API_KEY: "sk" });
-    // Identity and run settings are the user's to change; clearing the
-    // profile does not undo them.
+    // Identity is the agent's now; the seeded run settings are not, and must
+    // not outlive the profile that explained them.
     assert.equal(applied[0].displayName, "Bond");
+    assert.equal(applied[0].parallelism, "");
+    mounted.unmount();
+  });
+
+  it("shows the definition's pin and writes no override for it", async () => {
+    listHandler = () => Promise.resolve([rawBond]);
+    const applied = [];
+    const inheritedEnvVars = {
+      HERMES_HOME: rawBond.path,
+      HERMES_ACP_SKIP_CONFIGURED_MCP: "0",
+    };
+    const mounted = mountPicker({
+      // The instance layer is empty: instances are never seeded from their
+      // definition, so reading it alone would report "No profile".
+      draft: { ...emptyDraft, envVars: {} },
+      enabled: true,
+      inheritedEnvVars,
+      onApply: (next) => applied.push(next),
+    });
+    await mounted.settle();
+
+    assert.equal(mounted.latest.current.isInherited, true);
+    assert.equal(mounted.latest.current.inheritedPath, rawBond.path);
+    assert.equal(
+      mounted.latest.current.effectiveEnvVars.HERMES_HOME,
+      rawBond.path,
+    );
+
+    // Re-picking the inherited profile is not a change, so no override lands.
+    const [bond] = mounted.latest.current.profiles;
+    act(() => mounted.latest.current.handleProfileChange(bond));
+    assert.deepEqual(applied[0].envVars, {});
+    mounted.unmount();
+  });
+
+  it("falls back to the definition's profile without clearing its seeding", async () => {
+    listHandler = () => Promise.resolve([rawBond]);
+    const applied = [];
+    const mounted = mountPicker({
+      defaultParallelism: "4",
+      draft: {
+        ...emptyDraft,
+        envVars: { HERMES_HOME: "/Users/me/.hermes/profiles/sky" },
+        parallelism: "1",
+        systemPrompt: HERMES_PROFILE_DEFAULT_INSTRUCTIONS,
+      },
+      enabled: true,
+      inheritedEnvVars: { HERMES_HOME: rawBond.path },
+      onApply: (next) => applied.push(next),
+    });
+    await mounted.settle();
+
+    act(() => mounted.latest.current.handleProfileChange(null));
+    // The override goes; the definition's profile is still in effect, so the
+    // instructions and parallelism it explains stay.
+    assert.deepEqual(applied[0].envVars, {});
     assert.equal(applied[0].parallelism, "1");
+    assert.equal(applied[0].systemPrompt, HERMES_PROFILE_DEFAULT_INSTRUCTIONS);
+    mounted.unmount();
+  });
+
+  it("writes an instance override only when the pick differs", async () => {
+    const rawSky = {
+      slug: "sky",
+      name: "Sky",
+      path: "/Users/me/.hermes/profiles/sky",
+    };
+    listHandler = () => Promise.resolve([rawBond, rawSky]);
+    const applied = [];
+    const mounted = mountPicker({
+      draft: { ...emptyDraft, envVars: {} },
+      enabled: true,
+      inheritedEnvVars: { HERMES_HOME: rawBond.path },
+      onApply: (next) => applied.push(next),
+    });
+    await mounted.settle();
+
+    const sky = mounted.latest.current.profiles.find(
+      (profile) => profile.slug === "sky",
+    );
+    act(() => mounted.latest.current.handleProfileChange(sky));
+    assert.deepEqual(applied[0].envVars, {
+      HERMES_HOME: rawSky.path,
+      HERMES_ACP_SKIP_CONFIGURED_MCP: "0",
+    });
     mounted.unmount();
   });
 
@@ -251,6 +347,46 @@ describe("HermesProfileField", () => {
       }),
     );
   }
+
+  it("describes the control with its help, path and error text", () => {
+    const html = render({
+      envVars: { HERMES_HOME: bond.path },
+      status: "error",
+    });
+    assert.ok(
+      html.includes(
+        'aria-describedby="persona-hermes-profile-error persona-hermes-profile-path persona-hermes-profile-help"',
+      ),
+      html,
+    );
+    assert.ok(html.includes('role="alert"'));
+  });
+
+  it("renders an inherited pin read-only with a way back to the definition", () => {
+    let edited = 0;
+    const html = renderToStaticMarkup(
+      React.createElement(HermesProfileField, {
+        disabled: false,
+        envVars: { HERMES_HOME: bond.path },
+        inherited: {
+          isInherited: true,
+          onEditDefinition: () => {
+            edited += 1;
+          },
+          path: bond.path,
+        },
+        onProfileChange: () => {},
+        profiles: [bond],
+        status: "ready",
+      }),
+    );
+    // An instance override cannot unset an inherited env var, so the control is
+    // read-only and the recovery affordance points at the definition.
+    assert.ok(html.includes("disabled"));
+    assert.ok(html.includes("Set by this agent&#x27;s definition."));
+    assert.ok(html.includes("Edit definition"));
+    assert.equal(edited, 0);
+  });
 
   it("labels the control and shows the pinned directory read-only", () => {
     const html = render({ envVars: { HERMES_HOME: bond.path } });
