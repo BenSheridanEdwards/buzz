@@ -5,8 +5,17 @@ enum VoiceNotePackager {
     static let videoEnvelopeTimeout: TimeInterval = 30
     static let exportTimeout: TimeInterval = 30
 
+    /// Upload container for a recorded voice note. Raw values match the Dart side.
+    enum Container: String {
+        /// H.264/AAC MP4 envelope uploaded as `video/mp4`.
+        case mp4Envelope = "mp4"
+        /// Bare AAC audio uploaded as `audio/mp4` on relays advertising `buzz-audio`.
+        case m4a
+    }
+
     static func package(
         sourcePath: String,
+        container: Container = .mp4Envelope,
         result: @escaping FlutterResult
     ) {
         let sourceAsset = AVURLAsset(url: URL(fileURLWithPath: sourcePath))
@@ -30,6 +39,11 @@ enum VoiceNotePackager {
                     details: nil
                 )
             )
+            return
+        }
+
+        if container == .m4a {
+            exportVoiceNoteAudio(sourceURL: URL(fileURLWithPath: sourcePath), result: result)
             return
         }
 
@@ -263,6 +277,78 @@ enum VoiceNotePackager {
         exportSession.shouldOptimizeForNetworkUse = true
         exportSession.metadata = []
         exportSession.metadataItemFilter = nil
+        runExport(exportSession, outputURL: outputURL, videoURL: videoURL, result: result)
+    }
+
+    /// Exports the recording as bare AAC audio for relays that accept `audio/mp4`.
+    ///
+    /// The composition carries only the audio track and the `.m4a` output type keeps the
+    /// container an ISO `M4A ` brand rather than QuickTime. `metadata = []` plus the sharing
+    /// filter stop AVFoundation from writing any `udta`/`meta` box, which the relay rejects.
+    private static func exportVoiceNoteAudio(
+        sourceURL: URL,
+        result: @escaping FlutterResult
+    ) {
+        let sourceAsset = AVURLAsset(url: sourceURL)
+        let composition = AVMutableComposition()
+        do {
+            guard
+                let sourceAudio = sourceAsset.tracks(withMediaType: .audio).first,
+                let destinationAudio = composition.addMutableTrack(
+                    withMediaType: .audio,
+                    preferredTrackID: kCMPersistentTrackID_Invalid
+                )
+            else {
+                throw NSError(
+                    domain: "BuzzVoiceNote",
+                    code: 6,
+                    userInfo: [NSLocalizedDescriptionKey: "Unable to assemble the voice note audio."]
+                )
+            }
+            try destinationAudio.insertTimeRange(sourceAudio.timeRange, of: sourceAudio, at: .zero)
+        } catch {
+            result(
+                FlutterError(
+                    code: "transcode_failed",
+                    message: "Unable to assemble voice note for upload.",
+                    details: error.localizedDescription
+                )
+            )
+            return
+        }
+
+        guard let exportSession = AVAssetExportSession(
+            asset: composition,
+            presetName: AVAssetExportPresetAppleM4A
+        ) else {
+            result(
+                FlutterError(
+                    code: "transcode_failed",
+                    message: "Unable to create voice note export session.",
+                    details: nil
+                )
+            )
+            return
+        }
+        let outputURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString)
+            .appendingPathExtension("m4a")
+        exportSession.outputURL = outputURL
+        exportSession.outputFileType = .m4a
+        exportSession.shouldOptimizeForNetworkUse = true
+        exportSession.metadata = []
+        exportSession.metadataItemFilter = AVMetadataItemFilter.forSharing()
+        runExport(exportSession, outputURL: outputURL, videoURL: nil, result: result)
+    }
+
+    /// Runs a configured export with a timeout, canonicalizes the output and delivers the
+    /// Flutter result exactly once. `videoURL` is the temporary envelope track to remove.
+    private static func runExport(
+        _ exportSession: AVAssetExportSession,
+        outputURL: URL,
+        videoURL: URL?,
+        result: @escaping FlutterResult
+    ) {
         let completionQueue = DispatchQueue(label: "xyz.block.buzz.voice-note-export")
         let completion = VoiceNoteExportCompletion(
             outputURL: outputURL,
@@ -325,13 +411,13 @@ enum VoiceNotePackager {
 /// even though the timeout already delivered the Flutter result.
 final class VoiceNoteExportCompletion {
     private let outputURL: URL
-    private let videoURL: URL
+    private let videoURL: URL?
     private let fileManager: FileManager
     private var delivered = false
 
     init(
         outputURL: URL,
-        videoURL: URL,
+        videoURL: URL?,
         fileManager: FileManager = .default
     ) {
         self.outputURL = outputURL
@@ -359,7 +445,8 @@ final class VoiceNoteExportCompletion {
         deliver()
     }
 
-    private func remove(_ url: URL) {
+    private func remove(_ url: URL?) {
+        guard let url else { return }
         try? fileManager.removeItem(at: url)
     }
 }

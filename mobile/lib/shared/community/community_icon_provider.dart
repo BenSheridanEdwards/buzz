@@ -3,6 +3,8 @@ import 'dart:convert';
 import 'package:hooks_riverpod/hooks_riverpod.dart';
 import 'package:http/http.dart' as http;
 
+import '../relay/relay_info_uri.dart';
+
 /// Supplies the HTTP client used for NIP-11 community icon lookups.
 ///
 /// Tests can override this provider to return deterministic relay responses.
@@ -20,7 +22,7 @@ final communityIconHttpClientProvider = Provider<http.Client>((ref) {
 /// metadata updates can be retried without background polling.
 final communityIconProvider = FutureProvider.autoDispose
     .family<String?, String>((ref, relayUrl) async {
-      final uri = _relayInfoUri(relayUrl);
+      final uri = relayInfoUri(relayUrl);
       if (uri == null) return null;
 
       try {
@@ -42,18 +44,3 @@ final communityIconProvider = FutureProvider.autoDispose
         return null;
       }
     });
-
-Uri? _relayInfoUri(String relayUrl) {
-  try {
-    final uri = Uri.parse(relayUrl.trim());
-    final scheme = switch (uri.scheme) {
-      'wss' => 'https',
-      'ws' => 'http',
-      'https' || 'http' => uri.scheme,
-      _ => null,
-    };
-    return scheme == null ? null : uri.replace(scheme: scheme);
-  } on FormatException {
-    return null;
-  }
-}

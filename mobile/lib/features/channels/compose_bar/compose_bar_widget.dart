@@ -545,6 +545,19 @@ class ComposeBar extends HookConsumerWidget {
         final queueGeneration = uploadGeneration.value;
         final cancellation = UploadCancellationToken();
         final uploadService = ref.read(mediaUploadServiceProvider);
+        // Kick off the relay's NIP-11 audio verdict (cached per relay) before
+        // the first await so the provider is read while this ref is live.
+        final relayAudioSupport =
+            queuedAttachments.any(
+              (attachment) =>
+                  attachment.kind == _PendingAttachmentKind.voiceNote,
+            )
+            ? ref.read(
+                relayAudioSupportProvider(
+                  ref.read(relayConfigProvider).baseUrl,
+                ).future,
+              )
+            : null;
         activeUploadCancellation.value = cancellation;
         final delivery = onSend;
         unawaited(() async {
@@ -556,6 +569,7 @@ class ComposeBar extends HookConsumerWidget {
               final descriptor = await _uploadPendingAttachment(
                 uploadService,
                 attachment,
+                relayAudioSupport: relayAudioSupport,
                 onProgress: (progress) {
                   if (context.mounted) {
                     uploadProgress.value =

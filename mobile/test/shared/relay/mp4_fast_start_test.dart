@@ -64,6 +64,75 @@ void main() {
     });
   }
 
+  test('strips moov-level meta and udta only when asked', () async {
+    final ftyp = _box('ftyp', [
+      ...ascii.encode('M4A '),
+      0,
+      0,
+      0,
+      0,
+      ...ascii.encode('isom'),
+    ]);
+    final mdat = _box('mdat', [9, 9, 9, 9]);
+    final originalMediaOffset = ftyp.length + 8;
+    final sampleTable = _box('stco', [
+      0,
+      0,
+      0,
+      0,
+      ..._uint32(1),
+      ..._uint32(originalMediaOffset),
+    ]);
+    final trak = _box(
+      'trak',
+      _box('mdia', _box('minf', _box('stbl', sampleTable))),
+    );
+    // MediaMuxer's moov-level metadata: `meta` (com.android.version) and a
+    // `udta` box, neither of which the relay accepts on audio uploads.
+    final meta = _box('meta', [
+      0,
+      0,
+      0,
+      0,
+      ..._box('keys', [0, 0, 0, 0]),
+    ]);
+    final udta = _box('udta', _box('name', ascii.encode('note')));
+    final moov = _box('moov', [...trak, ...meta, ...udta]);
+    final source = File('${tempDirectory.path}/source.m4a');
+    await source.writeAsBytes([...ftyp, ...mdat, ...moov]);
+
+    final kept = File('${tempDirectory.path}/kept.m4a');
+    await rewriteMp4ForFastStart(source, kept);
+    final keptBytes = await kept.readAsBytes();
+    expect(_topLevelTypes(keptBytes), ['ftyp', 'moov', 'mdat']);
+    expect(_findAscii(keptBytes, 'meta'), greaterThan(0));
+    expect(_findAscii(keptBytes, 'udta'), greaterThan(0));
+
+    final stripped = File('${tempDirectory.path}/stripped.m4a');
+    await rewriteMp4ForFastStart(source, stripped, stripMoovMetadata: true);
+    final strippedBytes = await stripped.readAsBytes();
+    expect(_topLevelTypes(strippedBytes), ['ftyp', 'moov', 'mdat']);
+    expect(_findAscii(strippedBytes, 'meta'), -1);
+    expect(_findAscii(strippedBytes, 'udta'), -1);
+    expect(_findAscii(strippedBytes, 'name'), -1);
+    final expectedMoov = _box('moov', trak);
+    expect(
+      strippedBytes.sublist(ftyp.length, ftyp.length + expectedMoov.length),
+      isNot(equals(expectedMoov)),
+      reason: 'chunk offsets must be patched for the smaller moov',
+    );
+    expect(_readUint32(strippedBytes, ftyp.length), expectedMoov.length);
+    final entryOffset = _findAscii(strippedBytes, 'stco') + 12;
+    expect(
+      _readUint32(strippedBytes, entryOffset),
+      originalMediaOffset + expectedMoov.length,
+    );
+    expect(
+      strippedBytes.sublist(ftyp.length + expectedMoov.length),
+      equals(mdat),
+    );
+  });
+
   test(
     'rejects excessive nested box depth and deletes partial output',
     () async {

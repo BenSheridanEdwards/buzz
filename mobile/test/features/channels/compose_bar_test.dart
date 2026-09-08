@@ -192,11 +192,15 @@ Widget _buildComposeBar({
   String composeBarKey = 'compose-bar',
   VoiceNoteRecorder Function()? voiceNoteRecorderFactory,
   VoiceNotePlayerController Function()? voiceNotePlayerFactory,
+  bool relayAcceptsAudio = false,
 }) {
   return ProviderScope(
     overrides: [
       customEmojiListProvider.overrideWithValue(customEmoji),
       mediaUploadServiceProvider.overrideWithValue(uploadService),
+      relayAudioSupportHttpClientProvider.overrideWithValue(
+        _fakeRelayInfoClient(relayAcceptsAudio: relayAcceptsAudio),
+      ),
       if (voiceNoteRecorderFactory != null)
         voiceNoteRecorderFactoryProvider.overrideWithValue(
           voiceNoteRecorderFactory,
@@ -330,6 +334,21 @@ class _FakeRelayConfigNotifier extends RelayConfigNotifier {
   );
 }
 
+/// Serves the relay's NIP-11 document, with or without `buzz-audio`.
+http.Client _fakeRelayInfoClient({required bool relayAcceptsAudio}) =>
+    http_testing.MockClient((request) async {
+      expect(request.headers['Accept'], 'application/nostr+json');
+      return http.Response(
+        jsonEncode({
+          'supported_extensions': [
+            'nip-29',
+            if (relayAcceptsAudio) 'buzz-audio',
+          ],
+        }),
+        200,
+      );
+    });
+
 class _FakeAppLifecycleNotifier extends AppLifecycleNotifier {
   @override
   AppLifecycleState build() => AppLifecycleState.resumed;
@@ -392,6 +411,7 @@ class _FakeVoiceNoteUploadService extends MediaUploadService {
       );
 
   VoiceNoteRecording? uploadedRecording;
+  bool? uploadedWithRelayAudio;
   Completer<BlobDescriptor>? pendingVoiceNoteUpload;
   XFile? file;
 
@@ -402,6 +422,7 @@ class _FakeVoiceNoteUploadService extends MediaUploadService {
   Future<BlobDescriptor> uploadVoiceNote(
     XFile voiceNote, {
     required Duration duration,
+    bool relayAcceptsAudio = false,
     ValueChanged<double>? onProgress,
     UploadCancellationToken? cancellationToken,
   }) async {
@@ -410,18 +431,20 @@ class _FakeVoiceNoteUploadService extends MediaUploadService {
       duration: duration,
       waveform: const [],
     );
+    uploadedWithRelayAudio = relayAcceptsAudio;
     final pending = pendingVoiceNoteUpload;
     if (pending != null) return pending.future;
     onProgress?.call(1);
+    final extension = relayAcceptsAudio ? 'm4a' : 'mp4';
     return BlobDescriptor(
-      url: 'https://relay.example/media/voice-note.mp4',
+      url: 'https://relay.example/media/voice-note.$extension',
       sha256:
           '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef',
       size: 4,
-      type: 'video/mp4',
+      type: relayAcceptsAudio ? 'audio/mp4' : 'video/mp4',
       uploaded: 1,
       duration: duration.inMilliseconds / 1000,
-      filename: voiceNote.name.replaceFirst('.m4a', '.mp4'),
+      filename: voiceNote.name.replaceFirst('.m4a', '.$extension'),
     );
   }
 }
@@ -4794,6 +4817,7 @@ void main() {
         uploadService.uploadedRecording?.duration,
         const Duration(seconds: 3),
       );
+      expect(uploadService.uploadedWithRelayAudio, isFalse);
       expect(
         sentContent,
         'Keep this draft\n'
@@ -4805,6 +4829,63 @@ void main() {
           'm video/mp4',
           'duration 3.0',
           'filename voice-note-test.mp4',
+        ]),
+      );
+    });
+
+    testWidgets('sends a voice note as bare audio on a buzz-audio relay', (
+      tester,
+    ) async {
+      final recorder = _FakeVoiceNoteRecorder();
+      final uploadService = _FakeVoiceNoteUploadService();
+      String? sentContent;
+      List<List<String>> sentMediaTags = const [];
+
+      await tester.pumpWidget(
+        _buildComposeBar(
+          uploadService: uploadService,
+          relayAcceptsAudio: true,
+          voiceNoteRecorderFactory: () => recorder,
+          voiceNotePlayerFactory: _FakeVoiceNotePlayer.new,
+          onSend:
+              (
+                content,
+                mentionPubkeys, {
+                mediaTags = const <List<String>>[],
+              }) async {
+                sentContent = content;
+                sentMediaTags = mediaTags;
+              },
+        ),
+      );
+
+      await _expandComposer(tester);
+      await _openAttachmentMenu(tester);
+      await tester.tap(find.text('Voice note'));
+      await tester.pumpAndSettle();
+      await tester.tap(find.byKey(const ValueKey('voice-note-recorder-stop')));
+      await tester.pumpAndSettle();
+      await tester.tap(
+        find
+            .ancestor(
+              of: find.byIcon(LucideIcons.arrowUp),
+              matching: find.byType(IconButton),
+            )
+            .hitTestable(),
+      );
+      await tester.pumpAndSettle();
+
+      expect(uploadService.uploadedWithRelayAudio, isTrue);
+      expect(
+        sentContent,
+        '\n[voice-note-test.m4a](https://relay.example/media/voice-note.m4a)',
+      );
+      expect(
+        sentMediaTags.single,
+        containsAll([
+          'm audio/mp4',
+          'duration 3.0',
+          'filename voice-note-test.m4a',
         ]),
       );
     });

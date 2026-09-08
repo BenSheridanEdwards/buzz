@@ -67,7 +67,7 @@ Size: about 100 lines. Half a day. Optional for the first milestone, because the
 
 1. Build from `main` to get voice notes at all (PR #7121).
 2. `mobile/lib/shared/relay/media_upload.dart`: `_allowedAudioMimeTypes` is the voice-note set; extend the generic upload path (line 585) to accept audio files from the picker.
-3. `voice_note_recording.dart` and the two native packagers: upload the recorded M4A as `audio/mp4` when the relay accepts audio; keep the MP4 envelope as fallback.
+3. `voice_note_recording.dart` and the two native packagers: upload the recorded M4A as `audio/mp4` when the relay accepts audio; keep the MP4 envelope as fallback. Done (issue #3): `relay_audio_support_provider.dart` reads NIP-11 once per relay per session (any failure is `false`, retried after five minutes); `packageVoiceNoteForUpload` takes `{path, container: "m4a" | "mp4"}`; Android remuxes only the AAC track with `MediaMuxer` and the Dart fast-start rewrite drops the moov-level `meta` box `MediaMuxer` always writes; iOS exports an audio-only composition with `AVAssetExportPresetAppleM4A`, `.m4a`, `metadata = []` and the sharing metadata filter. The upload is `audio/mp4` with `filename voice-note-<id>.m4a`, imeta `m audio/mp4` plus `duration`, and content `[voice-note-<id>.m4a](url)`. Without the extension the envelope path is unchanged.
 4. `message_content.dart:328`: verify the audio kind renders the same player as voice notes for `audio/mpeg` and `audio/mp4`; adjust the kind detection in `message_media.dart:123-141` if it keys on filename.
 
 Size: about 150 lines plus the build pipeline. One day of code. Toolchain is the real cost, see section 5.
@@ -124,7 +124,7 @@ Implemented on this branch (see `docs/VOICE-NOTES-ISSUE.md` for the design and a
 - **3.2 CLI**: done (allow-list, `filename` imeta, audio link markdown).
 - **3.3 Desktop**: sending done. When the relay advertises `buzz-audio`, voice notes upload as bare AAC M4A (`audio/mp4`); otherwise the envelope. Receiving needed nothing.
 - **3.5 Hermes plugin**: done locally (`~/.hermes/hermes-agent/plugins/platforms/buzz/adapter.py`, backup `adapter.py.bak-20260906-audio`). Outbound: NIP-11 probe, metadata-free MP3 (frame copy for MP3 sources, LAME otherwise), direct Blossom PUT with a kind-24242 auth event, kind-9 publish with `filename voice-note-<id>.mp3`; envelope fallback for older relays. Inbound: Buzz voice-note envelopes are demuxed to MP3 so they dispatch as audio and reach STT.
-- **3.4 Mobile**: not started. Receiving `audio/*` already works on `main`; sending real audio needs the native packagers to emit audio-only M4A. Blocked on the toolchain decision in section 7.
+- **3.4 Mobile**: sending done in code (issue #3, see 3.4 item 3); on-device validation of both packagers against the relay is pending. Receiving `audio/*` already works on `main`. The audio picker (M4) is not started.
 - **Recorder UI** (lock, slide-to-cancel, review, transcript toggle) from the design canvas: not started on either client.
 
 Deploy on the Studio: build `buzz-relay:audio` from this branch (`DOCKER_BUILDKIT=1 docker build -t buzz-relay:audio .`, needs the `docker-buildx` plugin on Colima), set `BUZZ_IMAGE=buzz-relay:audio` and `BUZZ_MEDIA_AUDIO_UPLOADS=true` in `~/Chief/Projects/relay/.env`, `docker compose up -d`, then confirm `curl -H 'Accept: application/nostr+json' https://<relay>/` lists `buzz-audio`.

@@ -38,7 +38,15 @@ final class _Mp4Box {
 /// Only chunk offsets into the region moved by the relocation are adjusted.
 /// The files must be distinct, and malformed or excessively nested inputs fail
 /// closed rather than producing a partially valid upload.
-Future<void> rewriteMp4ForFastStart(File source, File destination) async {
+///
+/// With [stripMoovMetadata], `meta` and `udta` boxes directly under `moov` are
+/// dropped as well. Android's `MediaMuxer` has no switch for the metadata it
+/// writes there, and the relay rejects any such box on audio uploads.
+Future<void> rewriteMp4ForFastStart(
+  File source,
+  File destination, {
+  bool stripMoovMetadata = false,
+}) async {
   if (source.absolute.path == destination.absolute.path) {
     throw const FormatException(
       'MP4 fast-start rewrite requires a distinct destination',
@@ -66,9 +74,12 @@ Future<void> rewriteMp4ForFastStart(File source, File destination) async {
     }
 
     await input.setPosition(moov.offset);
-    final moovBytes = await input.read(moov.size);
+    var moovBytes = await input.read(moov.size);
     if (moovBytes.length != moov.size) {
       throw const FormatException('truncated MP4 moov box');
+    }
+    if (stripMoovMetadata) {
+      moovBytes = _withoutMoovMetadata(moovBytes, moov.headerSize);
     }
     if (moov.offset > firstMdat.offset) {
       _patchChunkOffsets(
@@ -77,7 +88,7 @@ Future<void> rewriteMp4ForFastStart(File source, File destination) async {
         moovBytes.length,
         firstMdat.offset,
         moov.offset,
-        moov.size,
+        moovBytes.length,
         0,
         [0],
       );
@@ -111,6 +122,40 @@ Future<void> rewriteMp4ForFastStart(File source, File destination) async {
   } finally {
     await input.close();
   }
+}
+
+const _moovMetadataTypes = {'meta', 'udta'};
+
+/// Returns [moovBytes] without its direct `meta` and `udta` children, with the
+/// `moov` size field rewritten to match.
+Uint8List _withoutMoovMetadata(Uint8List moovBytes, int headerSize) {
+  final end = moovBytes.length;
+  final kept = BytesBuilder(copy: false)..add(moovBytes.sublist(0, headerSize));
+  var offset = headerSize;
+  var boxes = 0;
+  while (offset < end) {
+    boxes++;
+    if (boxes > _maxNestedBoxes) {
+      throw const FormatException('MP4 has too many nested boxes');
+    }
+    final box = _readMemoryBoxHeader(moovBytes, offset, end);
+    if (!_moovMetadataTypes.contains(box.type)) {
+      kept.add(moovBytes.sublist(offset, offset + box.size));
+    }
+    offset += box.size;
+  }
+  if (offset != end) {
+    throw const FormatException('MP4 child boxes do not cover their parent');
+  }
+  final stripped = kept.takeBytes();
+  final header = ByteData.sublistView(stripped);
+  if (headerSize == 16) {
+    header.setUint32(0, 1, Endian.big);
+    header.setUint64(8, stripped.length, Endian.big);
+  } else {
+    header.setUint32(0, stripped.length, Endian.big);
+  }
+  return stripped;
 }
 
 Future<List<_Mp4Box>> _readTopLevelBoxes(RandomAccessFile input) async {
