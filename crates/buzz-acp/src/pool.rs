@@ -1416,7 +1416,7 @@ async fn create_session_and_apply_model(
                 Err(AcpError::AgentError { code: -32601, .. }) => {
                     agent.goose_system_prompt_supported = Some(false);
                     tracing::warn!(
-                        target: "pool::session",
+                        target: "buzz_acp::pool::session",
                         "Goose does not support its system-prompt extension; using user-message framing"
                     );
                 }
@@ -1521,7 +1521,7 @@ async fn create_session_and_apply_model(
             }
             None => {
                 tracing::warn!(
-                    target: "pool::model",
+                    target: "buzz_acp::pool::model",
                     "desired model {desired} not found in agent's available models — proceeding with agent default"
                 );
                 // Surface the miss so the desktop ModelPicker can reject a live
@@ -1698,7 +1698,7 @@ async fn apply_model_switch(
         // `session.configOptions` on a model change and returns them here).
         Ok(Ok(value)) => {
             tracing::info!(
-                target: "pool::model",
+                target: "buzz_acp::pool::model",
                 "applied model {desired} via {method_label} on session {session_id}"
             );
             Ok(ModelSwitchOutcome::Applied(value))
@@ -1711,7 +1711,7 @@ async fn apply_model_switch(
         | Ok(Err(e @ AcpError::Protocol(_)))
         | Ok(Err(e @ AcpError::AgentExited)) => {
             tracing::error!(
-                target: "pool::model",
+                target: "buzz_acp::pool::model",
                 "fatal error setting model {desired} via {method_label}: {e}"
             );
             Err(e)
@@ -1722,7 +1722,7 @@ async fn apply_model_switch(
         // the caller must preserve pre-switch capabilities here.
         Ok(Err(e)) => {
             tracing::warn!(
-                target: "pool::model",
+                target: "buzz_acp::pool::model",
                 "failed to set model {desired} via {method_label}: {e} — proceeding with agent default"
             );
             Ok(ModelSwitchOutcome::Rejected)
@@ -1731,7 +1731,7 @@ async fn apply_model_switch(
             // Outer timeout fired — the inner send_request may have left the
             // stream in an unknown state. Treat as transport error.
             tracing::error!(
-                target: "pool::model",
+                target: "buzz_acp::pool::model",
                 "model set via {method_label} timed out ({MODEL_SWITCH_TIMEOUT:?}) — treating as fatal"
             );
             Err(AcpError::Timeout(MODEL_SWITCH_TIMEOUT))
@@ -1769,7 +1769,7 @@ async fn apply_startup_effort(
     };
     let Some(config_id) = extract_thought_level_config_id(session_new_result) else {
         tracing::info!(
-            target: "pool::effort",
+            target: "buzz_acp::pool::effort",
             "startup effort {value} configured but model advertises no thought_level option — leaving agent default"
         );
         return Ok(None);
@@ -1786,7 +1786,7 @@ async fn apply_startup_effort(
     match result {
         Ok(Ok(_)) => {
             tracing::info!(
-                target: "pool::effort",
+                target: "buzz_acp::pool::effort",
                 "applied startup effort {value} via configId={config_id} on session {session_id}"
             );
             Ok(Some(StartupEffortOutcome::Applied { config_id, value }))
@@ -1799,7 +1799,7 @@ async fn apply_startup_effort(
         | Ok(Err(e @ AcpError::Protocol(_)))
         | Ok(Err(e @ AcpError::AgentExited)) => {
             tracing::error!(
-                target: "pool::effort",
+                target: "buzz_acp::pool::effort",
                 "fatal error applying startup effort {value} via configId={config_id}: {e}"
             );
             Err(e)
@@ -1807,7 +1807,7 @@ async fn apply_startup_effort(
         // Application-level rejection (e.g. Json) — agent is fine, uses default effort.
         Ok(Err(e)) => {
             tracing::warn!(
-                target: "pool::effort",
+                target: "buzz_acp::pool::effort",
                 "adapter rejected startup effort {value} via configId={config_id}: {e} — proceeding with agent default"
             );
             Ok(Some(StartupEffortOutcome::Rejected))
@@ -1816,7 +1816,7 @@ async fn apply_startup_effort(
             // Outer timeout fired — the inner send_request may have left the
             // stream in an unknown state. Treat as transport error.
             tracing::error!(
-                target: "pool::effort",
+                target: "buzz_acp::pool::effort",
                 "startup effort {value} via configId={config_id} timed out ({MODEL_SWITCH_TIMEOUT:?}) — treating as fatal"
             );
             Err(AcpError::Timeout(MODEL_SWITCH_TIMEOUT))
@@ -1892,7 +1892,7 @@ async fn apply_permission_mode(
     match result {
         Ok(Ok(_)) => {
             tracing::info!(
-                target: "pool::permission",
+                target: "buzz_acp::pool::permission",
                 "applied permission mode {wire:?} on session {session_id}"
             );
         }
@@ -1904,7 +1904,7 @@ async fn apply_permission_mode(
         | Ok(Err(e @ AcpError::Protocol(_)))
         | Ok(Err(e @ AcpError::AgentExited)) => {
             tracing::error!(
-                target: "pool::permission",
+                target: "buzz_acp::pool::permission",
                 "fatal error setting permission mode {wire:?}: {e}"
             );
             return Err(e);
@@ -1912,14 +1912,14 @@ async fn apply_permission_mode(
         // Application-level errors — agent is fine, just uses default permission mode.
         Ok(Err(e)) => {
             tracing::warn!(
-                target: "pool::permission",
+                target: "buzz_acp::pool::permission",
                 "failed to set permission mode {wire:?}: {e} — falling back to per-tool auto-approval"
             );
         }
         Err(_) => {
             // Outer timeout fired — stream may be in unknown state.
             tracing::error!(
-                target: "pool::permission",
+                target: "buzz_acp::pool::permission",
                 "permission mode set timed out ({PERMISSION_MODE_TIMEOUT:?}) — treating as fatal"
             );
             return Err(AcpError::Timeout(PERMISSION_MODE_TIMEOUT));
@@ -2276,7 +2276,7 @@ pub async fn run_prompt_task(
                     Ok(s) => s,
                     Err(_) => {
                         tracing::warn!(
-                            target: "engram::core",
+                            target: "buzz_acp::engram::core",
                             channel = %cid,
                             timeout_ms = CORE_FETCH_TIMEOUT.as_millis() as u64,
                             "core fetch timed out — emitting no section"
@@ -2286,7 +2286,7 @@ pub async fn run_prompt_task(
                 };
                 if let Some(rendered) = section {
                     tracing::info!(
-                        target: "engram::core",
+                        target: "buzz_acp::engram::core",
                         channel = %cid,
                         scope = %scope.telemetry_label(),
                         section_len = rendered.len(),
@@ -2383,7 +2383,7 @@ pub async fn run_prompt_task(
                 {
                     Ok(sid) => {
                         tracing::info!(
-                            target: "pool::session",
+                            target: "buzz_acp::pool::session",
                             "created session {sid} for channel {cid} (scope {})",
                             scope.telemetry_label()
                         );
@@ -2449,7 +2449,7 @@ pub async fn run_prompt_task(
                 {
                     Ok(sid) => {
                         tracing::info!(
-                            target: "pool::session",
+                            target: "buzz_acp::pool::session",
                             "created heartbeat session {sid} for agent {}",
                             agent.index
                         );
@@ -2535,7 +2535,7 @@ pub async fn run_prompt_task(
         {
             let cid = &scope.channel_id();
             tracing::info!(
-                target: "pool::session",
+                target: "buzz_acp::pool::session",
                 "sending initial_message to session {session_id} for channel {cid}"
             );
             let init_msg = prepend_standing_for_legacy(
@@ -2560,7 +2560,7 @@ pub async fn run_prompt_task(
             match init_result {
                 Ok(stop_reason) => {
                     tracing::info!(
-                        target: "pool::session",
+                        target: "buzz_acp::pool::session",
                         "initial_message complete for channel {cid}: {stop_reason:?}"
                     );
                     // The legacy agent has its standing context now; the turn
@@ -2596,7 +2596,7 @@ pub async fn run_prompt_task(
                 }
                 Err(AcpError::IdleTimeout(_)) => {
                     tracing::warn!(
-                        target: "pool::session",
+                        target: "buzz_acp::pool::session",
                         "initial_message idle timeout ({}s) for channel {cid} — cancelling",
                         ctx.idle_timeout.as_secs()
                     );
@@ -2632,7 +2632,7 @@ pub async fn run_prompt_task(
                         }
                         Err(e) => {
                             tracing::error!(
-                                target: "pool::session",
+                                target: "buzz_acp::pool::session",
                                 "cancel_with_cleanup failed during initial_message timeout: {e}"
                             );
                             agent.state.invalidate(&source);
@@ -2651,7 +2651,7 @@ pub async fn run_prompt_task(
                 Err(AcpError::HardTimeout { silence }) => {
                     let recently_active = silence < RECENT_ACTIVITY_WINDOW;
                     tracing::error!(
-                        target: "pool::session",
+                        target: "buzz_acp::pool::session",
                         "hard timeout ({}s cap, silence {silence:?}, recently_active={recently_active}) during initial_message for channel {cid} — agent process is unrecoverable",
                         ctx.max_turn_duration.as_secs()
                     );
@@ -2668,7 +2668,7 @@ pub async fn run_prompt_task(
                 }
                 Err(e) => {
                     tracing::error!(
-                        target: "pool::session",
+                        target: "buzz_acp::pool::session",
                         "initial_message failed for channel {cid}: {e} — invalidating session"
                     );
                     agent.state.invalidate(&source);
@@ -2766,7 +2766,7 @@ pub async fn run_prompt_task(
         slash_command = crate::queue::slash_command_for_batch(b, &known_names);
         if let Some(ref cmd) = slash_command {
             tracing::info!(
-                target: "pool::prompt",
+                target: "buzz_acp::pool::prompt",
                 channel = %b.channel_id,
                 command = %cmd,
                 "slash-command pass-through"
@@ -2828,6 +2828,12 @@ pub async fn run_prompt_task(
         None => prompt_sections.iter().map(String::as_str).collect(),
     };
     let prompt_bytes: usize = prompt_blocks.iter().map(|block| block.len()).sum();
+    // Ordered first lines of the content blocks. A legacy agent's first turn
+    // carries `<base>` and `<context>` in the same `session/prompt`, and an
+    // engine that logs a truncated prefix of the joined prompt shows only the
+    // leading `<base>` section; this field is the harness-side record of
+    // every section that actually travelled in the turn.
+    let prompt_sections_summary = prompt_block_labels(&prompt_blocks);
     let has_standing_context = match &source {
         PromptSource::Channel(_) => !standing.sections().is_empty(),
         PromptSource::Heartbeat => ctx.base_prompt.is_some(),
@@ -2835,8 +2841,10 @@ pub async fn run_prompt_task(
     let standing_context_included =
         !agent.has_system_prompt_support() && !standing_context_sent && has_standing_context;
     tracing::info!(
-        target: "pool::prompt",
+        target: "buzz_acp::pool::prompt",
         prompt_bytes,
+        prompt_blocks = prompt_blocks.len(),
+        sections = ?prompt_sections_summary,
         standing_context_included,
         delivered_event_delta = pending_delivered_event_ids.len(),
         "prompt context delivery"
@@ -2857,7 +2865,7 @@ pub async fn run_prompt_task(
     // zero completions either way, so anything reading them afterwards has to
     // guess which happened.
     tracing::info!(
-        target: "pool::prompt",
+        target: "buzz_acp::pool::prompt",
         "turn starting for {}",
         prompt_label(&source)
     );
@@ -2996,12 +3004,12 @@ pub async fn run_prompt_task(
                             ControlSignal::Rotate | ControlSignal::SwitchModel { .. }
                         ) {
                             tracing::debug!(
-                                target: "pool::prompt",
+                                target: "buzz_acp::pool::prompt",
                                 "rotate/switch signal arrived but turn already completed — invalidating session"
                             );
                         } else {
                             tracing::debug!(
-                                target: "pool::prompt",
+                                target: "buzz_acp::pool::prompt",
                                 "control signal arrived but turn already completed — treating as success"
                             );
                         }
@@ -3087,7 +3095,7 @@ pub async fn run_prompt_task(
 
             if should_rotate {
                 tracing::info!(
-                    target: "pool::session",
+                    target: "buzz_acp::pool::session",
                     "rotating session for {source:?} after {stop_reason:?}",
                 );
                 agent.state.invalidate(&source);
@@ -3115,7 +3123,7 @@ pub async fn run_prompt_task(
             );
         }
         Err(AcpError::AgentExited) => {
-            tracing::error!(target: "pool::prompt", "agent {} exited during prompt", agent.index);
+            tracing::error!(target: "buzz_acp::pool::prompt", "agent {} exited during prompt", agent.index);
             agent.state.invalidate_all();
             let usage = agent.acp.take_turn_usage();
             publish_agent_turn_metric(
@@ -3138,7 +3146,7 @@ pub async fn run_prompt_task(
         }
         Err(AcpError::IdleTimeout(_)) => {
             tracing::warn!(
-                target: "pool::prompt",
+                target: "buzz_acp::pool::prompt",
                 "idle timeout ({}s) — cancelling session {session_id}",
                 ctx.idle_timeout.as_secs()
             );
@@ -3172,7 +3180,7 @@ pub async fn run_prompt_task(
                 }
                 Err(AcpError::AgentExited) => {
                     tracing::error!(
-                        target: "pool::prompt",
+                        target: "buzz_acp::pool::prompt",
                         "agent {} exited during cancel_with_cleanup",
                         agent.index
                     );
@@ -3198,7 +3206,7 @@ pub async fn run_prompt_task(
                 }
                 Err(e) => {
                     tracing::error!(
-                        target: "pool::prompt",
+                        target: "buzz_acp::pool::prompt",
                         "cancel_with_cleanup error: {e} — invalidating session"
                     );
                     agent.state.invalidate(&source);
@@ -3226,7 +3234,7 @@ pub async fn run_prompt_task(
         Err(AcpError::HardTimeout { silence }) => {
             let recently_active = silence < RECENT_ACTIVITY_WINDOW;
             tracing::error!(
-                target: "pool::prompt",
+                target: "buzz_acp::pool::prompt",
                 "hard timeout ({}s cap, silence {silence:?}, recently_active={recently_active}) — agent process is unrecoverable, invalidating all sessions",
                 ctx.max_turn_duration.as_secs()
             );
@@ -3251,7 +3259,7 @@ pub async fn run_prompt_task(
             );
         }
         Err(e) => {
-            tracing::error!(target: "pool::prompt", "session_prompt error: {e}");
+            tracing::error!(target: "buzz_acp::pool::prompt", "session_prompt error: {e}");
             // AgentError means the agent caught a problem before mutating
             // session state (e.g. bad LLM response). The session is healthy —
             // don't invalidate it. Other errors may have corrupted state.
@@ -3516,7 +3524,7 @@ async fn fetch_canvas_section(channel_id: Uuid, rest: &RestClient) -> Option<Str
         Ok(Ok(v)) => v,
         Ok(Err(e)) => {
             tracing::warn!(
-                target: "canvas::fetch",
+                target: "buzz_acp::canvas::fetch",
                 channel = %channel_id,
                 "canvas query failed: {e} — emitting no section"
             );
@@ -3524,7 +3532,7 @@ async fn fetch_canvas_section(channel_id: Uuid, rest: &RestClient) -> Option<Str
         }
         Err(_) => {
             tracing::warn!(
-                target: "canvas::fetch",
+                target: "buzz_acp::canvas::fetch",
                 channel = %channel_id,
                 timeout_ms = CANVAS_FETCH_TIMEOUT.as_millis() as u64,
                 "canvas fetch timed out — emitting no section"
@@ -3537,7 +3545,7 @@ async fn fetch_canvas_section(channel_id: Uuid, rest: &RestClient) -> Option<Str
         Some(arr) => arr,
         None => {
             tracing::warn!(
-                target: "canvas::fetch",
+                target: "buzz_acp::canvas::fetch",
                 channel = %channel_id,
                 "canvas query response is not a JSON array — emitting no section"
             );
@@ -3568,7 +3576,7 @@ pub(crate) fn canvas_section_from_query_response(
         Ok(ev) => ev,
         Err(err) => {
             tracing::warn!(
-                target: "canvas::fetch",
+                target: "buzz_acp::canvas::fetch",
                 channel = %channel_uuid,
                 %err,
                 "canvas query returned a malformed event — emitting no section",
@@ -3581,7 +3589,7 @@ pub(crate) fn canvas_section_from_query_response(
     // A structurally complete but tampered event must not supply trusted metadata.
     if let Err(err) = event.verify() {
         tracing::warn!(
-            target: "canvas::fetch",
+            target: "buzz_acp::canvas::fetch",
             channel = %channel_uuid,
             %err,
             "canvas event failed signature verification — emitting no section",
@@ -3592,7 +3600,7 @@ pub(crate) fn canvas_section_from_query_response(
     // Validate kind: must be KIND_CANVAS (40100).
     if event.kind != nostr::Kind::Custom(buzz_core::kind::KIND_CANVAS as u16) {
         tracing::warn!(
-            target: "canvas::fetch",
+            target: "buzz_acp::canvas::fetch",
             channel = %channel_uuid,
             kind = %event.kind.as_u16(),
             "canvas event has unexpected kind — emitting no section",
@@ -3609,7 +3617,7 @@ pub(crate) fn canvas_section_from_query_response(
     });
     if !h_tag_matches {
         tracing::warn!(
-            target: "canvas::fetch",
+            target: "buzz_acp::canvas::fetch",
             channel = %channel_uuid,
             "canvas event is missing expected h-tag — emitting no section",
         );
@@ -3619,7 +3627,7 @@ pub(crate) fn canvas_section_from_query_response(
     // Blank content means the canvas was cleared; do not fall back to older events.
     if event.content.trim().is_empty() {
         tracing::debug!(
-            target: "canvas::fetch",
+            target: "buzz_acp::canvas::fetch",
             channel = %channel_uuid,
             "latest canvas event has blank content — emitting no section"
         );
@@ -3636,7 +3644,7 @@ pub(crate) fn canvas_section_from_query_response(
         Ok(s) => s,
         Err(_) => {
             tracing::warn!(
-                target: "canvas::fetch",
+                target: "buzz_acp::canvas::fetch",
                 channel = %channel_uuid,
                 "canvas event created_at overflows i64 — emitting no section",
             );
@@ -3647,7 +3655,7 @@ pub(crate) fn canvas_section_from_query_response(
         Some(dt) => dt.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
         None => {
             tracing::warn!(
-                target: "canvas::fetch",
+                target: "buzz_acp::canvas::fetch",
                 channel = %channel_uuid,
                 ts_secs,
                 "canvas event has out-of-range created_at — emitting no section",
@@ -3657,7 +3665,7 @@ pub(crate) fn canvas_section_from_query_response(
     };
 
     tracing::info!(
-        target: "canvas::fetch",
+        target: "buzz_acp::canvas::fetch",
         channel = %channel_uuid,
         event_id = %id,
         "injected channel canvas metadata section into system prompt"
@@ -4544,6 +4552,25 @@ fn classify_control_cancel_failure(
 /// How a turn's source is named in the `pool::prompt` log lines.
 ///
 /// Shared by the turn-start and turn-stop lines so a log can be read as pairs.
+/// First line of each prompt content block, trimmed and capped, in wire order.
+///
+/// Section framing puts the tag on its own first line (`<base>`, `<context>`,
+/// `<buzz-event type="dm">`), so this is the list of sections a turn carries,
+/// in the order the engine receives them.
+fn prompt_block_labels(blocks: &[&str]) -> Vec<String> {
+    const MAX_LABEL_CHARS: usize = 48;
+    blocks
+        .iter()
+        .map(|block| {
+            let first_line = block.lines().next().unwrap_or("").trim();
+            match first_line.char_indices().nth(MAX_LABEL_CHARS) {
+                Some((cut, _)) => format!("{}...", &first_line[..cut]),
+                None => first_line.to_string(),
+            }
+        })
+        .collect()
+}
+
 fn prompt_label(source: &PromptSource) -> String {
     match source {
         PromptSource::Channel(scope) => format!(
@@ -4560,19 +4587,19 @@ fn log_stop_reason(source: &PromptSource, stop_reason: &StopReason) {
     let label = prompt_label(source);
     match stop_reason {
         StopReason::EndTurn => {
-            tracing::info!(target: "pool::prompt", "turn complete for {label}: end_turn");
+            tracing::info!(target: "buzz_acp::pool::prompt", "turn complete for {label}: end_turn");
         }
         StopReason::Cancelled => {
-            tracing::warn!(target: "pool::prompt", "turn cancelled for {label}");
+            tracing::warn!(target: "buzz_acp::pool::prompt", "turn cancelled for {label}");
         }
         StopReason::MaxTokens => {
-            tracing::warn!(target: "pool::prompt", "turn hit max_tokens for {label} — session will be rotated");
+            tracing::warn!(target: "buzz_acp::pool::prompt", "turn hit max_tokens for {label}, session will be rotated");
         }
         StopReason::MaxTurnRequests => {
-            tracing::warn!(target: "pool::prompt", "turn hit max_turn_requests for {label} — session will be rotated");
+            tracing::warn!(target: "buzz_acp::pool::prompt", "turn hit max_turn_requests for {label}, session will be rotated");
         }
         StopReason::Refusal => {
-            tracing::warn!(target: "pool::prompt", "turn refused for {label}");
+            tracing::warn!(target: "buzz_acp::pool::prompt", "turn refused for {label}");
         }
     }
 }
@@ -4593,7 +4620,7 @@ fn record_scope_delivery_success(
     event_ids: &HashSet<String>,
 ) {
     tracing::info!(
-        target: "pool::prompt",
+        target: "buzz_acp::pool::prompt",
         "{}",
         delivery_receipt_line(scope.channel_id(), event_ids)
     );
@@ -4947,7 +4974,7 @@ async fn publish_agent_turn_metric(
         Ok(c) => c,
         Err(e) => {
             tracing::warn!(
-                target: "pool::metrics",
+                target: "buzz_acp::pool::metrics",
                 session_id,
                 turn_id,
                 "NIP-AM: encrypt failed: {e}"
@@ -4970,7 +4997,7 @@ async fn publish_agent_turn_metric(
         Ok(e) => e,
         Err(e) => {
             tracing::warn!(
-                target: "pool::metrics",
+                target: "buzz_acp::pool::metrics",
                 session_id,
                 turn_id,
                 "NIP-AM: sign failed: {e}"
@@ -4982,13 +5009,13 @@ async fn publish_agent_turn_metric(
     match tokio::time::timeout(METRIC_TIMEOUT, ctx.rest_client.submit_event(&event)).await {
         Ok(Ok(_)) => {}
         Ok(Err(e)) => tracing::warn!(
-            target: "pool::metrics",
+            target: "buzz_acp::pool::metrics",
             session_id,
             turn_id,
             "NIP-AM: publish failed: {e}"
         ),
         Err(_) => tracing::warn!(
-            target: "pool::metrics",
+            target: "buzz_acp::pool::metrics",
             session_id,
             turn_id,
             "NIP-AM: publish timed out"
@@ -6766,6 +6793,354 @@ done"#
             !prompt_text(2).contains("<base>\nstanding-once\n</base>"),
             "turn after channel ACP success must omit standing context"
         );
+    }
+
+    /// Human-readable outcome label for assertion messages (`PromptOutcome`
+    /// carries non-`Debug` payloads).
+    fn describe_outcome(outcome: &PromptOutcome) -> String {
+        match outcome {
+            PromptOutcome::Ok(stop) => format!("Ok({stop:?})"),
+            PromptOutcome::Error(error) => format!("Error({error})"),
+            PromptOutcome::ProjectContextIndeterminate(reason) => {
+                format!("ProjectContextIndeterminate({reason})")
+            }
+            PromptOutcome::AgentExited => "AgentExited".into(),
+            PromptOutcome::Timeout(kind) => format!("Timeout({kind:?})"),
+            PromptOutcome::Cancelled => "Cancelled".into(),
+            PromptOutcome::CancelDrainTimeout(grace) => format!("CancelDrainTimeout({grace:?})"),
+        }
+    }
+
+    #[test]
+    fn prompt_block_labels_take_each_block_first_line_capped() {
+        let long = format!("<{}>\nbody", "x".repeat(80));
+        let labels = prompt_block_labels(&[
+            "<base>\nstanding\n</base>",
+            "  <context>\nScope: dm",
+            &long,
+            "",
+        ]);
+        assert_eq!(labels[0], "<base>");
+        assert_eq!(labels[1], "<context>");
+        assert!(labels[2].ends_with("..."), "over-long first line is capped");
+        assert_eq!(labels[2].chars().count(), 48 + 3);
+        assert_eq!(labels[3], "");
+    }
+
+    /// Regression: the first human message after a (re)spawn must reach the
+    /// engine exactly once, in a prompt that carries `<context>`, and the next
+    /// message must get its own `<context>` prompt.
+    ///
+    /// A freshly spawned worker is `OwnedAgent { state: SessionState::default(), .. }`
+    /// (see the respawn arm in the main loop and the lazy-pool wake arm), so
+    /// the triggering turn creates the session and delivers standing context
+    /// in the same call. For a protocol-1 engine the `<base>` block rides in
+    /// front of `<context>` inside that one `session/prompt`, each section as
+    /// its own content block. An engine that logs a truncated prefix of the
+    /// joined prompt (Hermes logs the first 100 characters) therefore shows
+    /// `<base>` and never `<context>`, which was misread as "the trigger
+    /// message was never delivered". This test binds the production seam
+    /// (`run_prompt_task`, the function `dispatch_pending` spawns) and asserts
+    /// on the wire: the joined prompt text holds `<base>` once, `<context>`
+    /// once and the message once, with `<context>` in its own block; the
+    /// follow-up prompt holds `<context>` and its own message only; a batch of
+    /// two events (messages queued while the worker was still initialising)
+    /// lands as one prompt carrying both.
+    #[tokio::test]
+    async fn spawn_triggering_message_is_delivered_once_with_context_then_next_message_gets_own_prompt(
+    ) {
+        use crate::relay::RestClient;
+
+        /// Minimal HTTP stub answering `[]` to every request. Returns its base
+        /// URL and the server task; abort the task when done.
+        async fn spawn_empty_query_stub() -> (String, tokio::task::JoinHandle<()>) {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind REST stub");
+            let base_url = format!("http://{}", listener.local_addr().unwrap());
+            let server = tokio::spawn(async move {
+                while let Ok((mut socket, _)) = listener.accept().await {
+                    let mut request = vec![0; 16 * 1024];
+                    let _ = socket.read(&mut request).await;
+                    let _ = socket
+                        .write_all(
+                            b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n[]",
+                        )
+                        .await;
+                }
+            });
+            (base_url, server)
+        }
+
+        for protocol_version in [1u32, 2u32] {
+            let capture = std::env::temp_dir().join(format!(
+                "buzz-acp-spawn-first-prompt-v{protocol_version}-{}.ndjson",
+                Uuid::new_v4()
+            ));
+            let quoted_capture = capture.to_string_lossy().replace('\'', "'\\''");
+            // Scripted engine: `session/new` gets a session id, every other
+            // request (the prompts) ends its turn. Request ids are sequential
+            // from 0, matching the client's allocation.
+            let script = format!(
+                r#"count=0
+while IFS= read -r line; do
+  printf '%s\n' "$line" >> '{quoted_capture}'
+  id=$count
+  count=$((count + 1))
+  case "$line" in
+    *'"session/new"'*) printf '%s\n' '{{"jsonrpc":"2.0","id":'"$id"',"result":{{"sessionId":"sess-spawn"}}}}' ;;
+    *) printf '%s\n' '{{"jsonrpc":"2.0","id":'"$id"',"result":{{"stopReason":"end_turn"}}}}' ;;
+  esac
+done"#
+            );
+            let acp = AcpClient::spawn("bash", &["-c".to_string(), script], &[], false)
+                .await
+                .expect("spawn first-prompt ACP script");
+            let channel_id = Uuid::new_v4();
+            // Exactly the state a worker has right after spawn/respawn.
+            let mut agent = OwnedAgent {
+                index: 0,
+                acp,
+                state: SessionState::default(),
+                model_capabilities: None,
+                desired_model: None,
+                model_overridden: false,
+                desired_model_request_id: None,
+                desired_model_pending_ack: false,
+                startup_effort: None,
+                agent_name: "spawn-test-agent".into(),
+                goose_system_prompt_supported: None,
+                protocol_version,
+            };
+
+            // Every relay-side fetch on the new-session path (canvas, huddle
+            // instructions, profile lookup) answers empty at once, so the turn
+            // runs the real `session/new` seam without waiting out the fetch
+            // timeouts a dead base URL would cost.
+            let (rest_base_url, rest_stub) = spawn_empty_query_stub().await;
+            let mut ctx = make_prompt_context_no_owner();
+            ctx.base_prompt = Some("standing-base-prompt".into());
+            ctx.rest_client = RestClient {
+                http: reqwest::Client::new(),
+                base_url: rest_base_url.clone(),
+                keys: ctx.agent_keys.clone(),
+                auth_tag_json: None,
+            };
+            ctx.channel_info = ChannelInfoResolver::new(
+                HashMap::from([(
+                    channel_id,
+                    crate::relay::ChannelInfo {
+                        name: "dm".into(),
+                        channel_type: "dm".into(),
+                        description: None,
+                    },
+                )]),
+                RestClient {
+                    http: reqwest::Client::new(),
+                    base_url: rest_base_url,
+                    keys: ctx.agent_keys.clone(),
+                    auth_tag_json: None,
+                },
+            );
+            // Fresh project cache so the turn does not need a relay to resolve
+            // project authority.
+            ctx.channel_info.projects.write().unwrap().insert(
+                channel_id,
+                CachedProjectInfo {
+                    fetched_at: std::time::Instant::now(),
+                    value: None,
+                },
+            );
+            let ctx = Arc::new(ctx);
+            let (result_tx, mut result_rx) = mpsc::unbounded_channel();
+
+            let message_m = "M-9f3a: what is the fleet status right now?";
+            let message_n = "N-2c7d: and who is on call tonight?";
+            let message_p = "P-41e0: first message queued during init";
+            let message_q = "Q-b8d2: second message queued during init";
+            let batch_of = |contents: &[&str]| FlushBatch {
+                channel_id,
+                scope: conv(channel_id),
+                events: contents
+                    .iter()
+                    .map(|content| crate::queue::BatchEvent {
+                        event: EventBuilder::new(Kind::Custom(9), *content)
+                            .sign_with_keys(&Keys::generate())
+                            .unwrap(),
+                        prompt_tag: "test".into(),
+                        received_at: std::time::Instant::now(),
+                    })
+                    .collect(),
+                cancelled_events: vec![],
+                cancel_reason: None,
+            };
+
+            for (turn, contents) in [vec![message_m], vec![message_n], vec![message_p, message_q]]
+                .into_iter()
+                .enumerate()
+            {
+                run_prompt_task(
+                    agent,
+                    Some(batch_of(&contents)),
+                    None,
+                    Arc::clone(&ctx),
+                    result_tx.clone(),
+                    None,
+                    format!("spawn-turn-{turn}"),
+                )
+                .await;
+                let result = result_rx.recv().await.expect("prompt result");
+                let ended_turn = matches!(result.outcome, PromptOutcome::Ok(StopReason::EndTurn));
+                assert!(
+                    ended_turn,
+                    "v{protocol_version} turn {turn}: expected end_turn, got {}",
+                    describe_outcome(&result.outcome)
+                );
+                assert!(
+                    result.batch.is_none(),
+                    "v{protocol_version} turn {turn}: a delivered batch must not be requeued"
+                );
+                agent = result.agent;
+                if protocol_version == 1 {
+                    assert!(
+                        agent.state.deliveries[&conv(channel_id)].standing_context_sent,
+                        "v1 turn {turn}: standing context must be committed after the first success"
+                    );
+                }
+            }
+            agent.acp.shutdown().await;
+
+            let requests: Vec<serde_json::Value> = std::fs::read_to_string(&capture)
+                .expect("read captured ACP requests")
+                .lines()
+                .map(|line| serde_json::from_str(line).expect("captured request is JSON"))
+                .collect();
+            std::fs::remove_file(&capture).expect("remove ACP capture");
+
+            let methods: Vec<&str> = requests
+                .iter()
+                .map(|request| request["method"].as_str().unwrap_or(""))
+                .collect();
+            assert_eq!(
+                methods,
+                [
+                    "session/new",
+                    "session/prompt",
+                    "session/prompt",
+                    "session/prompt"
+                ],
+                "v{protocol_version}: one session, then exactly one prompt per turn"
+            );
+            // What an engine sees: every text block of the prompt joined, the
+            // way an ACP adapter reconstructs the user message.
+            let blocks_of = |index: usize| -> Vec<String> {
+                requests[index]["params"]["prompt"]
+                    .as_array()
+                    .expect("prompt blocks")
+                    .iter()
+                    .map(|block| block["text"].as_str().expect("text block").to_string())
+                    .collect()
+            };
+            let joined = |index: usize| -> String { blocks_of(index).join("\n") };
+            let base_block = "<base>\nstanding-base-prompt\n</base>";
+            let system_prompt = requests[0]["params"]["systemPrompt"].as_str();
+
+            let first = joined(1);
+            match protocol_version {
+                1 => {
+                    assert!(
+                        system_prompt.is_none(),
+                        "v1: standing context must not go through session/new"
+                    );
+                    assert_eq!(
+                        first.matches(base_block).count(),
+                        1,
+                        "v1: <base> rides in the first prompt exactly once; got:\n{first}"
+                    );
+                    assert!(
+                        first.starts_with("<base>"),
+                        "v1: <base> leads the first prompt (an engine logging one line sees only this)"
+                    );
+                }
+                _ => {
+                    assert_eq!(
+                        system_prompt.map(|s| s.matches(base_block).count()),
+                        Some(1),
+                        "v2: <base> goes through session/new systemPrompt exactly once"
+                    );
+                    assert!(
+                        !first.contains("<base>"),
+                        "v2: first prompt must not repeat <base>; got:\n{first}"
+                    );
+                }
+            }
+            assert_eq!(
+                first.matches("<context>").count(),
+                1,
+                "v{protocol_version}: first prompt carries <context> exactly once; got:\n{first}"
+            );
+            // Per-section content blocks: `<context>` is its own block right
+            // after `<base>` (the observer size trimmer elides a block body in
+            // place while every section header survives), never folded into
+            // the standing-context block.
+            let first_blocks = blocks_of(1);
+            let context_block = first_blocks
+                .iter()
+                .position(|block| block.starts_with("<context>"))
+                .expect("first prompt has a <context> block");
+            match protocol_version {
+                1 => {
+                    assert!(
+                        first_blocks[0].starts_with("<base>"),
+                        "v1: block 0 is the standing context; got:\n{}",
+                        first_blocks[0]
+                    );
+                    assert_eq!(context_block, 1, "v1: <context> is block 1");
+                }
+                _ => assert_eq!(context_block, 0, "v2: <context> is block 0"),
+            }
+            assert!(
+                first.contains("Scope: dm"),
+                "v{protocol_version}: first prompt is DM-scoped; got:\n{first}"
+            );
+            assert_eq!(
+                first.matches(message_m).count(),
+                1,
+                "v{protocol_version}: the triggering message is delivered exactly once; got:\n{first}"
+            );
+
+            let second = joined(2);
+            assert!(
+                !second.contains("<base>"),
+                "v{protocol_version}: second prompt must not repeat <base>; got:\n{second}"
+            );
+            assert_eq!(
+                second.matches("<context>").count(),
+                1,
+                "v{protocol_version}: second message gets its own <context>; got:\n{second}"
+            );
+            assert_eq!(
+                second.matches(message_n).count(),
+                1,
+                "v{protocol_version}: second message delivered exactly once; got:\n{second}"
+            );
+            assert!(
+                !second.contains(message_m),
+                "v{protocol_version}: second prompt must not re-deliver the first message; got:\n{second}"
+            );
+
+            let third = joined(3);
+            assert!(!third.contains("<base>"));
+            assert_eq!(third.matches("<context>").count(), 1);
+            assert_eq!(
+                (third.matches(message_p).count(), third.matches(message_q).count()),
+                (1, 1),
+                "v{protocol_version}: two messages batched during init land once each in one prompt; got:\n{third}"
+            );
+            assert!(!third.contains(message_m) && !third.contains(message_n));
+            rest_stub.abort();
+        }
     }
 
     #[tokio::test]
