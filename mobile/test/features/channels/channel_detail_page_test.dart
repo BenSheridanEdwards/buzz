@@ -9,6 +9,7 @@ import 'package:flutter/rendering.dart'
 import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:hooks_riverpod/hooks_riverpod.dart';
+import 'package:hooks_riverpod/misc.dart';
 import 'package:http/http.dart' as http;
 import 'package:http/testing.dart' as http_testing;
 import 'package:lucide_icons_flutter/lucide_icons.dart';
@@ -39,6 +40,7 @@ import 'package:buzz/features/channels/thread_detail_page.dart';
 import 'package:buzz/features/channels/thread_replies_provider.dart';
 import 'package:buzz/features/channels/timeline_message.dart';
 import 'package:buzz/features/channels/channels_provider.dart';
+import 'package:buzz/features/channels/voice_note_recording.dart';
 import 'package:buzz/shared/read_state/read_state_provider.dart';
 import 'package:buzz/features/channels/unread_badge/observed_unread_event.dart';
 import 'package:buzz/features/channels/small_avatar.dart';
@@ -63,6 +65,8 @@ import 'package:buzz/shared/widgets/lucide_star_icon.dart';
 import 'package:buzz/shared/widgets/masked_avatar_badge.dart';
 import 'package:buzz/shared/widgets/skeleton.dart';
 import 'package:shared_preferences/shared_preferences.dart';
+
+import 'voice_note_test_support.dart';
 
 const _channelId = '11111111-2222-4333-8444-555555555555';
 const _huddleChannelId = '8d764100-fd8f-44cf-9c98-6d8fbd739b8c';
@@ -244,6 +248,7 @@ Widget _buildTestable({
   String? huddleCurrentPubkey,
   http.Client? mediaClient,
   Widget? home,
+  List<Override> extraOverrides = const [],
 }) {
   final resolvedChannel = channel ?? _testChannel;
   final navigatorKey = GlobalKey<NavigatorState>();
@@ -371,6 +376,7 @@ Widget _buildTestable({
       appLifecycleProvider.overrideWith(_TestAppLifecycleNotifier.new),
       // Compose bar drafts persist through SharedPreferences.
       savedPrefsProvider.overrideWithValue(_testPrefs),
+      ...extraOverrides,
     ],
     child: MaterialApp(
       navigatorKey: navigatorKey,
@@ -1949,6 +1955,66 @@ void main() {
         findsOneWidget,
       );
     });
+
+    for (final (channelType, unfolds) in [('dm', true), ('stream', false)]) {
+      testWidgets('a voice-note transcript in a $channelType channel '
+          '${unfolds ? 'unfolds' : 'stays folded'} when playback starts', (
+        tester,
+      ) async {
+        const audioUrl = 'https://example.com/media/note.mp4';
+        final channel = Channel(
+          id: _channelId,
+          name: channelType == 'dm' ? '' : 'general',
+          channelType: channelType,
+          visibility: 'open',
+          description: '',
+          createdBy: 'abc123',
+          createdAt: DateTime(2025),
+          memberCount: 2,
+          isMember: true,
+        );
+        await tester.pumpWidget(
+          _buildTestable(
+            channel: channel,
+            messages: [
+              _textMsg(
+                id: 'voice-1',
+                pubkey: 'alice',
+                content: '![audio]($audioUrl)',
+                extraTags: const [
+                  [
+                    'imeta',
+                    'url $audioUrl',
+                    'm audio/mp4',
+                    'duration 24.0',
+                    'alt Status is green on the Studio.',
+                  ],
+                ],
+              ),
+            ],
+            users: const {
+              'alice': UserProfile(pubkey: 'alice', displayName: 'Alice'),
+            },
+            extraOverrides: [
+              voiceNotePlayerFactoryProvider.overrideWithValue(
+                FakeVoiceNotePlayer.new,
+              ),
+            ],
+          ),
+        );
+        await tester.pumpAndSettle();
+
+        final body = find.byKey(const ValueKey('voice-note-transcript-body'));
+        expect(find.text('Show transcript'), findsOneWidget);
+        expect(body, findsNothing);
+
+        await tester.tap(find.byKey(const ValueKey('voice-note-play-pause')));
+        await tester.pumpAndSettle();
+
+        expect(find.text('0:00 · Alice · 0:24'), findsOneWidget);
+        expect(body, unfolds ? findsOneWidget : findsNothing);
+      });
+    }
 
     testWidgets(
       'channel details combines people and agents in one member list',
@@ -9239,12 +9305,22 @@ void main() {
       await tester.pumpAndSettle();
 
       expect(find.byType(TextField), findsNothing);
-      expect(find.byIcon(LucideIcons.arrowUp).hitTestable(), findsOneWidget);
+      expect(
+        find.byKey(const ValueKey('composer-mic')).hitTestable(),
+        findsOneWidget,
+      );
 
       await tester.tap(find.text('Message #general'));
       await tester.pumpAndSettle();
 
       expect(find.byType(TextField), findsOneWidget);
+      expect(
+        find.byKey(const ValueKey('composer-mic')).hitTestable(),
+        findsOneWidget,
+      );
+
+      await tester.enterText(find.byType(TextField), 'hello');
+      await tester.pumpAndSettle();
       expect(find.byIcon(LucideIcons.arrowUp).hitTestable(), findsOneWidget);
     });
 

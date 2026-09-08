@@ -73,18 +73,6 @@ extension NativeAttachmentPopoverViewController {
     )
     stack.addArrangedSubview(
       makeNativeAttachmentMenuButton(
-        title: "Voice note",
-        symbol: "mic",
-        action: { [weak self] in
-          self?.finish(
-            method: "recordVoiceNote",
-            notifyBeforeDismissal: true
-          )
-        }
-      )
-    )
-    stack.addArrangedSubview(
-      makeNativeAttachmentMenuButton(
         title: "Files",
         symbol: "doc",
         action: { [weak self] in

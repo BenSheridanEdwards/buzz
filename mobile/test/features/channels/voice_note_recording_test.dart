@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:io';
 
+import 'package:clock/clock.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:http/http.dart' as http;
 import 'package:just_audio/just_audio.dart' as audio;
@@ -14,6 +15,8 @@ class _DelayedRecorderBackend implements VoiceNoteRecorderBackend {
   final nativeStop = Completer<String?>();
   final amplitudes = StreamController<Amplitude>.broadcast();
   bool startCalled = false;
+  bool pauseCalled = false;
+  bool resumeCalled = false;
   bool stopCalled = false;
   bool stopCompleted = false;
   bool cancelCalled = false;
@@ -31,6 +34,16 @@ class _DelayedRecorderBackend implements VoiceNoteRecorderBackend {
 
   @override
   Stream<Amplitude> onAmplitudeChanged(Duration interval) => amplitudes.stream;
+
+  @override
+  Future<void> pause() async {
+    pauseCalled = true;
+  }
+
+  @override
+  Future<void> resume() async {
+    resumeCalled = true;
+  }
 
   @override
   Future<String?> stop() async {
@@ -300,6 +313,102 @@ void main() {
 
     expect(backend.cancelCalled, isTrue);
     await recorder.dispose();
+  });
+
+  test('pause and resume forward to the backend and gate samples', () async {
+    final backend = _DelayedRecorderBackend();
+    final directory = await Directory.systemTemp.createTemp('voice-note-test');
+    addTearDown(() => directory.delete(recursive: true));
+    final recorder = DeviceVoiceNoteRecorder(
+      backend: backend,
+      temporaryDirectory: () async => directory,
+    );
+    final levels = <double>[];
+    recorder.levels.listen(levels.add);
+    backend.permission.complete(true);
+    backend.nativeStart.complete();
+    await recorder.start();
+
+    backend.amplitudes.add(Amplitude(current: -6, max: 0));
+    await Future<void>.delayed(Duration.zero);
+    expect(levels, hasLength(1));
+
+    await recorder.pause();
+    expect(backend.pauseCalled, isTrue);
+    backend.amplitudes.add(Amplitude(current: -6, max: 0));
+    await Future<void>.delayed(Duration.zero);
+    expect(levels, hasLength(1));
+
+    // Pausing twice is idempotent and resuming re-enables levels.
+    await recorder.pause();
+    await recorder.resume();
+    expect(backend.resumeCalled, isTrue);
+    backend.amplitudes.add(Amplitude(current: -6, max: 0));
+    await Future<void>.delayed(Duration.zero);
+    expect(levels, hasLength(2));
+
+    final stopping = recorder.stop();
+    backend.nativeStop.complete('/tmp/voice-note-test.m4a');
+    final recording = await stopping;
+    expect(recording.waveform, hasLength(2));
+    expect(recording.duration, greaterThanOrEqualTo(Duration.zero));
+    await recorder.dispose();
+  });
+
+  test('paused time is excluded from the recorded duration', () async {
+    var now = DateTime(2026, 9, 8, 9);
+    await withClock(Clock(() => now), () async {
+      final backend = _DelayedRecorderBackend();
+      final directory = await Directory.systemTemp.createTemp(
+        'voice-note-test',
+      );
+      addTearDown(() => directory.delete(recursive: true));
+      final recorder = DeviceVoiceNoteRecorder(
+        backend: backend,
+        temporaryDirectory: () async => directory,
+      );
+      backend.permission.complete(true);
+      backend.nativeStart.complete();
+      await recorder.start();
+
+      now = now.add(const Duration(seconds: 20));
+      await recorder.pause();
+      now = now.add(const Duration(minutes: 3));
+      await recorder.resume();
+      now = now.add(const Duration(seconds: 10));
+      // A second pause that is still open when stop is called also counts.
+      await recorder.pause();
+      now = now.add(const Duration(seconds: 45));
+
+      final stopping = recorder.stop();
+      backend.nativeStop.complete('/tmp/voice-note-test.m4a');
+      final recording = await stopping;
+      expect(recording.duration, const Duration(seconds: 30));
+      await recorder.dispose();
+    });
+  });
+
+  test('a stalled native stop times out as a failure', () async {
+    final backend = _DelayedRecorderBackend();
+    final directory = await Directory.systemTemp.createTemp('voice-note-test');
+    addTearDown(() => directory.delete(recursive: true));
+    final recorder = DeviceVoiceNoteRecorder(
+      backend: backend,
+      temporaryDirectory: () async => directory,
+      stopTimeout: const Duration(milliseconds: 50),
+    );
+    backend.permission.complete(true);
+    backend.nativeStart.complete();
+    await recorder.start();
+
+    await expectLater(recorder.stop(), throwsA(isA<TimeoutException>()));
+    expect(backend.stopCalled, isTrue);
+    expect(backend.stopCompleted, isFalse);
+
+    // Disposal still ends the native recording the stop never confirmed.
+    await recorder.dispose();
+    expect(backend.cancelCalled, isTrue);
+    expect(backend.disposeCalled, isTrue);
   });
 
   test(

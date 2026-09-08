@@ -3,6 +3,7 @@ import 'package:buzz/shared/community/community_membership_provider.dart';
 import 'package:buzz/shared/community/community.dart';
 import 'package:buzz/shared/community/community_provider.dart';
 import 'package:buzz/shared/theme/theme.dart';
+import 'package:buzz/shared/voice_notes/voice_note_preferences.dart';
 import 'package:buzz/shared/push/push_bridge.dart';
 import 'package:buzz/shared/relay/app_lifecycle_provider.dart';
 import 'package:buzz/shared/widgets/app_list.dart';
@@ -52,7 +53,17 @@ void main() {
       find.byKey(const ValueKey('push-notifications-enabled')),
       findsOneWidget,
     );
-    expect(tester.widget<Switch>(find.byType(Switch)).value, isTrue);
+    expect(
+      tester
+          .widget<Switch>(
+            find.descendant(
+              of: find.byKey(const ValueKey('push-notifications-enabled')),
+              matching: find.byType(Switch),
+            ),
+          )
+          .value,
+      isTrue,
+    );
     debugDefaultTargetPlatformOverride = null;
   });
 
@@ -97,7 +108,17 @@ void main() {
     );
     await tester.pumpAndSettle();
 
-    expect(tester.widget<Switch>(find.byType(Switch)).value, isTrue);
+    expect(
+      tester
+          .widget<Switch>(
+            find.descendant(
+              of: find.byKey(const ValueKey('push-notifications-enabled')),
+              matching: find.byType(Switch),
+            ),
+          )
+          .value,
+      isTrue,
+    );
     expect(
       find.text('Enabled in Buzz, but disabled in iOS Settings'),
       findsOneWidget,
@@ -472,6 +493,50 @@ void main() {
       sections.every((section) => section.verticalPadding == Grid.twelve),
       isTrue,
     );
+  });
+
+  testWidgets('review voice notes toggle persists under one prefs key', (
+    tester,
+  ) async {
+    SharedPreferences.setMockInitialValues({});
+    final prefs = await SharedPreferences.getInstance();
+    await tester.pumpWidget(
+      ProviderScope(
+        overrides: [
+          savedPrefsProvider.overrideWithValue(prefs),
+          activeCommunityProvider.overrideWith((ref) async => null),
+          appLifecycleProvider.overrideWith(_SettingsLifecycleNotifier.new),
+        ],
+        child: MaterialApp(
+          theme: AppTheme.light(),
+          home: SettingsPage(
+            profileHeader: const SizedBox.shrink(),
+            invitePageBuilder: (_) => const SizedBox.shrink(),
+            identityRecoveryPageBuilder: (_) => const SizedBox.shrink(),
+          ),
+        ),
+      ),
+    );
+    await tester.pumpAndSettle();
+
+    final row = find.byKey(const ValueKey('voice-note-review-before-sending'));
+    await tester.scrollUntilVisible(row, 200);
+    await tester.pumpAndSettle();
+    Switch reviewSwitch() => tester.widget<Switch>(
+      find.descendant(of: row, matching: find.byType(Switch)),
+    );
+    expect(reviewSwitch().value, isFalse);
+    expect(prefs.getBool(voiceNoteReviewBeforeSendPrefsKey), isNull);
+
+    await tester.tap(find.text('Review voice notes before sending'));
+    await tester.pumpAndSettle();
+    expect(reviewSwitch().value, isTrue);
+    expect(prefs.getBool(voiceNoteReviewBeforeSendPrefsKey), isTrue);
+
+    await tester.tap(find.descendant(of: row, matching: find.byType(Switch)));
+    await tester.pumpAndSettle();
+    expect(reviewSwitch().value, isFalse);
+    expect(prefs.getBool(voiceNoteReviewBeforeSendPrefsKey), isFalse);
   });
 }
 

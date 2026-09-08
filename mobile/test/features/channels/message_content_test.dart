@@ -98,7 +98,8 @@ class _FakeVoiceNotePlayer extends VoiceNotePlayerController {
 
   @override
   Future<void> toggle() async {
-    _state = _state.copyWith(isPlaying: !_state.isPlaying);
+    // Playing loads the source, which is what makes the note scrubbable.
+    _state = _state.copyWith(isPlaying: !_state.isPlaying, canSeek: true);
     notifyListeners();
   }
 }
@@ -1411,14 +1412,14 @@ void main() {
                   widget.padding ==
                   const EdgeInsets.symmetric(
                     horizontal: Grid.xxs,
-                    vertical: Grid.half + Grid.quarter,
+                    vertical: Grid.quarter,
                   ),
             );
         expect(
           ratePadding.padding,
           const EdgeInsets.symmetric(
             horizontal: Grid.xxs,
-            vertical: Grid.half + Grid.quarter,
+            vertical: Grid.quarter,
           ),
         );
         final rateValueFinder = find.byKey(
@@ -1461,7 +1462,8 @@ void main() {
         expect(tester.getSize(rateFinder), rateSize);
         await tester.tap(rateFinder);
         await tester.pump();
-        expect(tester.widget<Text>(rateValueFinder).data, '.5×');
+        expect(tester.widget<Text>(rateValueFinder).data, '1×');
+        expect(player.speed, 1);
         expect(tester.getSize(rateFinder), rateSize);
       });
 
