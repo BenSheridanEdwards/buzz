@@ -1,3 +1,7 @@
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant};
+
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use nostr::{EventBuilder, JsonUtil, Keys, Kind, Tag, Timestamp};
 use serde::{Deserialize, Serialize};
@@ -406,6 +410,24 @@ pub(crate) async fn upload_image_bytes(
     do_upload(body, &mime, state, None, None).await
 }
 
+/// Why an upload attempt failed: the relay's status when it answered, so a
+/// caller can tell a validator rejection (415, 422) from a transport or auth
+/// failure, plus the user-facing message.
+#[derive(Debug)]
+struct UploadFailure {
+    status: Option<reqwest::StatusCode>,
+    message: String,
+}
+
+impl UploadFailure {
+    fn transport(message: String) -> Self {
+        Self {
+            status: None,
+            message,
+        }
+    }
+}
+
 async fn do_upload(
     body: Vec<u8>,
     mime: &str,
@@ -413,6 +435,19 @@ async fn do_upload(
     progress: Option<(tauri::AppHandle, String)>,
     cancellation: Option<&CancellationToken>,
 ) -> Result<BlobDescriptor, String> {
+    do_upload_checked(body, mime, state, progress, cancellation)
+        .await
+        .map_err(|failure| failure.message)
+}
+
+/// `do_upload` with the relay's status kept on failure.
+async fn do_upload_checked(
+    body: Vec<u8>,
+    mime: &str,
+    state: &AppState,
+    progress: Option<(tauri::AppHandle, String)>,
+    cancellation: Option<&CancellationToken>,
+) -> Result<BlobDescriptor, UploadFailure> {
     let sha256 = hex::encode(Sha256::digest(&body));
 
     // Video uploads get a 1-hour auth window to survive slow connections;
@@ -425,8 +460,9 @@ async fn do_upload(
     };
     let base_url = relay_api_base_url_with_override(state);
     let auth_event = {
-        let keys = state.signing_keys()?;
-        sign_blossom_upload_auth(&keys, &sha256, expiry_secs, &base_url)?
+        let keys = state.signing_keys().map_err(UploadFailure::transport)?;
+        sign_blossom_upload_auth(&keys, &sha256, expiry_secs, &base_url)
+            .map_err(UploadFailure::transport)?
     };
 
     let auth_header = format!(
@@ -449,7 +485,8 @@ async fn do_upload(
             cancellation,
         },
     )
-    .await?;
+    .await
+    .map_err(UploadFailure::transport)?;
     if should_retry_legacy_upload(resp.status()) {
         resp = send_upload_attempt(
             state,
@@ -463,14 +500,37 @@ async fn do_upload(
                 cancellation,
             },
         )
-        .await?;
+        .await
+        .map_err(UploadFailure::transport)?;
     }
 
     if !resp.status().is_success() {
-        return Err(relay_error_message(resp).await);
+        let status = resp.status();
+        return Err(UploadFailure {
+            status: Some(status),
+            message: relay_error_message(resp).await,
+        });
     }
 
-    parse_json_response::<BlobDescriptor>(resp).await
+    parse_json_response::<BlobDescriptor>(resp)
+        .await
+        .map_err(UploadFailure::transport)
+}
+
+/// Whether a refused voice note should be re-sent as the MP4 envelope: only
+/// when it went out as an M4A and the relay's validator turned it away (415
+/// or 422). A transport, auth, or rate-limit failure would fail the envelope
+/// the same way, so those are reported as they are.
+fn should_fall_back_to_envelope(
+    container: VoiceNoteContainer,
+    status: Option<reqwest::StatusCode>,
+) -> bool {
+    container == VoiceNoteContainer::M4aAudio
+        && matches!(
+            status,
+            Some(reqwest::StatusCode::UNSUPPORTED_MEDIA_TYPE)
+                | Some(reqwest::StatusCode::UNPROCESSABLE_ENTITY)
+        )
 }
 
 // ── Commands ─────────────────────────────────────────────────────────────────
@@ -714,15 +774,23 @@ pub(super) async fn upload_media_bytes_inner(
     let is_voice_note = is_voice_note_filename(filename.as_deref());
     // Real audio only where the relay says it takes it; otherwise the envelope
     // every relay accepts. Decided per upload so a workspace switch is honoured.
-    let voice_note_container = if is_voice_note && relay_accepts_audio_uploads(&state).await {
+    let mut voice_note_container = if is_voice_note && relay_accepts_audio_uploads(&state).await {
         VoiceNoteContainer::M4aAudio
     } else {
         VoiceNoteContainer::Mp4Envelope
     };
+    // The recording is kept (shared, not copied) so a relay that refuses the
+    // M4A can be answered with the envelope without asking for it again.
+    let mut voice_note_source: Option<Arc<Vec<u8>>> = None;
 
     let (body, poster_bytes) = if is_voice_note {
         emit_media_upload_phase(&app, progress_id.as_deref(), "processing-audio");
-        prepare_voice_note_for_upload(data, cancellation, voice_note_container).await?
+        let source = Arc::new(data);
+        let prepared =
+            prepare_voice_note_for_upload(Arc::clone(&source), cancellation, voice_note_container)
+                .await?;
+        voice_note_source = Some(source);
+        prepared
     } else if is_video_file(&data) {
         emit_media_upload_phase(&app, progress_id.as_deref(), "processing-video");
         // Video: write to temp → transcode + extract poster → read results.
@@ -778,7 +846,39 @@ pub(super) async fn upload_media_bytes_inner(
     if cancellation.is_some_and(CancellationToken::is_cancelled) {
         return Err("upload cancelled".to_string());
     }
-    let mut descriptor = do_upload(body, &mime, &state, progress, cancellation).await?;
+    let (mut descriptor, poster_bytes) =
+        match do_upload_checked(body, &mime, &state, progress.clone(), cancellation).await {
+            Ok(descriptor) => (descriptor, poster_bytes),
+            Err(failure) => {
+                let Some(source) = voice_note_source
+                    .take()
+                    .filter(|_| should_fall_back_to_envelope(voice_note_container, failure.status))
+                else {
+                    return Err(failure.message);
+                };
+                // The relay advertised `buzz-audio` but refused the M4A: the
+                // flag was turned off inside the cache TTL, a proxy fronts a
+                // different relay, or the validators disagree. Forget the
+                // verdict so the next note re-reads NIP-11, and send this one
+                // as the envelope every relay accepts rather than losing it.
+                eprintln!(
+                    "buzz-desktop: relay refused the M4A voice note ({}); retrying as MP4 envelope",
+                    failure.message
+                );
+                forget_relay_audio_capability(&state);
+                voice_note_container = VoiceNoteContainer::Mp4Envelope;
+                emit_media_upload_phase(&app, progress_id.as_deref(), "processing-audio");
+                let (body, poster) =
+                    prepare_voice_note_for_upload(source, cancellation, voice_note_container)
+                        .await?;
+                let mime = detect_and_validate_mime(&body)?;
+                if cancellation.is_some_and(CancellationToken::is_cancelled) {
+                    return Err("upload cancelled".to_string());
+                }
+                let descriptor = do_upload(body, &mime, &state, progress, cancellation).await?;
+                (descriptor, poster)
+            }
+        };
 
     emit_media_upload_phase(&app, progress_id.as_deref(), "finishing");
     if let Some(poster) = poster_bytes {
@@ -803,7 +903,13 @@ pub(super) async fn upload_media_bytes_inner(
 // ── Relay audio capability ───────────────────────────────────────────────────
 
 /// How long a relay's `buzz-audio` verdict is trusted before re-reading NIP-11.
-const AUDIO_CAPABILITY_TTL: std::time::Duration = std::time::Duration::from_secs(300);
+const AUDIO_CAPABILITY_TTL: Duration = Duration::from_secs(300);
+
+/// How long a failed NIP-11 read counts as "no" before it is retried. Short,
+/// so a burst of voice notes right after a relay restart or a transient
+/// timeout does not go out as envelopes for five minutes on a relay that
+/// takes real audio.
+const AUDIO_CAPABILITY_FAILURE_TTL: Duration = Duration::from_secs(30);
 
 /// Whether the NIP-11 document lists the `buzz-audio` extension, i.e. the relay
 /// accepts metadata-free `audio/mpeg` and `audio/mp4` uploads and serves them
@@ -818,54 +924,109 @@ pub(crate) fn relay_info_advertises_audio(info: &serde_json::Value) -> bool {
         })
 }
 
-/// Whether the active relay takes real audio uploads.
-///
-/// Read from NIP-11 and cached per relay base URL (community switches change
-/// the base URL, so a stale verdict can never leak across communities). Any
-/// failure reads as "no": the upload then uses the MP4 envelope every relay
-/// accepts, which is the safe direction.
-pub(crate) async fn relay_accepts_audio_uploads(state: &AppState) -> bool {
-    use std::collections::HashMap;
-    use std::sync::{Mutex, OnceLock};
-    use std::time::Instant;
+/// One cached NIP-11 read for a relay base URL.
+#[derive(Debug, Clone, Copy)]
+struct AudioCapabilityEntry {
+    /// `Some(advertises)` from a successful read; `None` when the read failed.
+    verdict: Option<bool>,
+    checked_at: Instant,
+}
 
-    static CACHE: OnceLock<Mutex<HashMap<String, (bool, Instant)>>> = OnceLock::new();
-    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
-    let base_url = relay_api_base_url_with_override(state);
+/// `buzz-audio` verdicts keyed by relay base URL. Community switches change
+/// the base URL, so a stale verdict can never leak across communities.
+#[derive(Debug, Default)]
+struct AudioCapabilityCache {
+    entries: Mutex<HashMap<String, AudioCapabilityEntry>>,
+}
 
-    let cached = cache
-        .lock()
-        .ok()
-        .and_then(|entries| entries.get(&base_url).copied());
-    if let Some((supported, checked_at)) = cached {
-        if checked_at.elapsed() < AUDIO_CAPABILITY_TTL {
-            return supported;
+impl AudioCapabilityCache {
+    /// The answer for `base_url` at `now`, if a fresh one is cached. A
+    /// successful read lives for [`AUDIO_CAPABILITY_TTL`]; a failed read reads
+    /// as "no" for [`AUDIO_CAPABILITY_FAILURE_TTL`] and then expires so NIP-11
+    /// is consulted again. `None` means fetch.
+    fn lookup(&self, base_url: &str, now: Instant) -> Option<bool> {
+        let entries = self.entries.lock().ok()?;
+        let entry = entries.get(base_url)?;
+        let ttl = if entry.verdict.is_some() {
+            AUDIO_CAPABILITY_TTL
+        } else {
+            AUDIO_CAPABILITY_FAILURE_TTL
+        };
+        if now.saturating_duration_since(entry.checked_at) < ttl {
+            Some(entry.verdict.unwrap_or(false))
+        } else {
+            None
         }
     }
 
-    let supported = fetch_relay_audio_capability(&state.http_client, &base_url).await;
-    if let Ok(mut entries) = cache.lock() {
-        entries.insert(base_url, (supported, Instant::now()));
+    fn record(&self, base_url: &str, verdict: Option<bool>, now: Instant) {
+        if let Ok(mut entries) = self.entries.lock() {
+            entries.insert(
+                base_url.to_string(),
+                AudioCapabilityEntry {
+                    verdict,
+                    checked_at: now,
+                },
+            );
+        }
     }
-    supported
+
+    /// Drop the entry for `base_url` so the next voice note re-reads NIP-11.
+    fn forget(&self, base_url: &str) {
+        if let Ok(mut entries) = self.entries.lock() {
+            entries.remove(base_url);
+        }
+    }
 }
 
-async fn fetch_relay_audio_capability(client: &reqwest::Client, base_url: &str) -> bool {
+fn audio_capability_cache() -> &'static AudioCapabilityCache {
+    static CACHE: OnceLock<AudioCapabilityCache> = OnceLock::new();
+    CACHE.get_or_init(AudioCapabilityCache::default)
+}
+
+/// Whether the active relay takes real audio uploads.
+///
+/// Read from NIP-11 and cached per relay base URL. A read that fails (timeout,
+/// non-2xx, malformed document) reads as "no" for a short while, so the upload
+/// uses the MP4 envelope every relay accepts, and is then retried rather than
+/// being remembered as a verdict.
+pub(crate) async fn relay_accepts_audio_uploads(state: &AppState) -> bool {
+    let base_url = relay_api_base_url_with_override(state);
+    let cache = audio_capability_cache();
+    if let Some(supported) = cache.lookup(&base_url, Instant::now()) {
+        return supported;
+    }
+    let verdict = fetch_relay_audio_capability(&state.http_client, &base_url).await;
+    cache.record(&base_url, verdict, Instant::now());
+    verdict.unwrap_or(false)
+}
+
+/// Forget the cached verdict for the active relay. Called when a relay that
+/// advertised `buzz-audio` refused an M4A, so the stale "yes" does not fail
+/// every voice note for the rest of the TTL.
+fn forget_relay_audio_capability(state: &AppState) {
+    audio_capability_cache().forget(&relay_api_base_url_with_override(state));
+}
+
+/// `Some(advertises)` from a successful NIP-11 read, `None` when the read
+/// failed for any reason.
+async fn fetch_relay_audio_capability(client: &reqwest::Client, base_url: &str) -> Option<bool> {
     let url = format!("{}/info", base_url.trim_end_matches('/'));
-    let response = match client
+    let response = client
         .get(&url)
         .header("accept", "application/nostr+json")
-        .timeout(std::time::Duration::from_secs(5))
+        .timeout(Duration::from_secs(5))
         .send()
         .await
-    {
-        Ok(response) if response.status().is_success() => response,
-        _ => return false,
-    };
-    match response.json::<serde_json::Value>().await {
-        Ok(info) => relay_info_advertises_audio(&info),
-        Err(_) => false,
+        .ok()?;
+    if !response.status().is_success() {
+        return None;
     }
+    response
+        .json::<serde_json::Value>()
+        .await
+        .ok()
+        .map(|info| relay_info_advertises_audio(&info))
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────────
@@ -873,6 +1034,81 @@ async fn fetch_relay_audio_capability(client: &reqwest::Client, base_url: &str) 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn audio_capability_cache_expires_verdicts_and_retries_failures_sooner() {
+        let cache = AudioCapabilityCache::default();
+        let relay = "https://relay.example";
+        let t0 = Instant::now();
+        assert_eq!(cache.lookup(relay, t0), None, "nothing cached yet");
+
+        // A successful read is trusted for the full TTL and then re-read.
+        cache.record(relay, Some(true), t0);
+        assert_eq!(cache.lookup(relay, t0), Some(true));
+        assert_eq!(
+            cache.lookup(relay, t0 + AUDIO_CAPABILITY_TTL - Duration::from_secs(1)),
+            Some(true)
+        );
+        assert_eq!(cache.lookup(relay, t0 + AUDIO_CAPABILITY_TTL), None);
+        cache.record(relay, Some(false), t0);
+        assert_eq!(cache.lookup(relay, t0), Some(false));
+
+        // A failed read is "no" only briefly, then NIP-11 is consulted again.
+        cache.record(relay, None, t0);
+        assert_eq!(cache.lookup(relay, t0), Some(false));
+        assert_eq!(
+            cache.lookup(
+                relay,
+                t0 + AUDIO_CAPABILITY_FAILURE_TTL - Duration::from_secs(1)
+            ),
+            Some(false)
+        );
+        assert_eq!(cache.lookup(relay, t0 + AUDIO_CAPABILITY_FAILURE_TTL), None);
+        assert!(AUDIO_CAPABILITY_FAILURE_TTL < AUDIO_CAPABILITY_TTL);
+
+        // Verdicts are per relay, and eviction is immediate.
+        cache.record(relay, Some(true), t0);
+        assert_eq!(cache.lookup("https://other.example", t0), None);
+        cache.forget(relay);
+        assert_eq!(cache.lookup(relay, t0), None);
+    }
+
+    #[test]
+    fn m4a_refusal_falls_back_to_envelope_only_for_validator_rejections() {
+        use reqwest::StatusCode;
+        use VoiceNoteContainer::{M4aAudio, Mp4Envelope};
+
+        assert!(should_fall_back_to_envelope(
+            M4aAudio,
+            Some(StatusCode::UNSUPPORTED_MEDIA_TYPE)
+        ));
+        assert!(should_fall_back_to_envelope(
+            M4aAudio,
+            Some(StatusCode::UNPROCESSABLE_ENTITY)
+        ));
+        // Anything else would fail the envelope the same way.
+        for status in [
+            StatusCode::BAD_REQUEST,
+            StatusCode::UNAUTHORIZED,
+            StatusCode::FORBIDDEN,
+            StatusCode::NOT_FOUND,
+            StatusCode::PAYLOAD_TOO_LARGE,
+            StatusCode::TOO_MANY_REQUESTS,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            StatusCode::SERVICE_UNAVAILABLE,
+        ] {
+            assert!(
+                !should_fall_back_to_envelope(M4aAudio, Some(status)),
+                "{status}"
+            );
+        }
+        assert!(!should_fall_back_to_envelope(M4aAudio, None));
+        // The envelope has nothing to fall back to.
+        assert!(!should_fall_back_to_envelope(
+            Mp4Envelope,
+            Some(StatusCode::UNPROCESSABLE_ENTITY)
+        ));
+    }
 
     #[test]
     fn relay_info_audio_extension_is_read_from_supported_extensions() {

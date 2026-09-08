@@ -67,6 +67,37 @@ pub fn build_imeta_tag(d: &BlobDescriptor, filename: Option<&str>) -> Vec<String
     tag
 }
 
+/// Sanitise a local basename for the imeta `filename` field.
+///
+/// Mirrors the desktop's rules so the relay's ingest validation ("1 to 255
+/// chars, no path separators or control characters") is met before the blob
+/// is uploaded rather than failing the whole message afterwards: directory
+/// components are stripped, control characters removed, the result bounded
+/// to 255 characters, and an empty name becomes `file`.
+pub fn sanitize_filename(name: &str) -> String {
+    let base = name.rsplit(['/', '\\']).next().unwrap_or(name).trim();
+    let cleaned: String = base.chars().filter(|c| !c.is_control()).take(255).collect();
+    if cleaned.is_empty() {
+        "file".to_string()
+    } else {
+        cleaned
+    }
+}
+
+/// Escape a markdown link label so `[`, `]` and `\` in a filename cannot
+/// break or redirect the `[label](url)` line the body carries. Matches the
+/// desktop renderer's `imetaMediaMarkdown` escaping.
+pub fn escape_markdown_label(label: &str) -> String {
+    let mut out = String::with_capacity(label.len());
+    for c in label.chars() {
+        if matches!(c, '[' | ']' | '\\') {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
+}
+
 /// MIME types accepted for upload.
 const ALLOWED_MIMES: &[&str] = &[
     "image/jpeg",
@@ -1186,9 +1217,13 @@ impl BuzzClient {
         let bytes = std::fs::read(file_path)
             .map_err(|e| CliError::Other(format!("failed to read {file_path}: {e}")))?;
 
-        // 2. Detect MIME from magic bytes
+        // 2. Detect MIME from magic bytes. `infer` only knows MPEG-1 Layer III
+        //    and ID3-tagged MP3s; the relay's own sniff parses frame headers,
+        //    so a 22.05 kHz MPEG-2 file from a speech encoder is sent as
+        //    audio/mpeg rather than refused as an unknown type.
         let mime = infer::get(&bytes)
             .map(|t| t.mime_type().to_string())
+            .or_else(|| buzz_media::sniff_audio_mime(&bytes).map(str::to_string))
             .unwrap_or_else(|| "application/octet-stream".to_string());
 
         if !ALLOWED_MIMES.contains(&mime.as_str()) {
@@ -2287,6 +2322,91 @@ mod retry_policy_tests {
             auths.iter().all(|a| a.contains("Nostr ")),
             "each attempt must carry Nostr auth"
         );
+    }
+
+    /// The relay's own MPEG-2 fixture (22.05 kHz, `FF F3`), which `infer` does
+    /// not recognise: the CLI must still send it, as `audio/mpeg`, with the
+    /// exact file bytes. Without the shared sniff this fails before any
+    /// request is made ("unsupported file type: application/octet-stream").
+    #[tokio::test]
+    async fn upload_file_sends_mpeg2_mp3_as_audio_mpeg() {
+        use std::io::Write;
+
+        use axum::body::Bytes;
+        use axum::routing::put;
+
+        const CLEAN_MP3: &[u8] =
+            include_bytes!("../../buzz-media/tests/fixtures/audio/sine-clean.mp3");
+        assert!(
+            infer::get(CLEAN_MP3).is_none(),
+            "fixture must be one `infer` cannot classify"
+        );
+        let mut tmp = tempfile::NamedTempFile::new().unwrap();
+        tmp.write_all(CLEAN_MP3).unwrap();
+        let file_path = tmp.path().to_str().unwrap().to_string();
+
+        type Seen = Arc<std::sync::Mutex<Vec<(String, usize)>>>;
+        let seen: Seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let app = Router::new()
+            .route(
+                "/upload",
+                put(
+                    |State(seen): State<Seen>, headers: HeaderMap, body: Bytes| async move {
+                        let content_type = headers
+                            .get("content-type")
+                            .and_then(|v| v.to_str().ok())
+                            .unwrap_or_default()
+                            .to_string();
+                        seen.lock().unwrap().push((content_type, body.len()));
+                        let descriptor = format!(
+                            r#"{{"url":"https://relay.test/media/aabbcc.mp3","sha256":"aabbcc","size":{},"type":"audio/mpeg","uploaded":0,"duration":1.2}}"#,
+                            body.len()
+                        );
+                        Response::builder()
+                            .status(StatusCode::OK)
+                            .header("content-type", "application/json")
+                            .body(Body::from(descriptor))
+                            .unwrap()
+                    },
+                ),
+            )
+            .with_state(seen.clone());
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr: SocketAddr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let client = test_client(&format!("http://{addr}"));
+        let descriptor = client
+            .upload_file(&file_path)
+            .await
+            .expect("MPEG-2 mp3 uploads");
+        assert_eq!(descriptor.mime_type, "audio/mpeg");
+        assert_eq!(descriptor.duration, Some(1.2));
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec![("audio/mpeg".to_string(), CLEAN_MP3.len())]
+        );
+    }
+
+    #[test]
+    fn imeta_filename_is_sanitised_and_markdown_label_escaped() {
+        use super::{escape_markdown_label, sanitize_filename};
+
+        assert_eq!(sanitize_filename("voice-note-1.mp3"), "voice-note-1.mp3");
+        assert_eq!(sanitize_filename("../../etc/passwd"), "passwd");
+        assert_eq!(sanitize_filename(r"C:\Users\me\reply.m4a"), "reply.m4a");
+        assert_eq!(sanitize_filename("a\nb\tc.mp3"), "abc.mp3");
+        assert_eq!(sanitize_filename("  "), "file");
+        assert_eq!(sanitize_filename("/"), "file");
+        let long = "x".repeat(300);
+        assert_eq!(sanitize_filename(&long).chars().count(), 255);
+
+        assert_eq!(escape_markdown_label("plain.mp3"), "plain.mp3");
+        assert_eq!(
+            escape_markdown_label("a](https://x)[b.mp3"),
+            r"a\](https://x)\[b.mp3"
+        );
+        assert_eq!(escape_markdown_label(r"back\slash.mp3"), r"back\\slash.mp3");
     }
 
     /// When all retry attempts for a stored event end with a partial body (200
