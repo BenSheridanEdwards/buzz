@@ -1117,6 +1117,90 @@ workspace `emptyDir` (e.g. `/home/agent`), and the harness runs with cwd =
 system gitconfig references the nostr helpers by absolute path so it works
 regardless of `HOME`.
 
+One consequence for outbound media: the harness will not publish files from
+a working directory that is `HOME`, a parent of `HOME`, the filesystem root,
+a system directory (`/etc`, `/usr`, `/var`, `/opt`, `/srv`, a mount point,
+and the rest of `SYSTEM_PREFIXES` in `crates/buzz-acp/src/media_publish.rs`),
+or a directory that contains the attachment root or sits inside it, because
+none of those is a boundary: a reply naming `~/Documents/passport.pdf` would
+otherwise have the harness read and post it. **`HOME` must be set** for the
+working directory to be usable at all. The sentence above about the
+gitconfig working regardless of `HOME` is about git, not about this: with
+`HOME` absent the boundary cannot be judged, so the harness refuses the
+working directory, logs the reason at error level, and says so in the thread.
+Under this deployment (cwd = `HOME`) the only directory a reply can attach a
+file from is that turn's own attachment directory.
+
+**What these rules are, before what they cover.** They are not a privilege
+boundary. The engine is a child process at the harness's own uid, the harness
+auto-approves every permission the engine asks for
+(`handle_permission_request` in `crates/buzz-acp/src/acp.rs` selects the
+allow-once option on every request), and the base prompt tells the engine to
+publish by running the `buzz` CLI through its own shell with the relay URL,
+agent key and auth tag in its environment. An engine that wants to post a host
+file can read it and upload it itself. The working-directory rules therefore
+reduce *accidental* disclosure (an echoed path, a path copied out of a
+document, a channel member talking the agent into naming one) and make
+deliberate disclosure the engine's own signed action rather than something the
+harness does on its behalf. Making it a real boundary needs a different uid or
+sandbox for the engine, or an end to auto-approved permissions; neither exists
+today, so do not deploy on the assumption that a hostile engine is contained
+by the cwd it was given.
+
+**What an accepted working directory exposes, stated deliberately.** A
+provider that wants the engine to send its own files gives the harness a
+dedicated project directory as cwd, and should decide this knowingly: every
+file under that directory with a publishable extension (`MEDIA_EXTENSIONS`
+covers `txt`, `csv`, `pdf`, `zip`, `doc*`, `xls*` and the image, audio and
+video types) is then one echoed `MEDIA:` line away from the channel, and in a
+`respond_to: Anyone` channel any member can ask for that line. A project's
+`.env.txt`, exports and archives are in range; the agent's own credentials are
+not, because they arrive through the environment rather than through cwd.
+Treat the cwd you hand the harness as the set of files you are willing to
+publish to that channel's membership, and prefer a directory the agent writes
+into over one it merely works in. The exposure is *not* bounded by that tree
+when the engine is the one doing the naming, for the reason above: a file
+moved into the turn directory publishes, and so does anything under a turn
+directory the engine replaced with a link.
+
+Files with a second name on the filesystem (hard links) are refused wherever
+they sit: `canonicalize` cannot see that a hard link came from outside the
+root, so the harness requires `nlink == 1` on the handle it is about to read.
+That catches the accident (a package store, a de-duplicated backup) and not a
+deliberate `mv`, which leaves one link; it is a hygiene check, not proof of
+where a file came from.
+
+**Inbound attachments: what the descriptor-relative write is and is not.**
+The URL, hash, size, declared type, filename and bytes of an attachment all
+come from another relay member who has no account on this host, and the
+harness writes those bytes under
+`<attachment root>/<turn id>/<index>-<their filename>`, a name they can
+predict exactly. That write is `openat`-relative to a descriptor taken when
+the turn directory was opened, with `O_CREAT | O_EXCL | O_NOFOLLOW` and mode
+`0600`, so a link planted at that name is refused, never followed.
+
+Read that as defence in depth, not as a boundary against the sender.
+A remote member cannot reach it alone: the filename is reduced to a single
+path component with no separator and never `.` or `..`, the `<index>-` prefix
+rules out collisions between accepted attachments, and `openat` against the
+retained descriptor would ignore a separator that somehow survived. Planting
+the symlink requires a local process running at the harness's uid, which is
+the engine, and the engine is explicitly not treated as contained anywhere
+else on this page. The rule the guard enforces is the narrower one that
+survives that: the harness must not be an arbitrary-write primitive for a
+name and bytes it did not choose. A confused engine reaches such a primitive
+without deciding to, the bytes are hash-verified content an outsider picked,
+and it is the hole that would still be open the day the engine runs as a
+different uid.
+
+The one thing a member with no host account can make this harness do that it
+could not do itself is elsewhere: the attachment URL check constrains scheme,
+host and port but not path or query, so a crafted `imeta url` aims the
+harness's agent-signed kind-24242 GET at any path on the relay origin. It is
+blind (the body is discarded unless it hashes to the tag's `x`, and a refusal
+is collapsed to a status code before it reaches the prompt) and same-origin,
+and it is tracked as a follow-up rather than fixed here.
+
 ### Pod shape
 
 - **Bare Pod; `restartPolicy` follows lifetime policy (I5).** No Job, no

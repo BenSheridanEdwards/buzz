@@ -208,6 +208,12 @@ pub struct AcpClient {
     /// outside of a goose-native turn — the read loop's steer arm is
     /// disabled in that case.
     steer_rx: Option<tokio::sync::mpsc::Receiver<crate::pool::SteerRequest>>,
+    /// Bounded capture of the current turn's `agent_message_chunk` stream,
+    /// scanned after the turn for files the engine wants published. Reset at
+    /// the start of every `session/prompt`; taken by the pool via
+    /// [`take_turn_media`](Self::take_turn_media) once the prompt returns, so
+    /// it can only describe the turn that just completed.
+    turn_media: crate::media_publish::TurnMediaCapture,
     /// Usage tracker for goose/buzz-agent's cumulative notification format.
     goose_usage: UsageTracker,
     /// Per-turn prompt-response usage and Claude's optional cumulative cost.
@@ -560,6 +566,7 @@ impl AcpClient {
             active_run_id: None,
             steering_supported: false,
             steer_rx: None,
+            turn_media: crate::media_publish::TurnMediaCapture::default(),
             goose_usage: UsageTracker::default(),
             standard_usage: StandardUsageTracker::default(),
             standard_adapter,
@@ -580,6 +587,11 @@ impl AcpClient {
     /// Return a clone of the observer handle, if attached.
     pub(crate) fn observer_handle(&self) -> Option<ObserverHandle> {
         self.observer.clone()
+    }
+
+    /// The observer context of the current turn.
+    pub(crate) fn observer_context(&self) -> &ObserverContext {
+        &self.observer_context
     }
 
     /// Return the pool slot index for this agent process.
@@ -781,7 +793,34 @@ impl AcpClient {
         idle_timeout: std::time::Duration,
         max_duration: std::time::Duration,
     ) -> Result<StopReason, AcpError> {
-        let params = build_prompt_params(session_id, prompt_blocks);
+        let blocks: Vec<PromptBlock> = prompt_blocks
+            .iter()
+            .map(|text| PromptBlock::Text((*text).to_string()))
+            .collect();
+        self.session_prompt_content_with_idle_timeout(
+            session_id,
+            &blocks,
+            idle_timeout,
+            max_duration,
+        )
+        .await
+    }
+
+    /// Like [`session_prompt_blocks_with_idle_timeout`](Self::session_prompt_blocks_with_idle_timeout),
+    /// but accepts typed content blocks so inbound attachments can ride in the
+    /// same `session/prompt` as `resource_link` blocks.
+    ///
+    /// Starting a prompt discards any media captured from the previous turn:
+    /// a capture is only ever handed back for the prompt that produced it.
+    pub async fn session_prompt_content_with_idle_timeout(
+        &mut self,
+        session_id: &str,
+        prompt_blocks: &[PromptBlock],
+        idle_timeout: std::time::Duration,
+        max_duration: std::time::Duration,
+    ) -> Result<StopReason, AcpError> {
+        let params = build_prompt_content_params(session_id, prompt_blocks);
+        self.turn_media = crate::media_publish::TurnMediaCapture::default();
         let hard_deadline = tokio::time::Instant::now() + max_duration;
         self.current_hard_deadline = Some(hard_deadline);
 
@@ -888,6 +927,13 @@ impl AcpClient {
         let goose_usage = self.goose_usage.take();
         let standard_usage = self.standard_usage.take();
         goose_usage.or(standard_usage)
+    }
+
+    /// Take the media capture for the turn that just completed, leaving an
+    /// empty one behind. Callers must take it before the next prompt, which
+    /// resets the capture.
+    pub fn take_turn_media(&mut self) -> crate::media_publish::TurnMediaCapture {
+        std::mem::take(&mut self.turn_media)
     }
 
     /// Notify the usage tracker that buzz-acp just spawned a new session.
@@ -1757,6 +1803,7 @@ impl AcpClient {
                 if let Some(text) = update["content"]["text"].as_str() {
                     tracing::info!(target: "acp::stream", "{text}");
                 }
+                self.turn_media.record_chunk(&update["content"]);
                 false
             }
             "tool_call" => {
@@ -2040,12 +2087,86 @@ impl AcpClient {
     }
 }
 
+/// One content block of a `session/prompt`.
+///
+/// Text is what every turn carries; `ResourceLink` hands the engine a local
+/// file (an inbound attachment the harness fetched) by `file://` URI, which
+/// the ACP spec lists as always supported, so no capability negotiation is
+/// needed and the prompt stays small no matter how large the blob is.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PromptBlock {
+    /// `{"type":"text","text":...}`.
+    Text(String),
+    /// `{"type":"resource_link","uri":...,"name":...,"mimeType":...,"size":...,"description":...}`.
+    ResourceLink {
+        /// `file://` URI of the local file.
+        uri: String,
+        /// Display name (the file's basename).
+        name: String,
+        /// MIME type when known.
+        mime_type: Option<String>,
+        /// Size in bytes when known.
+        size: Option<u64>,
+        /// Short human-readable description.
+        description: Option<String>,
+    },
+}
+
+impl PromptBlock {
+    /// Bytes of model-visible text in this block (zero for links).
+    pub fn text_len(&self) -> usize {
+        match self {
+            Self::Text(text) => text.len(),
+            Self::ResourceLink { .. } => 0,
+        }
+    }
+
+    fn to_json(&self) -> serde_json::Value {
+        match self {
+            Self::Text(text) => serde_json::json!({ "type": "text", "text": text }),
+            Self::ResourceLink {
+                uri,
+                name,
+                mime_type,
+                size,
+                description,
+            } => {
+                let mut block = serde_json::json!({
+                    "type": "resource_link",
+                    "uri": uri,
+                    "name": name,
+                });
+                if let Some(mime) = mime_type {
+                    block["mimeType"] = serde_json::Value::String(mime.clone());
+                }
+                if let Some(size) = size {
+                    block["size"] = serde_json::Value::from(*size);
+                }
+                if let Some(description) = description {
+                    block["description"] = serde_json::Value::String(description.clone());
+                }
+                block
+            }
+        }
+    }
+}
+
 /// Build `session/prompt` params from one or more text content blocks.
+#[cfg(test)]
 fn build_prompt_params(session_id: &str, prompt_blocks: &[&str]) -> serde_json::Value {
-    let blocks: Vec<serde_json::Value> = prompt_blocks
+    let blocks: Vec<PromptBlock> = prompt_blocks
         .iter()
-        .map(|text| serde_json::json!({ "type": "text", "text": text }))
+        .map(|text| PromptBlock::Text((*text).to_string()))
         .collect();
+    build_prompt_content_params(session_id, &blocks)
+}
+
+/// Build `session/prompt` params from typed content blocks.
+fn build_prompt_content_params(
+    session_id: &str,
+    prompt_blocks: &[PromptBlock],
+) -> serde_json::Value {
+    let blocks: Vec<serde_json::Value> = prompt_blocks.iter().map(PromptBlock::to_json).collect();
     serde_json::json!({
         "sessionId": session_id,
         "prompt": blocks,
@@ -2592,6 +2713,112 @@ mod tests {
         assert_eq!(prompt[0]["text"].as_str(), Some("/goal ship it"));
         assert!(prompt[0]["text"].as_str().unwrap().starts_with('/'));
         assert_eq!(prompt[1]["type"].as_str(), Some("text"));
+    }
+
+    #[test]
+    fn session_prompt_resource_link_block_format() {
+        let params = build_prompt_content_params(
+            "sess_abc123",
+            &[
+                PromptBlock::Text("<buzz-event>...</buzz-event>".into()),
+                PromptBlock::ResourceLink {
+                    uri: "file:///tmp/buzz-acp/att/1-voice-note-1.mp3".into(),
+                    name: "1-voice-note-1.mp3".into(),
+                    mime_type: Some("audio/mpeg".into()),
+                    size: Some(1234),
+                    description: Some("Buzz voice note".into()),
+                },
+                PromptBlock::ResourceLink {
+                    uri: "file:///tmp/x.bin".into(),
+                    name: "x.bin".into(),
+                    mime_type: None,
+                    size: None,
+                    description: None,
+                },
+            ],
+        );
+        let prompt = params["prompt"].as_array().unwrap();
+        assert_eq!(prompt.len(), 3);
+        assert_eq!(prompt[0]["type"].as_str(), Some("text"));
+        assert_eq!(
+            prompt[1],
+            serde_json::json!({
+                "type": "resource_link",
+                "uri": "file:///tmp/buzz-acp/att/1-voice-note-1.mp3",
+                "name": "1-voice-note-1.mp3",
+                "mimeType": "audio/mpeg",
+                "size": 1234,
+                "description": "Buzz voice note",
+            })
+        );
+        assert_eq!(
+            prompt[2],
+            serde_json::json!({
+                "type": "resource_link",
+                "uri": "file:///tmp/x.bin",
+                "name": "x.bin",
+            }),
+            "absent optional fields are omitted, not null"
+        );
+        assert_eq!(
+            PromptBlock::Text("abc".into()).text_len(),
+            3,
+            "links contribute no prompt bytes"
+        );
+    }
+
+    /// Binds the production read loop: chunks the agent streams during a
+    /// `session/prompt` land in the capture, and starting a prompt discards
+    /// whatever an earlier turn left behind.
+    #[tokio::test]
+    async fn read_loop_captures_reply_media_and_prompt_resets_it() {
+        let script = r#"
+            read -t 5 _prompt
+            echo '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"s","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"Here it is.\nMEDIA:/tmp/reply.mp3"}}}}'
+            echo '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"s","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"resource_link","uri":"file:///tmp/shot.png","mimeType":"image/png"}}}}'
+            echo '{"jsonrpc":"2.0","id":0,"result":{"stopReason":"end_turn"}}'
+            sleep 1
+        "#;
+        let mut client = spawn_script(script).await;
+
+        // Stale capture from a "previous turn", fed through the same handler
+        // the read loop uses.
+        let stale = serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {"update": {"sessionUpdate": "agent_message_chunk",
+                "content": {"type": "text", "text": "MEDIA:/tmp/stale.wav"}}}
+        });
+        let _ = client.handle_session_update(&stale);
+        assert!(client.turn_media.text().contains("stale.wav"));
+
+        let stop = client
+            .session_prompt_content_with_idle_timeout(
+                "s",
+                &[PromptBlock::Text("go".into())],
+                std::time::Duration::from_secs(5),
+                std::time::Duration::from_secs(10),
+            )
+            .await
+            .expect("prompt completes");
+        assert_eq!(stop, StopReason::EndTurn);
+
+        let capture = client.take_turn_media();
+        assert!(
+            !capture.text().contains("stale.wav"),
+            "starting a prompt must discard the previous turn's capture"
+        );
+        assert_eq!(
+            crate::media_publish::extract_media_paths(capture.text()),
+            vec!["/tmp/reply.mp3".to_string()]
+        );
+        assert_eq!(capture.blocks().len(), 1);
+        assert_eq!(capture.blocks()[0]["type"].as_str(), Some("resource_link"));
+        assert!(
+            client.take_turn_media().is_empty(),
+            "take() leaves an empty capture behind"
+        );
+        client.shutdown().await;
     }
 
     #[test]
