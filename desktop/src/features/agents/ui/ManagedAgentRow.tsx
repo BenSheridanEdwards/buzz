@@ -19,7 +19,10 @@ import { cn } from "@/shared/lib/cn";
 import { Button } from "@/shared/ui/button";
 import { AgentConfigPanel } from "./AgentConfigPanel";
 import { friendlyAgentLastError } from "@/features/agents/lib/friendlyAgentLastError";
-import { relayMembershipNotice } from "@/features/agents/lib/relayMembership";
+import {
+  type relayMembershipNotice,
+  rowRelayMembershipNotice,
+} from "@/features/agents/lib/relayMembership";
 import { CopyButton } from "./CopyButton";
 import { ManagedAgentLogPanel } from "./ManagedAgentLogPanel";
 import { PubKey } from "@/shared/ui/PubKey";
@@ -92,7 +95,9 @@ export function ManagedAgentRow({
     agent.lastError,
     agent.lastErrorCode,
   );
-  const membershipNotice = relayMembershipNotice(
+  // `null` for a refusal of the WORKSPACE identity: that one is the group's
+  // to render (`AgentGroupRows`), once, rather than once per agent.
+  const membershipNotice = rowRelayMembershipNotice(
     agent.pubkey,
     agent.relayMembership,
   );
@@ -183,13 +188,8 @@ export function ManagedAgentRow({
       </div>
 
       {/* Sibling of the expansion button, like the restart badge above: the
-          block carries copy buttons, which must never nest inside it.
-
-          A `workspace`-subject notice is deliberately NOT rendered here: the
-          relay refused the user's identity, not this agent, so the group
-          renders it once above the rows (`AgentGroupRows`) instead of once
-          per agent. */}
-      {membershipNotice && membershipNotice.subject === "agent" ? (
+          block carries copy buttons, which must never nest inside it. */}
+      {membershipNotice ? (
         <RelayMembershipBlock notice={membershipNotice} />
       ) : null}
 

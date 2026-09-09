@@ -91,6 +91,25 @@ export function relayMembershipNotice(
   };
 }
 
+/**
+ * The notice an agent's own ROW should render, or `null` when the group owns
+ * it instead.
+ *
+ * The two renderers are deliberately complementary: exactly one of
+ * `rowRelayMembershipNotice` and [`workspaceRelayMembershipNotice`] carries
+ * any given notice, never both (the user would read the same amber block
+ * twice) and never neither (the npub and the operator command would vanish).
+ * Keeping the rule here, rather than as a condition in each component, is
+ * what makes that testable without mounting either of them.
+ */
+export function rowRelayMembershipNotice(
+  agentPubkeyHex: string,
+  membership: ManagedAgentRelayMembership | null | undefined,
+): RelayMembershipNotice | null {
+  const notice = relayMembershipNotice(agentPubkeyHex, membership);
+  return notice?.subject === "workspace" ? null : notice;
+}
+
 /** The shape `workspaceRelayMembershipNotice` needs from an agent. */
 export type RelayMembershipSubject = {
   pubkey: string;

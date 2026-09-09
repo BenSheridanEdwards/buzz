@@ -8,6 +8,7 @@ import {
   RELAY_CONTAINER_PLACEHOLDER,
   relayAddMemberCommand,
   relayMembershipNotice,
+  rowRelayMembershipNotice,
   workspaceRelayMembershipNotice,
 } from "./relayMembership.ts";
 
@@ -153,7 +154,8 @@ describe("workspace-level relay membership notice", () => {
   const refusedByRelay = (subjectPubkey) => ({
     state: "not_member",
     checkedAt: "t",
-    detail: "This relay only accepts members and it did not accept your identity.",
+    detail:
+      "This relay only accepts members and it did not accept your identity.",
     subjectPubkey,
   });
 
@@ -173,7 +175,11 @@ describe("workspace-level relay membership notice", () => {
       workspaceRelayMembershipNotice([
         {
           pubkey: AGENT_HEX,
-          relayMembership: { state: "not_member", checkedAt: "t", detail: null },
+          relayMembership: {
+            state: "not_member",
+            checkedAt: "t",
+            detail: null,
+          },
         },
       ]),
       null,
@@ -198,5 +204,36 @@ describe("workspace-level relay membership notice", () => {
     ]);
     assert.ok(collapsed);
     assert.equal(collapsed.agentCount, 1);
+  });
+});
+
+describe("who renders the membership block", () => {
+  const agentLevel = { state: "not_member", checkedAt: "t", detail: "why" };
+  const userLevel = { ...agentLevel, subjectPubkey: USER_HEX };
+
+  // Exactly one owner, always. Both would show the user the same amber block
+  // twice; neither would drop the npub and the operator command entirely,
+  // which is the only way out of the state the block describes.
+  it("gives every notice exactly one owner: the row or the group", () => {
+    for (const membership of [agentLevel, userLevel]) {
+      const row = rowRelayMembershipNotice(AGENT_HEX, membership);
+      const group = workspaceRelayMembershipNotice([
+        { pubkey: AGENT_HEX, relayMembership: membership },
+      ]);
+      assert.equal(
+        Number(Boolean(row)) + Number(Boolean(group)),
+        1,
+        `exactly one renderer must own ${JSON.stringify(membership)}`,
+      );
+    }
+  });
+
+  it("leaves an agent-level refusal on the agent's own row", () => {
+    assert.equal(
+      rowRelayMembershipNotice(AGENT_HEX, agentLevel)?.badge,
+      "Not a relay member",
+    );
+    assert.equal(rowRelayMembershipNotice(AGENT_HEX, userLevel), null);
+    assert.equal(rowRelayMembershipNotice(AGENT_HEX, null), null);
   });
 });
