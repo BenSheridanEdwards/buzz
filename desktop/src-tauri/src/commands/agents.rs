@@ -594,15 +594,12 @@ pub async fn create_managed_agent(
         // point for definition behavioral strings — fails loudly on a bad
         // mode/range instead of minting an agent the author didn't describe.
         let minted = crate::managed_agents::resolve_mint_behavioral_defaults(
+            &agent_command,
             input.respond_to,
             respond_to_allowlist.clone(),
             input.parallelism,
             linked_persona.as_ref(),
         )?;
-        // Harness default when nothing was requested (Hermes mints at 1;
-        // everything else at DEFAULT_AGENT_PARALLELISM).
-        let minted_parallelism =
-            crate::managed_agents::mint_parallelism(&agent_command, minted.parallelism);
         let record = ManagedAgentRecord {
             pubkey: pubkey.clone(),
             name: name.clone(),
@@ -631,7 +628,7 @@ pub async fn create_managed_agent(
             // 0 or None → harness uses its own default (320s idle, 3600s max), and the CLI also clamps 0 → minimum.
             idle_timeout_seconds: input.idle_timeout_seconds.filter(|s| *s > 0),
             max_turn_duration_seconds: input.max_turn_duration_seconds.filter(|s| *s > 0),
-            parallelism: minted_parallelism,
+            parallelism: minted.parallelism,
             system_prompt: snapshot_prompt.or_else(|| {
                 input
                     .system_prompt

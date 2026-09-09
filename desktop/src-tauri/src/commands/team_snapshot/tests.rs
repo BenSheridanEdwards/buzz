@@ -319,7 +319,11 @@ fn team_import_definitions_are_built_for_all_members() {
         &encode_team_snapshot_json(&snapshot(vec![memory_bearing, member("Bob")])).unwrap(),
     )
     .unwrap();
-    let definitions = build_import_definitions(&decoded, false, "now").unwrap();
+    let definitions = build_import_definitions(&decoded, false, "now")
+        .unwrap()
+        .into_iter()
+        .map(|m| m.definition)
+        .collect::<Vec<_>>();
     let team = build_import_team(
         &decoded,
         definitions
@@ -357,8 +361,16 @@ fn team_import_definitions_are_built_for_all_members() {
 #[test]
 fn team_import_keeps_or_clears_every_member_allowlist_with_one_toggle() {
     let source = snapshot(vec![member("Alice"), member("Bob")]);
-    let kept = build_import_definitions(&source, true, "now").unwrap();
-    let cleared = build_import_definitions(&source, false, "now").unwrap();
+    let kept = build_import_definitions(&source, true, "now")
+        .unwrap()
+        .into_iter()
+        .map(|m| m.definition)
+        .collect::<Vec<_>>();
+    let cleared = build_import_definitions(&source, false, "now")
+        .unwrap()
+        .into_iter()
+        .map(|m| m.definition)
+        .collect::<Vec<_>>();
 
     assert!(kept.iter().all(|definition| {
         definition.respond_to.as_deref() == Some("allowlist")
@@ -367,6 +379,54 @@ fn team_import_keeps_or_clears_every_member_allowlist_with_one_toggle() {
     assert!(cleared.iter().all(|definition| {
         definition.respond_to.is_none() && definition.respond_to_allowlist.is_empty()
     }));
+}
+
+// ── Import: the parallelism the team-snapshot mint site stores ──────────────
+//
+// `confirm_team_snapshot_import` destructures each `MintedDefinition` and
+// writes `parallelism` straight onto the member's `ManagedAgentRecord`, so
+// this is the derivation behind that field. Removing the harness fold turns an
+// imported Hermes member back into 10 workers.
+
+/// A member that names no parallelism is minted at its harness default: 1 for
+/// Hermes, the app default for everything else. The portable definition keeps
+/// `None` in both cases, so re-exporting the team does not pin this machine's
+/// default onto members that never asked for one.
+#[test]
+fn team_import_mints_each_member_at_its_harness_default() {
+    let app_default = crate::managed_agents::DEFAULT_AGENT_PARALLELISM;
+    assert_ne!(app_default, 1, "the Hermes default must be observable");
+
+    let blank = |runtime: &str| {
+        let mut m = member("Alice");
+        m.definition.runtime = Some(runtime.to_string());
+        m.definition.parallelism = None;
+        m
+    };
+    let source = snapshot(vec![blank("hermes"), blank("goose")]);
+    let minted = build_import_definitions(&source, false, "now").unwrap();
+
+    assert_eq!(minted[0].parallelism, 1, "hermes member mints at 1");
+    assert_eq!(
+        minted[1].parallelism, app_default,
+        "goose member mints at the app default"
+    );
+    assert!(
+        minted.iter().all(|m| m.definition.parallelism.is_none()),
+        "a blank stays blank in the portable definition"
+    );
+}
+
+/// A member that does name a parallelism keeps it, Hermes included, and the
+/// definition carries the same requested value.
+#[test]
+fn team_import_keeps_a_parallelism_the_member_named() {
+    let mut m = member("Alice");
+    m.definition.runtime = Some("hermes".to_string());
+    m.definition.parallelism = Some(6);
+    let minted = build_import_definitions(&snapshot(vec![m]), false, "now").unwrap();
+    assert_eq!(minted[0].parallelism, 6);
+    assert_eq!(minted[0].definition.parallelism, Some(6));
 }
 
 #[test]

@@ -282,6 +282,28 @@ test("fromRawAcpRuntimeCatalogEntry maps default_parallelism to defaultParalleli
   );
 });
 
+test("fromRawAcpRuntimeCatalogEntry falls back to the app default when default_parallelism is absent", () => {
+  const raw = {
+    id: "goose",
+    label: "Goose",
+    availability: "available",
+    command: "goose",
+    source: "builtin",
+    default_args: [],
+    can_auto_install: false,
+    requires_external_cli: false,
+    install_hint: "",
+    install_instructions_url: "",
+    mcp_command: null,
+  };
+  const entry = fromRawAcpRuntimeCatalogEntry(raw);
+  assert.equal(
+    entry.defaultParallelism,
+    10,
+    "an entry without the key must read as the app default, never undefined",
+  );
+});
+
 // ── Teardown ──────────────────────────────────────────────────────────────────
 
 test("teardown — restore Date.now", () => {

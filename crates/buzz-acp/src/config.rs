@@ -873,6 +873,18 @@ pub(crate) fn hermes_profile_backed(
             .any(|(key, value)| key == HERMES_HOME_ENV && !value.trim().is_empty())
 }
 
+/// Whether an *inherited* `HERMES_HOME` counts as profile-backing, i.e. the
+/// `parent_has_hermes_home` argument to [`hermes_profile_backed`].
+///
+/// Kept here, next to the record-layer test it must match, because the two
+/// layers describe the same variable: if the spawn site rolled its own
+/// emptiness check, a parent `HERMES_HOME="   "` could be profile-backed while
+/// the identical value in the record was not. Set-but-blank means "no profile"
+/// in both.
+pub(crate) fn hermes_home_is_profile_backing(value: Option<&std::ffi::OsStr>) -> bool {
+    value.is_some_and(|value| !value.to_string_lossy().trim().is_empty())
+}
+
 /// Build the `CODEX_CONFIG` environment variable that enables full outbound
 /// network access in Codex's macOS Seatbelt sandbox.
 ///
@@ -1859,6 +1871,32 @@ mod tests {
             false
         ));
         assert!(hermes_profile_backed(&env(&[("HERMES_HOME", "")]), true));
+
+        // The two layers must apply the SAME emptiness test to the same
+        // string: an inherited `HERMES_HOME` and a record one that read
+        // differently would make the profile-backed decision depend on which
+        // layer happened to carry the value.
+        for value in ["", "   ", "\t\n"] {
+            assert_eq!(
+                hermes_home_is_profile_backing(Some(std::ffi::OsStr::new(value))),
+                hermes_profile_backed(&env(&[("HERMES_HOME", value)]), false),
+                "parent and record layers must agree on {value:?}"
+            );
+            assert!(!hermes_home_is_profile_backing(Some(std::ffi::OsStr::new(
+                value
+            ))));
+        }
+        for value in ["/Users/me/.hermes", r"C:\Users\me\hermes", " /x "] {
+            assert_eq!(
+                hermes_home_is_profile_backing(Some(std::ffi::OsStr::new(value))),
+                hermes_profile_backed(&env(&[("HERMES_HOME", value)]), false),
+                "parent and record layers must agree on {value:?}"
+            );
+            assert!(hermes_home_is_profile_backing(Some(std::ffi::OsStr::new(
+                value
+            ))));
+        }
+        assert!(!hermes_home_is_profile_backing(None));
     }
 
     #[test]

@@ -103,13 +103,28 @@ fn effective_avatar(member: &AgentSnapshot) -> Option<String> {
         .or_else(|| member.profile.avatar_url.clone())
 }
 
+/// One imported team member: the portable definition plus the parallelism the
+/// member's `ManagedAgentRecord` must store.
+///
+/// The two differ on purpose. `AgentDefinition.parallelism` stays `None` when
+/// the snapshot expressed no opinion, so re-exporting the member does not bake
+/// in this machine's harness default; the record column is not optional, so it
+/// carries the resolved value. Keeping the resolved value on this struct is
+/// what stops the record site from re-deriving it with a second precedence.
+pub(crate) struct MintedDefinition {
+    pub definition: AgentDefinition,
+    /// `MintBehavioralDefaults::parallelism` for this member's harness.
+    pub parallelism: u32,
+}
+
 /// Build a definition from a team member snapshot without consuming its memory.
 fn definition_from_snapshot(
     member: &AgentSnapshot,
     keep_allowlist: bool,
     now: &str,
-) -> Result<AgentDefinition, String> {
+) -> Result<MintedDefinition, String> {
     let behavior = resolve_snapshot_import_behavior(
+        member.definition.runtime.as_deref(),
         member.definition.respond_to.as_deref(),
         &member.definition.respond_to_allowlist,
         member.definition.parallelism,
@@ -118,7 +133,7 @@ fn definition_from_snapshot(
     let respond_to = (behavior.respond_to != crate::managed_agents::RespondTo::default())
         .then(|| behavior.respond_to.as_str().to_string());
 
-    Ok(AgentDefinition {
+    let definition = AgentDefinition {
         id: Uuid::new_v4().to_string(),
         display_name: member.profile.display_name.trim().to_string(),
         avatar_url: effective_avatar(member),
@@ -140,9 +155,14 @@ fn definition_from_snapshot(
         env_vars: Default::default(),
         respond_to,
         respond_to_allowlist: behavior.respond_to_allowlist,
-        parallelism: behavior.parallelism,
+        parallelism: behavior.definition_parallelism,
         created_at: now.to_string(),
         updated_at: now.to_string(),
+    };
+
+    Ok(MintedDefinition {
+        definition,
+        parallelism: behavior.parallelism,
     })
 }
 
@@ -150,7 +170,7 @@ pub(crate) fn build_import_definitions(
     snapshot: &TeamSnapshot,
     keep_allowlist: bool,
     now: &str,
-) -> Result<Vec<AgentDefinition>, String> {
+) -> Result<Vec<MintedDefinition>, String> {
     snapshot
         .members
         .iter()
@@ -517,7 +537,10 @@ pub async fn confirm_team_snapshot_import(
 
     // Resolve behavioral defaults for every member before any key generation.
     let definitions = build_import_definitions(&snapshot, input.keep_allowlist, &now)?;
-    let persona_ids: Vec<String> = definitions.iter().map(|d| d.id.clone()).collect();
+    let persona_ids: Vec<String> = definitions
+        .iter()
+        .map(|d| d.definition.id.clone())
+        .collect();
     let imported_team = build_import_team(&snapshot, persona_ids.clone(), &now)?;
 
     // ── Phase 2: mint keys + auth tags (sync, outside lock) ─────────────────
@@ -528,11 +551,15 @@ pub async fn confirm_team_snapshot_import(
     };
 
     let mut minted: Vec<MintedMember> = Vec::with_capacity(snapshot.members.len());
-    for (member, definition) in snapshot.members.iter().zip(definitions) {
+    for (member, minted_definition) in snapshot.members.iter().zip(definitions) {
+        let MintedDefinition {
+            definition,
+            parallelism: minted_parallelism,
+        } = minted_definition;
         let display_name = definition.display_name.clone();
         let effective_avatar_url = effective_avatar(member);
         let respond_to_wire = definition.respond_to.clone();
-        let minted_parallelism = definition.parallelism;
+        let definition_parallelism = definition.parallelism;
 
         let (agent_keys, private_key_nsec, pubkey, auth_tag) = {
             let owner_keys = state.signing_keys()?;
@@ -580,10 +607,7 @@ pub async fn confirm_team_snapshot_import(
             turn_timeout_seconds: 0,
             idle_timeout_seconds: member.definition.idle_timeout_seconds,
             max_turn_duration_seconds: member.definition.max_turn_duration_seconds,
-            parallelism: crate::managed_agents::mint_parallelism(
-                definition.runtime.as_deref().unwrap_or_default(),
-                minted_parallelism,
-            ),
+            parallelism: minted_parallelism,
             system_prompt: member.definition.system_prompt.clone(),
             model: member.definition.model.clone(),
             provider: member.definition.provider.clone(),
@@ -624,7 +648,7 @@ pub async fn confirm_team_snapshot_import(
             team_catalog_source: None,
             definition_respond_to: respond_to_wire.clone(),
             definition_respond_to_allowlist: definition.respond_to_allowlist.clone(),
-            definition_parallelism: minted_parallelism,
+            definition_parallelism,
             relay_mesh: None,
             effort_level: None,
             runtime: member.definition.runtime.clone(),

@@ -52,9 +52,24 @@ pub fn harness_default_parallelism(harness: &str) -> u32 {
 /// definition-provided value when present, else the harness default.
 ///
 /// Shared by every mint site (create, team snapshot adopt, persona snapshot
-/// import) so they cannot drift on which default applies.
+/// import) so they cannot drift on which default applies. The sites do not
+/// hold the same key: create resolves a command, the two snapshot importers
+/// hold a `definition.runtime` id, and either can name a *custom* harness that
+/// only the loaded registry knows. Both are funnelled through
+/// [`canonical_harness_command`](super::discovery::canonical_harness_command)
+/// first — the same three-tier lookup (builtins, static presets, loaded
+/// registry) the harness selector uses — so a custom harness wrapping
+/// `hermes-acp` mints 1 everywhere, matching the 1 its catalog entry
+/// advertises, instead of 1 on create and 10 on import.
+///
+/// Unresolvable input falls through to the raw string, which the static preset
+/// table then rejects, so an unknown harness still gets the app default.
 pub fn mint_parallelism(harness: &str, requested: Option<u32>) -> u32 {
-    requested.unwrap_or_else(|| harness_default_parallelism(harness))
+    if let Some(value) = requested {
+        return value;
+    }
+    let canonical = super::discovery::canonical_harness_command(harness);
+    harness_default_parallelism(canonical.as_deref().unwrap_or(harness))
 }
 
 /// Return the effective parallelism for the given harness command and
@@ -244,6 +259,75 @@ mod tests {
             );
         }
         assert_ne!(app_default, 1, "the Hermes default must be observable");
+    }
+
+    /// A custom harness wrapping the Hermes command mints 1 from *either* key
+    /// space, so the three mint sites agree with each other and with the
+    /// number the harness's own catalog entry advertises.
+    ///
+    /// Create resolves a command before minting; the two snapshot importers
+    /// hold `definition.runtime`, a runtime id that only the loaded registry
+    /// can map. Before the canonicalization in `mint_parallelism`, the id
+    /// missed the preset table entirely and the same harness minted 1 on
+    /// create and 10 on import.
+    #[test]
+    fn mint_parallelism_resolves_a_custom_harness_through_the_registry() {
+        use crate::managed_agents::custom_harnesses::{
+            registry_test_lock, update_loaded_harness_registry, HarnessDefinition,
+        };
+        let _lock = registry_test_lock();
+        update_loaded_harness_registry(vec![HarnessDefinition {
+            id: "my-hermes".to_string(),
+            label: "My Hermes".to_string(),
+            command: "hermes-acp".to_string(),
+            args: vec![],
+            env: std::collections::BTreeMap::new(),
+            install_instructions_url: String::new(),
+            install_hint: String::new(),
+        }]);
+
+        // The create site's key space (command) and the snapshot importers'
+        // (runtime id) must land on the same number.
+        assert_eq!(super::mint_parallelism("hermes-acp", None), 1);
+        assert_eq!(
+            super::mint_parallelism("my-hermes", None),
+            1,
+            "a custom harness id wrapping hermes-acp must mint 1, not the app default"
+        );
+        // And that number is what the harness's catalog entry advertises.
+        assert_eq!(super::harness_default_parallelism("hermes-acp"), 1);
+
+        // An id the registry does not know still falls through to the app default.
+        assert_eq!(
+            super::mint_parallelism("not-registered", None),
+            crate::managed_agents::DEFAULT_AGENT_PARALLELISM
+        );
+
+        update_loaded_harness_registry(vec![]);
+    }
+
+    /// A custom harness that wraps a non-Hermes command keeps the app default,
+    /// so the canonicalization cannot leak Hermes's 1 into unrelated harnesses.
+    #[test]
+    fn mint_parallelism_leaves_unrelated_custom_harnesses_on_the_app_default() {
+        use crate::managed_agents::custom_harnesses::{
+            registry_test_lock, update_loaded_harness_registry, HarnessDefinition,
+        };
+        let _lock = registry_test_lock();
+        update_loaded_harness_registry(vec![HarnessDefinition {
+            id: "my-goose".to_string(),
+            label: "My Goose".to_string(),
+            command: "goose".to_string(),
+            args: vec![],
+            env: std::collections::BTreeMap::new(),
+            install_instructions_url: String::new(),
+            install_hint: String::new(),
+        }]);
+        assert_eq!(
+            super::mint_parallelism("my-goose", None),
+            crate::managed_agents::DEFAULT_AGENT_PARALLELISM
+        );
+        update_loaded_harness_registry(vec![]);
     }
 
     /// Explicit or definition-provided values always win over the harness

@@ -166,12 +166,11 @@ pub(crate) fn known_acp_runtime_exact(id: &str) -> Option<&'static KnownAcpRunti
 /// - `None`: this harness gets no sidecar at all.
 ///
 /// The resolver is injected so the "configured but absent" branch is
-/// exercisable without a filesystem. Production callers pass `resolve_command`
-/// (the spawn, which may probe a login shell once) or `resolve_command_cached`
-/// (the read-only paths, which must never spawn one).
+/// exercisable without a filesystem. Production callers reach it through
+/// [`sidecar_resolver`], never a bare `resolve_command*`.
 pub(crate) fn mcp_sidecar_with(
     command: &str,
-    resolve: impl FnOnce(&str) -> Option<PathBuf>,
+    resolve: impl FnOnce(&'static str) -> Option<PathBuf>,
 ) -> Option<(&'static str, Option<PathBuf>)> {
     let configured = known_acp_runtime(command)
         .and_then(|runtime| runtime.mcp_command)
@@ -179,29 +178,96 @@ pub(crate) fn mcp_sidecar_with(
     Some((configured, resolve(configured)))
 }
 
+/// Sticky resolutions for bundled MCP sidecars, held *outside* the
+/// `resolve_command` cache on purpose.
+///
+/// `mcp_command` is a restart-diff field: the running process stamped one value
+/// and the summary recomputes another, and any disagreement raises the
+/// "restart required" badge. `clear_resolve_cache()` empties the resolve cache
+/// on every forced discovery, and `resolve_command_cached` only knows the
+/// managed shim dir, `target/{debug,release}`, and `current_exe()`'s parent —
+/// so a sidecar reachable only through PATH or the login shell would stamp
+/// `buzz-dev-mcp` at spawn (the full resolver found it) and read back `""`
+/// afterwards, badging every running codex and buzz-agent agent for a restart
+/// that changes nothing. Remembering the resolved path here keeps the two
+/// sides agreeing across a cache clear.
+///
+/// Only *successful* resolutions are remembered, and each is re-checked with
+/// `is_executable_file` before reuse. A sidecar that is genuinely absent is
+/// therefore re-probed after every clear (so the badge still fires on the day
+/// it is installed, which is the behaviour this field was changed for), and a
+/// remembered one that later disappears is evicted rather than handed to a
+/// spawn as a dead path.
+fn sidecar_path_memo() -> &'static std::sync::Mutex<std::collections::HashMap<&'static str, PathBuf>>
+{
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+    static MEMO: OnceLock<Mutex<HashMap<&'static str, PathBuf>>> = OnceLock::new();
+    MEMO.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Resolve one sidecar name through [`sidecar_path_memo`], falling back to
+/// `resolve` on a miss or a stale entry.
+pub(crate) fn sticky_sidecar_path(
+    name: &'static str,
+    resolve: impl FnOnce(&'static str) -> Option<PathBuf>,
+) -> Option<PathBuf> {
+    let remembered = sidecar_path_memo()
+        .lock()
+        .ok()
+        .and_then(|guard| guard.get(name).cloned());
+    if let Some(path) = remembered {
+        if is_executable_file(&path) {
+            return Some(path);
+        }
+        if let Ok(mut guard) = sidecar_path_memo().lock() {
+            guard.remove(name);
+        }
+    }
+
+    let resolved = resolve(name);
+    if let Some(path) = resolved.as_ref() {
+        if let Ok(mut guard) = sidecar_path_memo().lock() {
+            guard.insert(name, path.clone());
+        }
+    }
+    resolved
+}
+
+/// Forget every remembered sidecar path. Test-only: the memo is process-global
+/// and deliberately survives `clear_resolve_cache`, so a test that injects a
+/// resolver must not leave its answer behind for the next one.
+#[cfg(test)]
+pub(crate) fn clear_sidecar_path_memo() {
+    if let Ok(mut guard) = sidecar_path_memo().lock() {
+        guard.clear();
+    }
+}
+
+/// The production sidecar resolver for the read-only paths (summary, restart
+/// snapshot): the sticky memo over `resolve_command_cached`.
+///
+/// Cache-only, never a login-shell probe, because these callers sit on the
+/// cheap read path. The spawn passes the full `resolve_command` through the
+/// same memo, so a sidecar only the spawn could find is still visible here.
+pub(crate) fn sidecar_resolver(name: &'static str) -> Option<PathBuf> {
+    sticky_sidecar_path(name, resolve_command_cached)
+}
+
 /// The MCP sidecar a summary or restart snapshot may report: the catalog name
 /// only when the binary behind it actually resolves, else `""`.
 ///
 /// A sidecar the spawn silently skipped must not be reported as attached: the
 /// UI would claim tools the agent does not have, and the restart diff would
-/// see no drift on the day the binary appears. Resolution goes through the
-/// cache only (never a login-shell probe) because these callers sit on the
-/// cheap read path; the spawn warms that cache with the full resolver, so the
-/// stamped snapshot and the prospective one agree.
+/// see no drift on the day the binary appears.
 pub(crate) fn attached_mcp_command_with(
     command: &str,
-    resolve: impl FnOnce(&str) -> Option<PathBuf>,
+    resolve: impl FnOnce(&'static str) -> Option<PathBuf>,
 ) -> &'static str {
     match mcp_sidecar_with(command, resolve) {
         Some((name, Some(_))) => name,
         _ => "",
     }
-}
-
-/// [`attached_mcp_command_with`] against the resolve cache: the derivation the
-/// summary and the restart snapshot use.
-pub(crate) fn attached_mcp_command(command: &str) -> &'static str {
-    attached_mcp_command_with(command, resolve_command_cached)
 }
 
 /// The agent command a freshly-created agent defaults to when the create

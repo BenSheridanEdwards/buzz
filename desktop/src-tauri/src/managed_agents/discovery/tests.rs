@@ -1840,3 +1840,97 @@ fn attached_mcp_command_is_empty_when_the_sidecar_is_missing() {
         ""
     );
 }
+
+// ── Sidecar memo: the restart badge must not flap on a cache clear ───────────
+
+/// Serialises the tests that inject a resolver into the process-global sidecar
+/// memo, so one test's answer cannot leak into another's.
+fn sidecar_memo_test_lock() -> std::sync::MutexGuard<'static, ()> {
+    use std::sync::{Mutex, OnceLock};
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+}
+
+/// A sidecar that only the spawn's full resolver could find stays visible to
+/// the cheap read paths after a forced discovery clears the resolve cache.
+///
+/// Without the memo the stamped snapshot says `buzz-dev-mcp` and the
+/// prospective one says `""`, and every running codex and buzz-agent agent
+/// wears a "restart required" badge for a change that never happened.
+#[test]
+fn sidecar_path_survives_a_resolve_cache_clear() {
+    let _lock = sidecar_memo_test_lock();
+    super::clear_sidecar_path_memo();
+
+    // A real file, so the memo's liveness re-check passes on reuse.
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("buzz-dev-mcp");
+    std::fs::write(&path, b"#!/bin/sh\n").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    // The spawn resolves it once (this stands in for the login-shell probe).
+    assert_eq!(
+        super::sticky_sidecar_path("buzz-dev-mcp", |_| Some(path.clone())),
+        Some(path.clone())
+    );
+
+    // A forced discovery empties the resolve cache; the read path, which only
+    // consults that cache, would now find nothing.
+    super::clear_resolve_cache();
+    assert_eq!(
+        super::sticky_sidecar_path("buzz-dev-mcp", |_| None),
+        Some(path.clone()),
+        "a remembered sidecar must survive the cache clear"
+    );
+    assert_eq!(
+        super::attached_mcp_command_with("codex-acp", |name| super::sticky_sidecar_path(
+            name,
+            |_| None
+        )),
+        "buzz-dev-mcp",
+        "so the prospective snapshot still agrees with the stamped one"
+    );
+
+    super::clear_sidecar_path_memo();
+}
+
+/// Absence is never memoized, so the badge still fires on the day the sidecar
+/// is installed; and a remembered path that disappears is evicted rather than
+/// handed to a spawn as a dead path.
+#[test]
+fn sidecar_memo_holds_only_live_paths() {
+    let _lock = sidecar_memo_test_lock();
+    super::clear_sidecar_path_memo();
+
+    // Absent stays absent, and re-probes rather than sticking.
+    assert_eq!(super::sticky_sidecar_path("buzz-dev-mcp", |_| None), None);
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("buzz-dev-mcp");
+    std::fs::write(&path, b"#!/bin/sh\n").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    assert_eq!(
+        super::sticky_sidecar_path("buzz-dev-mcp", |_| Some(path.clone())),
+        Some(path.clone()),
+        "a sidecar installed after a negative answer must still be found"
+    );
+
+    // A remembered path that is deleted is evicted, not returned.
+    drop(dir);
+    assert_eq!(
+        super::sticky_sidecar_path("buzz-dev-mcp", |_| None),
+        None,
+        "a vanished sidecar must not be handed to a spawn"
+    );
+
+    super::clear_sidecar_path_memo();
+}
