@@ -16,8 +16,8 @@
  * clear a newer holder's claim.
  *
  * Scope: one webview, deliberately. Module state dies with the realm, so the
- * claim cannot outlive the composers it describes — the symptoms it exists to
- * prevent (two rows on one screen, two live regions announcing into one
+ * claim cannot outlive the composers it describes, and the symptoms it exists
+ * to prevent (two rows on one screen, two live regions announcing into one
  * screen-reader context, one Escape key that can only reach one of them) are
  * all properties of a single document. The huddle companion window is a
  * second webview on `index.html` with its own registry, so it can record

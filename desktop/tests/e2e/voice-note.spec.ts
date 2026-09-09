@@ -730,7 +730,7 @@ test("records from the composer and renders an inline waveform card", async ({
   await expect(composerCard).toBeVisible();
   await waitForAnimations(page);
   // The cap is the point: 21rem in a 2200px composer. Assert the cap itself,
-  // then let the rendered box settle onto it — the card enters on a spring
+  // then let the rendered box settle onto it. The card enters on a spring
   // that overshoots the resting scale by a fraction of a percent, so a single
   // zero-tolerance read of the animated box is a race with the last frame
   // (336.17 idle here, 338.80 under load).
@@ -983,7 +983,7 @@ test("records from the composer and renders an inline waveform card", async ({
   await page.keyboard.press("End");
   await scrubbedTo("End goes to the last frame").toBeCloseTo(total, 2);
   // A seek onto the last frame ends the media, and the element fires `ended`
-  // for it exactly as it does for playback running out — whether a paused
+  // for it exactly as it does for playback running out. Whether a paused
   // scrub gets one depends on how far playback reached before the pause, so
   // fire it here rather than race it. That race was this spec's flake, and
   // what it caught was the card rewinding the head on a scrub the user aimed

@@ -91,7 +91,7 @@ export function useVoiceNoteRecorder() {
    * Opens the microphone. Resolves true only once the recorder is running:
    * every bail (no media APIs, a denied or failed `getUserMedia`, a cancel
    * that lands first) resolves false, so a caller holding a resource on the
-   * recording's behalf knows to let it go. The status alone cannot say —
+   * recording's behalf knows to let it go. The status alone cannot say it:
    * these paths never leave `idle`, so nothing keyed on a status change runs.
    */
   const start = React.useCallback(async (): Promise<boolean> => {

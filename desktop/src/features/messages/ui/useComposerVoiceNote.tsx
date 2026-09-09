@@ -260,7 +260,7 @@ export function useComposerVoiceNote({
   /**
    * The microphone half of the rule: only one composer in the window may hold
    * it. Separate from the attachment half because re-recording asks only this
-   * one — it is replacing the attachment it already has.
+   * one, because it is replacing the attachment it already has.
    */
   const acceptsRecordingClaim = React.useCallback(() => {
     if (getVoiceNoteRecordingOwner() === null) return true;
