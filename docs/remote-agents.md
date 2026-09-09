@@ -1119,12 +1119,33 @@ regardless of `HOME`.
 
 One consequence for outbound media: the harness will not publish files from
 a working directory that is `HOME`, a parent of `HOME`, the filesystem root,
-or a directory containing the attachment root, because none of those is a
-boundary: a reply naming `~/Documents/passport.pdf` would otherwise have the
-harness read and post it. Under this deployment (cwd = `HOME`) the only
-directory a reply can attach a file from is that turn's own attachment
-directory; a provider that wants the engine to send its own files should
-give the harness a dedicated project directory as cwd.
+a system directory (`/etc`, `/usr`, `/var`, `/opt`, `/srv`, a mount point,
+and the rest of `SYSTEM_PREFIXES` in `crates/buzz-acp/src/media_publish.rs`),
+or a directory that contains the attachment root or sits inside it, because
+none of those is a boundary: a reply naming `~/Documents/passport.pdf` would
+otherwise have the harness read and post it. **`HOME` must be set** for the
+working directory to be usable at all. The sentence above about the
+gitconfig working regardless of `HOME` is about git, not about this: with
+`HOME` absent the boundary cannot be judged, so the harness refuses the
+working directory, logs the reason at error level, and says so in the thread.
+Under this deployment (cwd = `HOME`) the only directory a reply can attach a
+file from is that turn's own attachment directory.
+
+**What an accepted working directory exposes, stated deliberately.** A
+provider that wants the engine to send its own files gives the harness a
+dedicated project directory as cwd, and should decide this knowingly: every
+file under that directory with a publishable extension (`MEDIA_EXTENSIONS`
+covers `txt`, `csv`, `pdf`, `zip`, `doc*`, `xls*` and the image, audio and
+video types) is then one echoed `MEDIA:` line away from the channel, and in a
+`respond_to: Anyone` channel any member can ask for that line. A project's
+`.env.txt`, exports and archives are in range; the agent's own credentials
+are not, because they arrive through the environment rather than through cwd.
+Treat the cwd you hand the harness as the set of files you are willing to
+publish to that channel's membership, and prefer a directory the agent writes
+into over one it merely works in. Files with a second name on the filesystem
+(hard links) are refused wherever they sit: `canonicalize` cannot see that a
+hard link came from outside the root, so the harness requires `nlink == 1` on
+the handle it is about to read.
 
 ### Pod shape
 

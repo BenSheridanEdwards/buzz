@@ -2836,9 +2836,17 @@ async fn tokio_main() -> Result<()> {
     let ctx = Arc::new(PromptContext {
         attachment_dir,
         live_turn_dirs: crate::attachments::LiveTurnDirs::default(),
-        // One in-flight reply-media publish per agent slot: the tasks are
-        // detached from the turn, so nothing else bounds how many pile up.
-        publish_slots: Arc::new(tokio::sync::Semaphore::new(config.agents.max(1) as usize)),
+        // Two in-flight reply-media publishes per agent slot: the tasks are
+        // detached from the turn, so nothing else bounds how many pile up,
+        // and the agent slot returns as soon as the prompt does. Sizing this
+        // to the agent count alone made a second turn finishing behind a
+        // still-uploading first one wait `PUBLISH_SLOT_WAIT` and then post a
+        // failure notice for media that was fine, under ordinary load rather
+        // than under attack. The bound is what matters (rule 4), not the
+        // exact multiple.
+        publish_slots: Arc::new(tokio::sync::Semaphore::new(
+            config.agents.max(1) as usize * 2,
+        )),
         audio_support: crate::blossom::AudioSupportCache::default(),
         ffmpeg,
         mcp_servers: build_mcp_servers(&config),

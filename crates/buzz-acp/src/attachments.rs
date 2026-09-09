@@ -674,27 +674,52 @@ fn check_private_dir(dir: &Path) -> std::io::Result<()> {
 /// unguessable name and mode `0700`, and removed when the publish task drops
 /// it.
 ///
-/// The turn directory is handed to the engine as a `file://` URI and is
-/// writable by it, so anything the harness writes at a name the engine can
-/// predict is a symlink the engine can plant: `File::create` on it would
+/// Both outbound roots are engine-writable, the turn directory because it is
+/// handed to the engine as a `file://` URI and the workspace because it is
+/// the engine's own working directory, so anything the harness writes at a
+/// name the engine can predict is a symlink it can plant: `File::create`
 /// overwrite whatever the link points at, with harness privileges. Staged
 /// copies, decoded inline blocks, and ffmpeg output therefore never go under
-/// the turn directory. They go here, under `<root>/.outbound/pub-<uuid>`,
-/// outside both the engine's working directory and its scratch, with every
-/// file created by [`PublishScratch::create_file`] under
-/// `O_CREAT | O_EXCL | O_NOFOLLOW` at a random name.
+/// either root. They go here, under `<root>/.outbound/pub-<uuid>`.
+///
+/// The location is not what makes this safe, and it never was: the engine
+/// runs under the same uid, `.outbound` is a compile-time constant one level
+/// above the turn directory it was handed, and mode `0700` says nothing to a
+/// process that is us. A same-uid engine can list the base, learn the name,
+/// and swap the directory for a symlink; `O_EXCL | O_NOFOLLOW` guard the
+/// last component of a path only, so the swap redirects the write.
+///
+/// What makes it safe is that the path is resolved exactly once. The
+/// directory is opened when it is created, with `O_DIRECTORY | O_NOFOLLOW`,
+/// and every later operation on it (create, reopen, unlink) is an
+/// `openat`/`unlinkat` against that descriptor rather than a fresh walk from
+/// `/`. Renaming or replacing the directory after that point moves the name,
+/// not the descriptor, so a swap redirects nothing.
+///
+/// The one path this cannot cover is a subprocess: ffmpeg is handed a path
+/// and does its own open. [`PublishScratch::still_at_its_path`] is checked
+/// immediately before that, and the output is read back through the
+/// descriptor, so a swap costs the publish rather than moving it. See
+/// `media_publish::MediaPublisher`.
 #[derive(Debug)]
 pub struct PublishScratch {
     dir: PathBuf,
+    /// The directory the publish writes into, opened once when it was
+    /// created. Every file operation goes through this, never through
+    /// `dir`, which is kept for logs, for ffmpeg, and for naming.
+    #[cfg(unix)]
+    fd: std::os::fd::OwnedFd,
 }
 
 impl PublishScratch {
-    /// Create the per-publish directory under the attachment `root`.
+    /// Create the per-publish directory under the attachment `root` and open
+    /// it.
     ///
     /// `std::fs::create_dir` is atomic and fails with `EEXIST` on anything
     /// already at the path, symlinks included, which is what `mkdtemp(3)`
-    /// buys; the UUID makes the name unguessable, so there is nothing for
-    /// the engine to plant in the first place.
+    /// buys; the UUID makes the name unguessable. The open that follows is
+    /// `O_DIRECTORY | O_NOFOLLOW`, so a directory swapped for a symlink
+    /// between the two fails the publish instead of redirecting it.
     pub fn create(root: &Path) -> std::io::Result<Self> {
         let base = root.join(OUTBOUND_DIR);
         private_dir_builder().create(&base)?;
@@ -703,36 +728,171 @@ impl PublishScratch {
         let mut once = private_dir_builder();
         once.recursive(false);
         once.create(&dir)?;
+        #[cfg(unix)]
+        let fd = open_dir_no_follow(&dir)?;
         prune_abandoned_scratch(&base, &dir);
-        Ok(Self { dir })
+        Ok(Self {
+            dir,
+            #[cfg(unix)]
+            fd,
+        })
     }
 
-    /// The directory itself; ffmpeg writes its output here.
+    /// The directory itself, for logs and for the one subprocess that has to
+    /// be given a path.
     pub fn dir(&self) -> &Path {
         &self.dir
     }
 
-    /// A fresh, empty file in the directory with a random name, opened for
-    /// writing with `O_CREAT | O_EXCL | O_NOFOLLOW` and mode `0600`.
+    /// A fresh, empty file in the directory with a random name, created
+    /// relative to the retained descriptor with
+    /// `O_CREAT | O_EXCL | O_NOFOLLOW` and mode `0600`.
     pub fn create_file(&self, ext: &str) -> std::io::Result<(std::fs::File, PathBuf)> {
+        let name = self.random_name(ext);
+        let file = self.create_at(&name)?;
+        Ok((file, self.dir.join(&name)))
+    }
+
+    /// Reopen a file this publish created, relative to the retained
+    /// descriptor, and verify it through the handle the way
+    /// [`open_verified`] does for a file the reply named.
+    ///
+    /// This is the only way the upload phase reads: no path produced during
+    /// resolution is ever resolved again, so neither the file nor the
+    /// directory holding it can be swapped between staging and upload.
+    pub fn open_file(
+        &self,
+        path: &Path,
+        expected_len: Option<u64>,
+    ) -> std::io::Result<(std::fs::File, u64)> {
+        let name = self.name_in_scratch(path)?;
+        let file = self.open_at(name)?;
+        verified_handle(file, expected_len, false)
+    }
+
+    /// Remove a file this publish created, relative to the retained
+    /// descriptor.
+    pub fn remove_file(&self, path: &Path) -> std::io::Result<()> {
+        let name = self.name_in_scratch(path)?;
+        self.unlink_at(name)
+    }
+
+    /// A random, unused path in the directory for a subprocess (ffmpeg) to
+    /// write to. The caller must check [`Self::still_at_its_path`] before
+    /// handing the path over and read the result back through
+    /// [`Self::open_file`].
+    pub fn reserve(&self, ext: &str) -> PathBuf {
+        self.dir.join(self.random_name(ext))
+    }
+
+    /// Confirm the scratch path still names the directory the descriptor
+    /// holds, for the moment before a subprocess is given a path to write.
+    ///
+    /// A swap that has already happened is caught here; one that happens
+    /// after this returns costs the publish (the output is read back through
+    /// the descriptor and is not there) rather than moving it.
+    pub fn still_at_its_path(&self) -> std::io::Result<()> {
+        #[cfg(unix)]
+        {
+            use std::os::fd::AsFd as _;
+            let held = nix::sys::stat::fstat(self.fd.as_fd()).map_err(std::io::Error::from)?;
+            let named = nix::sys::stat::lstat(&self.dir).map_err(std::io::Error::from)?;
+            if (held.st_dev, held.st_ino) != (named.st_dev, named.st_ino) {
+                return Err(std::io::Error::other(
+                    "the scratch path no longer names the publish directory it was created as",
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// A random file name with a sanitised extension.
+    fn random_name(&self, ext: &str) -> String {
         let ext = safe_attachment_filename(ext);
         let ext = if ext.is_empty() || ext == "attachment.bin" {
             "bin".to_string()
         } else {
             ext
         };
-        let path = self.reserve(&ext);
-        let file = create_new_no_follow(&path)?;
-        Ok((file, path))
+        format!("{}.{ext}", uuid::Uuid::new_v4().simple())
     }
 
-    /// A random, unused path in the directory for a subprocess (ffmpeg) to
-    /// write. Nothing else can be sitting there: the directory is fresh and
-    /// only this process knows its name.
-    pub fn reserve(&self, ext: &str) -> PathBuf {
-        self.dir
-            .join(format!("{}.{ext}", uuid::Uuid::new_v4().simple()))
+    /// The single name component of `path` within this scratch. A path from
+    /// anywhere else is a programming error and is refused rather than
+    /// resolved.
+    fn name_in_scratch<'a>(&self, path: &'a Path) -> std::io::Result<&'a std::ffi::OsStr> {
+        match (path.parent(), path.file_name()) {
+            (Some(parent), Some(name)) if parent == self.dir => Ok(name),
+            _ => Err(std::io::Error::other(
+                "it is not a file in this publish's scratch",
+            )),
+        }
     }
+
+    #[cfg(unix)]
+    fn create_at(&self, name: &str) -> std::io::Result<std::fs::File> {
+        use std::os::fd::AsFd as _;
+        let flags = nix::fcntl::OFlag::O_WRONLY
+            | nix::fcntl::OFlag::O_CREAT
+            | nix::fcntl::OFlag::O_EXCL
+            | nix::fcntl::OFlag::O_NOFOLLOW
+            | nix::fcntl::OFlag::O_CLOEXEC;
+        let mode = nix::sys::stat::Mode::from_bits_truncate(0o600);
+        let fd =
+            nix::fcntl::openat(self.fd.as_fd(), name, flags, mode).map_err(std::io::Error::from)?;
+        Ok(std::fs::File::from(fd))
+    }
+
+    #[cfg(not(unix))]
+    fn create_at(&self, name: &str) -> std::io::Result<std::fs::File> {
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(self.dir.join(name))
+    }
+
+    #[cfg(unix)]
+    fn open_at(&self, name: &std::ffi::OsStr) -> std::io::Result<std::fs::File> {
+        use std::os::fd::AsFd as _;
+        let flags = nix::fcntl::OFlag::O_RDONLY
+            | nix::fcntl::OFlag::O_NOFOLLOW
+            | nix::fcntl::OFlag::O_CLOEXEC;
+        let fd = nix::fcntl::openat(self.fd.as_fd(), name, flags, nix::sys::stat::Mode::empty())
+            .map_err(std::io::Error::from)?;
+        Ok(std::fs::File::from(fd))
+    }
+
+    #[cfg(not(unix))]
+    fn open_at(&self, name: &std::ffi::OsStr) -> std::io::Result<std::fs::File> {
+        std::fs::File::open(self.dir.join(name))
+    }
+
+    #[cfg(unix)]
+    fn unlink_at(&self, name: &std::ffi::OsStr) -> std::io::Result<()> {
+        use std::os::fd::AsFd as _;
+        nix::unistd::unlinkat(
+            self.fd.as_fd(),
+            name,
+            nix::unistd::UnlinkatFlags::NoRemoveDir,
+        )
+        .map_err(std::io::Error::from)
+    }
+
+    #[cfg(not(unix))]
+    fn unlink_at(&self, name: &std::ffi::OsStr) -> std::io::Result<()> {
+        std::fs::remove_file(self.dir.join(name))
+    }
+}
+
+/// Open an existing directory without following a symlink at its last
+/// component, for `openat`-relative work against it.
+#[cfg(unix)]
+fn open_dir_no_follow(dir: &Path) -> std::io::Result<std::os::fd::OwnedFd> {
+    let flags = nix::fcntl::OFlag::O_RDONLY
+        | nix::fcntl::OFlag::O_DIRECTORY
+        | nix::fcntl::OFlag::O_NOFOLLOW
+        | nix::fcntl::OFlag::O_CLOEXEC;
+    nix::fcntl::open(dir, flags, nix::sys::stat::Mode::empty()).map_err(std::io::Error::from)
 }
 
 /// How long an abandoned publish scratch directory can sit under the
@@ -774,26 +934,6 @@ fn prune_abandoned_scratch(base: &Path, keep: &Path) {
     }
 }
 
-/// Create `path` for writing with `O_CREAT | O_EXCL | O_NOFOLLOW` and mode
-/// `0600`: it must not exist, and if a symlink is sitting there the open
-/// fails rather than writing through it to whatever it points at.
-///
-/// `O_EXCL` is the flag that does the work on creation, a dangling link
-/// included, so removing `O_NOFOLLOW` alone fails no test; it is kept
-/// because every other open in this module carries it, and it is the only
-/// guard on the read side ([`open_verified`]).
-pub fn create_new_no_follow(path: &Path) -> std::io::Result<std::fs::File> {
-    let mut options = std::fs::OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt as _;
-        options.mode(0o600);
-        options.custom_flags(nix::fcntl::OFlag::O_NOFOLLOW.bits());
-    }
-    options.open(path)
-}
-
 impl Drop for PublishScratch {
     fn drop(&mut self) {
         if let Err(e) = std::fs::remove_dir_all(&self.dir) {
@@ -806,13 +946,28 @@ impl Drop for PublishScratch {
     }
 }
 
-/// Open `path` for reading without following a symlink at its last component
-/// and confirm through the open handle that it is a regular file, of exactly
-/// `expected_len` bytes when one is given. Returns the handle and its length.
+/// Open a file the reply named, for reading, without following a symlink at
+/// its last component, and decide on the open handle whether it is eligible
+/// to be published. Returns the handle and its length.
 ///
-/// Every read of a file the harness is about to upload goes through this, so
-/// a path that resolved to a regular file cannot be swapped for a link (or
-/// for different content) between resolution and the read.
+/// This is the last of the three containment primitives and the only one
+/// that looks at the file itself rather than at a path. `confine` decides
+/// where a name is allowed to resolve to; this decides whether the thing it
+/// resolved to may leave the host, and it decides it on the handle the bytes
+/// will actually be read from, so a path that resolved to a regular file
+/// cannot be swapped for a link (or for different content) in between.
+///
+/// A file with more than one link is refused. Containment is decided with
+/// `canonicalize`, which resolves symlinks and has nothing to resolve for a
+/// hard link: a second name for an inode is its own canonical path, so
+/// `ln ~/Documents/passport.pdf <turn dir>/note.pdf` puts a file that is
+/// nowhere near a root under one, and every path-shaped guard agrees that it
+/// belongs there. Both roots are engine-writable, so the engine can always
+/// make that second name. `nlink == 1` is the property that says a file has
+/// no other name, and it is only readable from the inode. The cost is that a
+/// legitimately hard-linked file (a package store, a de-duplicated backup)
+/// cannot be published from a root; it earns a note, and copying it into the
+/// root makes it publishable.
 pub fn open_verified(
     path: &Path,
     expected_len: Option<u64>,
@@ -825,17 +980,45 @@ pub fn open_verified(
         options.custom_flags(nix::fcntl::OFlag::O_NOFOLLOW.bits());
     }
     let file = options.open(path)?;
+    verified_handle(file, expected_len, true)
+}
+
+/// Check an open handle: a regular file, of exactly `expected_len` bytes
+/// when one is given, and, when `single_link`, with no second name.
+///
+/// `single_link` is on for a file the reply named and off for a file this
+/// publish created in its own scratch, whose provenance is not in question
+/// and whose length is the only thing worth re-checking.
+///
+/// The messages name the condition and never the path. The two callers are
+/// the outbound staging and upload paths, which prefix the reply's own name
+/// for the file and post the result into the channel; the absolute path is
+/// on the `tracing` line beside each call instead.
+fn verified_handle(
+    file: std::fs::File,
+    expected_len: Option<u64>,
+    single_link: bool,
+) -> std::io::Result<(std::fs::File, u64)> {
+    #[cfg(not(unix))]
+    let _ = single_link;
     let meta = file.metadata()?;
     if !meta.is_file() {
-        return Err(std::io::Error::other(format!(
-            "{} is not a regular file",
-            path.display()
-        )));
+        return Err(std::io::Error::other("it is not a regular file"));
+    }
+    #[cfg(unix)]
+    if single_link {
+        use std::os::unix::fs::MetadataExt as _;
+        if meta.nlink() > 1 {
+            return Err(std::io::Error::other(format!(
+                "it has {} names on this filesystem; a file with more than one name is not \
+                 contained by the directory it was found in",
+                meta.nlink()
+            )));
+        }
     }
     if let Some(expected) = expected_len.filter(|expected| *expected != meta.len()) {
         return Err(std::io::Error::other(format!(
-            "{} changed underneath us ({expected} bytes became {})",
-            path.display(),
+            "it changed underneath us ({expected} bytes became {})",
             meta.len()
         )));
     }
@@ -1462,12 +1645,13 @@ mod tests {
             assert_eq!(mode, 0o600, "{mode:o}");
 
             // A link planted at a scratch name is never written through:
-            // this is the open every scratch file is created with.
+            // `create_at` is the open every scratch file is created with,
+            // and the name is the only thing the test chooses.
             let victim = root.join("victim.txt");
             std::fs::write(&victim, b"victim").unwrap();
-            let planted = scratch.reserve("txt");
-            std::os::unix::fs::symlink(&victim, &planted).unwrap();
-            let err = create_new_no_follow(&planted)
+            std::os::unix::fs::symlink(&victim, scratch.dir().join("planted.txt")).unwrap();
+            let err = scratch
+                .create_at("planted.txt")
                 .expect_err("a planted symlink is not written through");
             assert!(
                 err.kind() == std::io::ErrorKind::AlreadyExists
@@ -1476,9 +1660,8 @@ mod tests {
             );
             assert_eq!(std::fs::read(&victim).unwrap(), b"victim");
             // And so is a plain existing file.
-            let taken = scratch.reserve("txt");
-            std::fs::write(&taken, b"first").unwrap();
-            assert!(create_new_no_follow(&taken).is_err());
+            std::fs::write(scratch.dir().join("taken.txt"), b"first").unwrap();
+            assert!(scratch.create_at("taken.txt").is_err());
             scratch.dir().to_path_buf()
         };
         assert!(!dir.exists(), "the scratch goes when the publish does");
@@ -1496,6 +1679,62 @@ mod tests {
         assert!(!abandoned.exists(), "the abandoned scratch was reclaimed");
         assert!(recent.is_dir(), "a fresh one is left alone");
         assert!(live.dir().is_dir());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// B1b from the third confirmation pass: the scratch is not hidden from
+    /// the engine (same uid, a constant `.outbound` one level above the
+    /// turn directory it was handed), so a same-uid process can list the
+    /// base, learn the name, and swap the directory for a symlink. Holding
+    /// the directory open and working `openat`-relative to it is what makes
+    /// that swap inert: the descriptor still names the real directory, the
+    /// creates and the reads follow it, and the attacker's directory stays
+    /// empty. Replacing `create_at`/`open_at` with a path-based open puts
+    /// the file in `victim` instead and fails this test.
+    #[test]
+    fn a_swapped_scratch_directory_redirects_nothing() {
+        let root = std::env::temp_dir().join(format!("buzz-acp-swap-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let scratch = PublishScratch::create(&root).unwrap();
+        let victim = root.join("victim");
+        std::fs::create_dir_all(&victim).unwrap();
+
+        // The swap, exactly as the probe did it: the real directory is moved
+        // aside and a symlink to the attacker's directory takes its name.
+        let named = scratch.dir().to_path_buf();
+        let real = root.join(OUTBOUND_DIR).join("moved");
+        std::fs::rename(&named, &real).unwrap();
+        std::os::unix::fs::symlink(&victim, &named).unwrap();
+
+        let (mut file, path) = scratch
+            .create_file("txt")
+            .expect("the descriptor still names a usable directory");
+        std::io::Write::write_all(&mut file, b"staged bytes").unwrap();
+        drop(file);
+        let name = path.file_name().unwrap();
+        assert!(
+            std::fs::read_dir(&victim).unwrap().next().is_none(),
+            "the write did not follow the swapped directory"
+        );
+        assert_eq!(
+            std::fs::read(real.join(name)).unwrap(),
+            b"staged bytes",
+            "it landed in the directory the descriptor holds"
+        );
+        // And the read side comes back through the same descriptor.
+        let (mut reopened, len) = scratch.open_file(&path, Some(12)).unwrap();
+        let mut back = Vec::new();
+        std::io::Read::read_to_end(&mut reopened, &mut back).unwrap();
+        assert_eq!((len, back.as_slice()), (12, b"staged bytes".as_slice()));
+        // The one operation that cannot go through the descriptor is a
+        // subprocess opening a path, and that is refused once swapped.
+        let err = scratch
+            .still_at_its_path()
+            .expect_err("the path no longer names the publish directory");
+        assert!(err.to_string().contains("no longer names"), "{err}");
+
+        std::fs::remove_file(&named).unwrap();
+        drop(scratch);
         let _ = std::fs::remove_dir_all(&root);
     }
 

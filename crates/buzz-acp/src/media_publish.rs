@@ -16,15 +16,41 @@
 //! the relay refuses audio and ffmpeg is available, and as a generic file
 //! otherwise; the log says which.
 //!
-//! A reply names a path; it does not get to read one. Every path is
-//! canonicalised and accepted only when the file it resolves to sits under
-//! the turn's own directory or the engine workspace ([`OutboundRoots`]), so
-//! a quoted `MEDIA:~/Documents/passport.pdf` echoed by the engine cannot make
-//! the harness publish a host file with its own privileges. Workspace files
-//! are staged into the turn directory at resolution time so the upload that
-//! follows only ever reads harness-owned copies.
+//! # The containment model
+//!
+//! A reply names a path; it does not get to read one. Two directories are
+//! outbound roots: this turn's own directory under the attachment root,
+//! always, and the harness working directory, only when
+//! [`outbound_workspace`] finds it to be a boundary (`HOME` known and neither
+//! `HOME` nor an ancestor of it, outside the attachment root and not
+//! containing it, not the filesystem root, and not on or under a system
+//! directory). Otherwise the turn directory is the only root and the reply
+//! notes say so. A file is eligible when the reply names it absolutely,
+//! without `..`, it canonicalises to a path under a root, and the handle
+//! opened `O_NOFOLLOW` at that path reports a regular file, of the length
+//! recorded a moment earlier, with exactly one link. Three primitives
+//! enforce that and nothing else is trusted to:
+//! [`OutboundRoots::confine`] resolves the name and tests it against the
+//! roots, [`crate::attachments::open_verified`] decides eligibility on the
+//! open handle (`nlink == 1` is what a hard link into a root cannot fake),
+//! and [`crate::attachments::PublishScratch`] holds an open descriptor on a
+//! private directory into which every accepted file is copied through that
+//! handle, so from staging onwards the upload reads only harness-owned
+//! snapshots, `openat`-relative, and resolves no path a second time.
+//!
+//! Both roots are writable by the engine, and an accepted workspace is a
+//! read primitive over its whole tree for anyone who can talk to the agent
+//! (see `docs/remote-agents.md`); that is the trade the workspace rule
+//! exists to bound.
+//!
+//! Every refusal reason that can reach [`failure_notice`] is a *reason*, not
+//! a path: the notice is posted into the channel, and the canonical path a
+//! name resolved to is the host's `HOME`, attachment root or scratch. The
+//! caller prefixes the reply's own basename for the file; the absolute path
+//! goes to `tracing` instead.
 
 use std::path::{Component, Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 use base64::Engine as _;
@@ -146,13 +172,28 @@ impl TurnMediaCapture {
     /// True when the reply named or carried anything that could be a file,
     /// including a `MEDIA:` token that looked like a path but was unusable
     /// (that earns a note rather than silence).
+    ///
+    /// A block of a type [`resolve_outbound_files`] does not handle is not
+    /// one: without this the harness would take a publish slot, create and
+    /// drop a scratch, and post nothing for a reply that never named a file.
+    /// A block that did not fit the capture still counts, because that one
+    /// might have been a file.
     pub fn references_media(&self) -> bool {
-        if !self.blocks.is_empty() || self.dropped_blocks > 0 {
+        if self.dropped_blocks > 0 || self.blocks.iter().any(is_publishable_block) {
             return true;
         }
         let refs = extract_media_refs(&self.text);
         !refs.paths.is_empty() || !refs.notes.is_empty()
     }
+}
+
+/// The content-block types [`resolve_outbound_files`] turns into files.
+/// Anything else is noted and skipped.
+fn is_publishable_block(block: &serde_json::Value) -> bool {
+    matches!(
+        block.get("type").and_then(|t| t.as_str()).unwrap_or(""),
+        "resource_link" | "resource" | "image" | "audio"
+    )
 }
 
 /// `MEDIA:` references found in reply text, plus the ones that looked like a
@@ -192,6 +233,11 @@ pub fn extract_media_refs(text: &str) -> MediaRefs {
         let token: &str = after.split(char::is_whitespace).next().unwrap_or("");
         if preceded_ok {
             match trim_to_media_extension(token) {
+                // The same token twice is one reference, deduplicated here
+                // with no note: nothing was skipped, the reply named one
+                // file. Two *different* names for one file (a path and a
+                // symlink to it) are two references, and the second earns a
+                // note in `resolve_outbound_files`.
                 Some(path) if is_absolute_or_home(path) && !refs.paths.iter().any(|p| p == path) => {
                     refs.paths.push(path.to_string());
                 }
@@ -375,10 +421,16 @@ pub struct OutboundRoots {
 
 impl OutboundRoots {
     /// Reason text for a path that is under no root.
+    ///
+    /// The notes this feeds are posted into the channel, so the refusal
+    /// reason itself never appears here: it names the canonical working
+    /// directory, which is the host's absolute `HOME` in the documented
+    /// deployment. The pool logs the reason; the channel gets the class.
     fn outside_reason(&self) -> String {
         match (&self.workspace, &self.workspace_refused) {
-            (_, Some(refused)) => {
-                format!("outside the turn directory (no workspace root: {refused})")
+            (_, Some(_)) => {
+                "outside the turn directory (the working directory is not a publishable root)"
+                    .into()
             }
             (Some(_), None) => "outside the turn directory and the workspace".into(),
             (None, None) => "outside the turn directory".into(),
@@ -419,18 +471,74 @@ impl OutboundRoots {
     }
 }
 
+/// Directories that belong to the host rather than to whoever started the
+/// harness. A working directory that is one of these, sits under one, or
+/// contains one is not a boundary around this agent's work: it is a boundary
+/// around the machine, and everything readable inside it would become
+/// publishable by anyone who can talk to the agent.
+///
+/// Each entry is canonicalised before it is compared, so the macOS symlink
+/// farm (`/etc` to `/private/etc`, `/var` to `/private/var`) is covered by
+/// the same list as Linux.
+const SYSTEM_PREFIXES: &[&str] = &[
+    "/bin",
+    "/boot",
+    "/dev",
+    "/etc",
+    "/lib",
+    "/lib32",
+    "/lib64",
+    "/libexec",
+    "/media",
+    "/mnt",
+    "/net",
+    "/opt",
+    "/proc",
+    "/root",
+    "/run",
+    "/sbin",
+    "/srv",
+    "/sys",
+    "/usr",
+    "/var",
+    "/Applications",
+    "/Library",
+    "/Network",
+    "/System",
+    "/Volumes",
+];
+
 /// Decide whether the harness working directory may be an outbound root.
 ///
-/// The harness runs wherever it was started, and `docs/remote-agents.md`
-/// documents cwd = `HOME` as the deployment convention, so "the engine's
-/// working directory" is not by itself a boundary: with cwd = `HOME` a reply
-/// naming `~/Documents/passport.pdf` would be publishing a host file again,
-/// and with cwd an ancestor of the attachment root it would be publishing
-/// another channel's inbound blobs out of a sibling turn directory. A
-/// working directory that is the filesystem root, `HOME`, an ancestor of
-/// `HOME`, or an ancestor of the attachment root is therefore refused: only
-/// the turn directory stays as a root, and the refusal is named in the reply
-/// notes and logged.
+/// The harness runs wherever it was started, so "the engine's working
+/// directory" is not by itself a boundary, and this is a positive test that
+/// it is one rather than a list of the two shapes that burned us. A
+/// directory passes only when all of these hold:
+///
+/// - it is absolute and resolves;
+/// - it is not the filesystem root;
+/// - `HOME` is known, and the directory is neither `HOME` nor an ancestor of
+///   it (`docs/remote-agents.md` documents cwd = `HOME` as the deployment
+///   convention, and a reply naming `~/Documents/passport.pdf` under that cwd
+///   would publish a host file);
+/// - it neither contains the attachment root nor sits inside it (either way a
+///   reply could name another channel's inbound blobs out of a sibling turn
+///   directory);
+/// - it is not, does not contain, and does not sit under a system directory
+///   ([`SYSTEM_PREFIXES`]), so a harness started from `/etc`, `/var/lib/app`
+///   or a mount point does not turn the host's configuration into channel
+///   content. The per-process temp directory is exempt: on macOS it lives
+///   under `/var`, and a scratch directory there is per-user, not the host's.
+///
+/// `home` being unknown is a refusal, not a skipped check: the check that
+/// matters most in the documented deployment is the `HOME` one, and a
+/// containment input that cannot be resolved is an error (rule 4). A
+/// launchd job, a systemd unit without `User=`, and `docker run` without
+/// `-e HOME` all reach this.
+///
+/// Every refusal is returned with its reason, which the pool logs. The reply
+/// notes carry a constant instead: the reason names host paths, and the
+/// notes are posted into a channel.
 pub fn outbound_workspace(
     cwd: &Path,
     home: Option<&Path>,
@@ -444,25 +552,49 @@ pub fn outbound_workspace(
     if canonical.parent().is_none() {
         return Err("the filesystem root is not an outbound root".into());
     }
-    if let Some(home) = home.map(|h| std::fs::canonicalize(h).unwrap_or_else(|_| h.to_path_buf())) {
-        if home.starts_with(&canonical) {
-            return Err(format!(
-                "{} is HOME or contains it; a reply must not be able to name a file anywhere under HOME",
-                canonical.display()
-            ));
-        }
+    if let Some(system) = system_directory_at(&canonical) {
+        return Err(format!(
+            "{} is, contains, or sits under the system directory {}; a reply must not be able to name a file the host owns",
+            canonical.display(),
+            system.display()
+        ));
+    }
+    let Some(home) = home.map(|h| std::fs::canonicalize(h).unwrap_or_else(|_| h.to_path_buf()))
+    else {
+        return Err(
+            "HOME is not set, so the working directory cannot be judged as a boundary".into(),
+        );
+    };
+    if home.starts_with(&canonical) {
+        return Err(format!(
+            "{} is HOME or contains it; a reply must not be able to name a file anywhere under HOME",
+            canonical.display()
+        ));
     }
     if let Some(root) = attachment_root
         .map(|r| std::fs::canonicalize(r).unwrap_or_else(|_| r.to_path_buf()))
-        .filter(|root| root.starts_with(&canonical))
+        .filter(|root| root.starts_with(&canonical) || canonical.starts_with(root))
     {
         return Err(format!(
-            "{} contains the attachment root {}; a reply must not be able to name another turn's blobs",
+            "{} contains the attachment root {} or sits inside it; a reply must not be able to name another turn's blobs",
             canonical.display(),
             root.display()
         ));
     }
     Ok(canonical)
+}
+
+/// The system directory `canonical` is, contains, or sits under, if any.
+fn system_directory_at(canonical: &Path) -> Option<PathBuf> {
+    let temp = std::fs::canonicalize(std::env::temp_dir()).unwrap_or_else(|_| std::env::temp_dir());
+    if canonical.starts_with(&temp) {
+        return None;
+    }
+    SYSTEM_PREFIXES
+        .iter()
+        .map(Path::new)
+        .map(|p| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf()))
+        .find(|prefix| canonical.starts_with(prefix) || prefix.starts_with(canonical))
 }
 
 /// Copy a file the reply named into the publish scratch so the upload reads
@@ -473,13 +605,18 @@ pub fn outbound_workspace(
 /// included: the turn directory is engine-writable too, so re-opening any
 /// resolved path by name during a publish that can run for minutes hands the
 /// engine a swap window. The source is opened once, without following a
-/// symlink at its last component, checked through that open handle, and the
-/// bytes are read from the handle rather than from the path. The destination
-/// is created with `O_CREAT | O_EXCL | O_NOFOLLOW` at a random name in a
-/// directory only this publish knows, so nothing can be waiting there.
+/// symlink at its last component, checked for eligibility through that open
+/// handle (regular file, unchanged length, one link), and the bytes are read
+/// from the handle rather than from the path. The destination is created
+/// relative to the scratch's own directory descriptor.
 ///
-/// A directory component swapped between `canonicalize` and the open is
-/// still not caught; that needs `openat2`-style resolution and is Linux-only.
+/// A directory component of the *source* swapped between `canonicalize` and
+/// the open is still not caught; that needs `openat2`-style resolution and
+/// is Linux-only.
+///
+/// Every error returned is a reason with no path in it: the caller prefixes
+/// the reply's own name for the file and the result is posted into the
+/// channel, so the canonical host path stays in the log.
 fn stage_file(
     scratch: &crate::attachments::PublishScratch,
     source: &Path,
@@ -491,7 +628,7 @@ fn stage_file(
         .unwrap_or("bin")
         .to_string();
     let (mut file, _) = crate::attachments::open_verified(source, Some(meta_len))
-        .map_err(|e| format!("cannot open {}: {e}", source.display()))?;
+        .map_err(|e| format!("cannot be opened: {e}"))?;
     let (mut out, staged) = scratch
         .create_file(&ext)
         .map_err(|e| format!("cannot create a staging file: {e}"))?;
@@ -499,12 +636,11 @@ fn stage_file(
         &mut std::io::Read::take(&mut file, MAX_OUTBOUND_FILE_BYTES + 1),
         &mut out,
     )
-    .map_err(|e| format!("cannot stage {}: {e}", source.display()))?;
+    .map_err(|e| format!("cannot be staged: {e}"))?;
     if copied != meta_len || copied > MAX_OUTBOUND_FILE_BYTES {
-        let _ = std::fs::remove_file(&staged);
+        let _ = scratch.remove_file(&staged);
         return Err(format!(
-            "{} changed while it was being staged ({meta_len} bytes became {copied})",
-            source.display()
+            "it changed while it was being staged ({meta_len} bytes became {copied})"
         ));
     }
     Ok((staged, copied))
@@ -574,6 +710,8 @@ pub fn resolve_outbound_files(
             }
         };
         if staged.contains(&canonical) {
+            out.notes
+                .push(format!("{shown} skipped: already attached in this reply"));
             return;
         }
         let meta = match std::fs::symlink_metadata(&canonical) {
@@ -633,7 +771,7 @@ pub fn resolve_outbound_files(
         );
         match write_inline(scratch, data, mime.as_deref()) {
             Ok((path, 0)) => {
-                let _ = std::fs::remove_file(&path);
+                let _ = scratch.remove_file(&path);
                 out.notes.push(format!("{label} skipped: no bytes"));
             }
             Ok((path, len)) => push_file(out, path, len, &shown, filename, mime, origin),
@@ -725,7 +863,10 @@ pub fn resolve_outbound_files(
                         .push(format!("{kind} block skipped: no inline data")),
                 }
             }
-            _ => {}
+            other => out.notes.push(format!(
+                "{} content block skipped: not a file the harness can publish",
+                if other.is_empty() { "untyped" } else { other }
+            )),
         }
     }
     if capture.dropped_blocks() > 0 {
@@ -781,7 +922,7 @@ fn write_inline(
         .create_file(ext)
         .map_err(|e| format!("cannot create an inline file: {e}"))?;
     std::io::Write::write_all(&mut file, &bytes)
-        .map_err(|e| format!("cannot write {}: {e}", path.display()))?;
+        .map_err(|e| format!("cannot be written to the staging directory: {e}"))?;
     Ok((path, bytes.len() as u64))
 }
 
@@ -1012,7 +1153,7 @@ impl MediaPublisher<'_> {
         &self,
         target: &ReplyTarget,
         resolution: OutboundResolution,
-        scratch: &crate::attachments::PublishScratch,
+        scratch: &Arc<crate::attachments::PublishScratch>,
         deadline: tokio::time::Instant,
     ) -> Option<PublishReport> {
         if resolution.is_empty() {
@@ -1057,7 +1198,7 @@ impl MediaPublisher<'_> {
                     // The relay may already have stored the blob; nothing
                     // will reference it, so name it by hash in the log
                     // rather than leaving an orphan nobody can find.
-                    let sha = read_bounded(&file.path, Some(file.len))
+                    let sha = read_bounded(scratch, &file.path, Some(file.len))
                         .await
                         .map(|bytes| blossom::sha256_hex(&bytes))
                         .unwrap_or_else(|_| "unknown".into());
@@ -1125,11 +1266,11 @@ impl MediaPublisher<'_> {
         origin: &RelayOrigin,
         file: &OutboundFile,
         relay_supports_audio: bool,
-        scratch: &crate::attachments::PublishScratch,
+        scratch: &Arc<crate::attachments::PublishScratch>,
     ) -> Result<PublishedMedia, String> {
         let kind = media_kind(&file.mime);
         if kind != MediaKind::Audio {
-            let bytes = read_bounded(&file.path, Some(file.len)).await?;
+            let bytes = read_bounded(scratch, &file.path, Some(file.len)).await?;
             let descriptor = blossom::upload_blob(self.rest, origin, bytes, &file.mime)
                 .await
                 .map_err(|e| e.to_string())?;
@@ -1148,7 +1289,7 @@ impl MediaPublisher<'_> {
             let attempt = match delivery {
                 AudioDelivery::NativeAudio => self.try_native_audio(origin, file, scratch).await,
                 AudioDelivery::Mp4Envelope => self.try_envelope(origin, file, scratch).await,
-                AudioDelivery::GenericFile => self.try_generic(origin, file).await,
+                AudioDelivery::GenericFile => self.try_generic(origin, file, scratch).await,
             };
             match attempt {
                 Ok(item) => {
@@ -1180,7 +1321,7 @@ impl MediaPublisher<'_> {
         &self,
         origin: &RelayOrigin,
         file: &OutboundFile,
-        scratch: &crate::attachments::PublishScratch,
+        scratch: &Arc<crate::attachments::PublishScratch>,
     ) -> Result<PublishedMedia, AudioAttemptError> {
         let stamp = now_ms();
         // Candidates are produced lazily: the stream copy first, and the
@@ -1233,6 +1374,13 @@ impl MediaPublisher<'_> {
                     let Some(ffmpeg) = self.ffmpeg else {
                         continue;
                     };
+                    // ffmpeg opens a path of its own, so this is the one
+                    // place the scratch path is resolved by something other
+                    // than the descriptor. Refuse if the path no longer
+                    // names the directory this publish created.
+                    if let Err(e) = scratch.still_at_its_path() {
+                        return Err(AudioAttemptError::Terminal(e.to_string()));
+                    }
                     match crate::ffmpeg::convert_to_clean_mp3(ffmpeg, &file.path, &out, reencode)
                         .await
                     {
@@ -1249,7 +1397,7 @@ impl MediaPublisher<'_> {
                     }
                 }
             };
-            let bytes = read_bounded(&path, expected)
+            let bytes = read_bounded(scratch, &path, expected)
                 .await
                 .map_err(AudioAttemptError::FallThrough)?;
             match blossom::upload_blob(self.rest, origin, bytes, mime).await {
@@ -1283,7 +1431,7 @@ impl MediaPublisher<'_> {
         &self,
         origin: &RelayOrigin,
         file: &OutboundFile,
-        scratch: &crate::attachments::PublishScratch,
+        scratch: &Arc<crate::attachments::PublishScratch>,
     ) -> Result<PublishedMedia, AudioAttemptError> {
         let Some(ffmpeg) = self.ffmpeg else {
             return Err(AudioAttemptError::FallThrough(
@@ -1292,10 +1440,16 @@ impl MediaPublisher<'_> {
         };
         let stamp = now_ms();
         let out = scratch.reserve("mp4");
+        // As in `try_native_audio`: ffmpeg resolves this path itself, so the
+        // path is checked against the descriptor first and the output is
+        // read back through the descriptor afterwards.
+        scratch
+            .still_at_its_path()
+            .map_err(|e| AudioAttemptError::Terminal(e.to_string()))?;
         crate::ffmpeg::wrap_as_voice_note_mp4(ffmpeg, &file.path, &out)
             .await
             .map_err(AudioAttemptError::FallThrough)?;
-        let bytes = read_bounded(&out, None)
+        let bytes = read_bounded(scratch, &out, None)
             .await
             .map_err(AudioAttemptError::FallThrough)?;
         match blossom::upload_blob(self.rest, origin, bytes, "video/mp4").await {
@@ -1314,8 +1468,9 @@ impl MediaPublisher<'_> {
         &self,
         origin: &RelayOrigin,
         file: &OutboundFile,
+        scratch: &Arc<crate::attachments::PublishScratch>,
     ) -> Result<PublishedMedia, AudioAttemptError> {
-        let bytes = read_bounded(&file.path, Some(file.len))
+        let bytes = read_bounded(scratch, &file.path, Some(file.len))
             .await
             .map_err(AudioAttemptError::Terminal)?;
         match blossom::upload_blob(self.rest, origin, bytes, "application/octet-stream").await {
@@ -1388,20 +1543,35 @@ enum NativeCandidate {
 /// the publish task outlives the turn, the engine's next turn runs beside it,
 /// and a path resolved minutes earlier is not a promise about what the name
 /// points at now.
-async fn read_bounded(path: &Path, expected_len: Option<u64>) -> Result<Vec<u8>, String> {
+async fn read_bounded(
+    scratch: &Arc<crate::attachments::PublishScratch>,
+    path: &Path,
+    expected_len: Option<u64>,
+) -> Result<Vec<u8>, String> {
     let owned = path.to_path_buf();
-    tokio::task::spawn_blocking(move || read_bounded_blocking(&owned, expected_len))
+    let scratch = Arc::clone(scratch);
+    tokio::task::spawn_blocking(move || read_bounded_blocking(&scratch, &owned, expected_len))
         .await
-        .map_err(|e| format!("reading {} failed: {e}", path.display()))?
+        .map_err(|e| format!("reading it failed: {e}"))?
 }
 
-fn read_bounded_blocking(path: &Path, expected_len: Option<u64>) -> Result<Vec<u8>, String> {
-    let (file, len) = crate::attachments::open_verified(path, expected_len)
-        .map_err(|e| format!("cannot open {}: {e}", path.display()))?;
+/// Every string returned from here is a *reason*, never a path: it is
+/// prefixed with the reply's own name for the file by the two callers and
+/// ends up in [`failure_notice`], which is posted into the channel. The
+/// absolute path is on the `tracing` line beside each call instead. This is
+/// the same rule [`OutboundRoots::outside_reason`] follows, applied to the
+/// upload half.
+fn read_bounded_blocking(
+    scratch: &crate::attachments::PublishScratch,
+    path: &Path,
+    expected_len: Option<u64>,
+) -> Result<Vec<u8>, String> {
+    let (file, len) = scratch
+        .open_file(path, expected_len)
+        .map_err(|e| format!("cannot be opened: {e}"))?;
     if len > MAX_OUTBOUND_FILE_BYTES {
         return Err(format!(
-            "{} is {len} bytes, over the {MAX_OUTBOUND_FILE_BYTES} byte limit",
-            path.display()
+            "it is {len} bytes, over the {MAX_OUTBOUND_FILE_BYTES} byte limit"
         ));
     }
     let mut bytes = Vec::with_capacity(len as usize);
@@ -1409,11 +1579,10 @@ fn read_bounded_blocking(path: &Path, expected_len: Option<u64>) -> Result<Vec<u
         &mut std::io::Read::take(file, MAX_OUTBOUND_FILE_BYTES + 1),
         &mut bytes,
     )
-    .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+    .map_err(|e| format!("cannot be read: {e}"))?;
     if bytes.len() as u64 != len {
         return Err(format!(
-            "{} changed while it was being read ({len} bytes became {})",
-            path.display(),
+            "it changed while it was being read ({len} bytes became {})",
             bytes.len()
         ));
     }
@@ -1441,9 +1610,10 @@ mod tests {
         }
     }
 
-    /// The harness-private publish directory, as the pool creates it.
-    fn scratch_under(root: &Path) -> crate::attachments::PublishScratch {
-        crate::attachments::PublishScratch::create(root).unwrap()
+    /// The harness-private publish directory, as the pool creates it
+    /// (shared, because the upload phase reads every file back through it).
+    fn scratch_under(root: &Path) -> Arc<crate::attachments::PublishScratch> {
+        Arc::new(crate::attachments::PublishScratch::create(root).unwrap())
     }
 
     fn far_deadline() -> tokio::time::Instant {
@@ -1760,6 +1930,13 @@ mod tests {
                 .unwrap_or_else(|| panic!("no note for {needle}: {:?}", resolved.notes))
                 .clone()
         };
+        // N2: the second reference to an already-staged file is skipped with
+        // a reason, like every other reference that produces no upload.
+        assert!(
+            refused("in-link.pdf skipped").contains("already attached in this reply"),
+            "{:?}",
+            resolved.notes
+        );
         assert!(refused("passport.pdf refused").contains("outside the turn directory"));
         assert!(refused("out-link.pdf refused").contains("symlink resolves outside"));
         assert!(refused("passport.pdf refused: path traversal").contains(".."));
@@ -1880,8 +2057,12 @@ mod tests {
         // the publish task is still running.
         std::fs::remove_file(&owned).unwrap();
         std::os::unix::fs::symlink(&secret, &owned).unwrap();
-        let bytes = read_bounded_blocking(&resolved.files[0].path, Some(resolved.files[0].len))
-            .expect("the staged snapshot still reads");
+        let bytes = read_bounded_blocking(
+            &scratch,
+            &resolved.files[0].path,
+            Some(resolved.files[0].len),
+        )
+        .expect("the staged snapshot still reads");
         assert_eq!(
             bytes, b"voice",
             "the upload reads the snapshot, not the swap"
@@ -1891,9 +2072,131 @@ mod tests {
         let staged = resolved.files[0].path.clone();
         std::fs::remove_file(&staged).unwrap();
         std::os::unix::fs::symlink(&secret, &staged).unwrap();
-        let err = read_bounded_blocking(&staged, Some(resolved.files[0].len))
+        let err = read_bounded_blocking(&scratch, &staged, Some(resolved.files[0].len))
             .expect_err("a symlink at the staged path is not followed");
-        assert!(err.contains("cannot open"), "{err}");
+        assert!(err.contains("cannot be opened"), "{err}");
+        // N1, upload half: the reason is prefixed with the reply's own name
+        // for the file and posted into the channel, so it carries no path.
+        assert!(!err.contains(&base.display().to_string()), "{err}");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// B1a from the third confirmation pass, and the original blocker
+    /// restored through a different door: containment is decided with
+    /// `canonicalize`, which resolves symlinks and has nothing to resolve
+    /// for a hard link, so a second name for `~/Documents/passport.pdf`
+    /// inside an outbound root *is* its own canonical path and every
+    /// path-shaped guard agrees it belongs there. The turn directory is a
+    /// root unconditionally and is engine-writable, so this works in every
+    /// deployment, with the workspace correctly refused.
+    ///
+    /// `nlink == 1`, read from the handle the bytes would be read from, is
+    /// the only thing that catches it. Removing that check from
+    /// `open_verified` publishes the file and fails this test.
+    #[test]
+    fn a_hard_link_into_a_root_publishes_nothing() {
+        let base = temp_root();
+        let home = base.join("home");
+        let turn_dir = base.join("run/attachments/turn-1");
+        for d in [&home, &turn_dir] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        let secret = home.join("passport.pdf");
+        std::fs::write(&secret, b"%PDF passport").unwrap();
+        // The engine, running under the harness's uid in the directory it
+        // was handed, gives the host file a second name inside the root.
+        let planted = turn_dir.join("note.pdf");
+        std::fs::hard_link(&secret, &planted).unwrap();
+        // A file that is only in the root is unaffected.
+        let own = turn_dir.join("1-voice-note.mp3");
+        std::fs::write(&own, b"mp3").unwrap();
+
+        let refusal = outbound_workspace(&home, Some(&home), Some(&base.join("run/attachments")))
+            .expect_err("cwd = HOME, so the turn directory is the only root");
+        let roots = OutboundRoots {
+            turn_dir: turn_dir.clone(),
+            workspace: None,
+            workspace_refused: Some(refusal),
+            home: Some(home.clone()),
+        };
+        let mut capture = TurnMediaCapture::default();
+        capture.record_chunk(&serde_json::json!({
+            "type": "text",
+            "text": format!("MEDIA:{}\nMEDIA:{}", planted.display(), own.display()),
+        }));
+        let scratch = scratch_under(&base);
+        let resolved = resolve_outbound_files(&capture, &roots, &scratch);
+
+        let names: Vec<&str> = resolved.files.iter().map(|f| f.filename.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["1-voice-note.mp3"],
+            "the hard link is not published: {resolved:?}"
+        );
+        assert!(
+            resolved
+                .notes
+                .iter()
+                .any(|n| n.contains("note.pdf skipped") && n.contains("more than one name")),
+            "and the refusal says why: {:?}",
+            resolved.notes
+        );
+        // N1 again, on the guard this round adds: the note goes into the
+        // channel, so it names the reply's own basename for the file and
+        // never the host path the reply resolved to.
+        assert!(
+            !resolved
+                .notes
+                .iter()
+                .any(|n| n.contains(&base.display().to_string())),
+            "no host path reaches the channel: {:?}",
+            resolved.notes
+        );
+        assert!(
+            !resolved
+                .files
+                .iter()
+                .any(|f| std::fs::read(&f.path).unwrap_or_default() == b"%PDF passport"),
+            "no staged copy holds the host file"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// N3 from the third confirmation pass: a reply carrying only a block
+    /// type this module does not turn into a file used to take a publish
+    /// slot, create and drop a scratch, and post nothing at all. It is not
+    /// a media reference, and when it rides along with one it earns a note
+    /// rather than silence.
+    #[test]
+    fn an_unhandled_block_type_is_not_a_media_reference() {
+        let mut alone = TurnMediaCapture::default();
+        alone.record_chunk(&serde_json::json!({"type": "diff", "path": "/tmp/x.rs"}));
+        assert!(
+            !alone.references_media(),
+            "a diff block does not start a publish"
+        );
+
+        let base = temp_root();
+        let turn_dir = base.join("turn");
+        std::fs::create_dir_all(&turn_dir).unwrap();
+        let own = turn_dir.join("clip.mp3");
+        std::fs::write(&own, b"mp3").unwrap();
+        let mut along = TurnMediaCapture::default();
+        along.record_chunk(
+            &serde_json::json!({"type": "text", "text": format!("MEDIA:{}", own.display())}),
+        );
+        along.record_chunk(&serde_json::json!({"type": "diff", "path": "/tmp/x.rs"}));
+        assert!(along.references_media());
+        let resolved = resolve_outbound_files(&along, &roots(&turn_dir), &scratch_under(&base));
+        assert_eq!(resolved.files.len(), 1, "{resolved:?}");
+        assert!(
+            resolved
+                .notes
+                .iter()
+                .any(|n| n.contains("diff content block skipped")),
+            "{:?}",
+            resolved.notes
+        );
         let _ = std::fs::remove_dir_all(&base);
     }
 
@@ -1908,7 +2211,8 @@ mod tests {
         std::os::unix::fs::symlink(&secret, &link).unwrap();
         let scratch = scratch_under(&base);
         let err = stage_file(&scratch, &link, 10).expect_err("a symlink source is not staged");
-        assert!(err.contains("cannot open"), "{err}");
+        assert!(err.contains("cannot be opened"), "{err}");
+        assert!(!err.contains(&base.display().to_string()), "{err}");
         assert!(
             std::fs::read_dir(scratch.dir()).unwrap().next().is_none(),
             "nothing was staged"
@@ -1926,7 +2230,8 @@ mod tests {
         let home = base.join("home");
         let attachments = base.join("state").join("attachments");
         let project = base.join("home").join("project");
-        for d in [&home, &attachments, &project] {
+        let inside_attachments = attachments.join("turn-a");
+        for d in [&home, &attachments, &project, &inside_attachments] {
             std::fs::create_dir_all(d).unwrap();
         }
         let refused = |cwd: &Path| {
@@ -1939,9 +2244,12 @@ mod tests {
             refused(Path::new("/")).contains("HOME") || refused(Path::new("/")).contains("root")
         );
         assert!(
-            outbound_workspace(&base.join("state"), None, Some(&attachments))
-                .unwrap_err()
-                .contains("contains the attachment root")
+            refused(&base.join("state")).contains("attachment root"),
+            "a workspace containing the attachment root"
+        );
+        assert!(
+            refused(&inside_attachments).contains("attachment root"),
+            "and a workspace inside the attachment root, which reaches sibling turns"
         );
         // A real project directory under HOME is still a usable root.
         assert_eq!(
@@ -1951,22 +2259,85 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
+    /// B2a from the third confirmation pass: with `HOME` absent from the
+    /// environment the HOME arm used to be skipped silently, so a workspace
+    /// that *was* HOME passed and the home file published. An input the
+    /// boundary cannot be judged without is a refusal (rule 4), not a
+    /// skipped check.
+    #[test]
+    fn a_workspace_is_refused_when_home_is_unknown() {
+        let base = temp_root();
+        let project = base.join("project");
+        let attachments = base.join("attachments");
+        for d in [&project, &attachments] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        let refusal = outbound_workspace(&project, None, Some(&attachments))
+            .expect_err("an unjudgeable workspace is not a root");
+        assert!(refusal.contains("HOME is not set"), "{refusal}");
+        // The same directory with HOME known is a usable root, so it is the
+        // missing input that refuses it and nothing else.
+        assert!(outbound_workspace(&project, Some(&base.join("home")), Some(&attachments)).is_ok());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// S1 from the third confirmation pass: the rule was a denylist of two
+    /// shapes, so a system-directory working directory was accepted and
+    /// `MEDIA:/etc/shadow.txt` published. These are real host paths, taken
+    /// through the production function; on macOS they canonicalise through
+    /// `/private`, which is why the prefixes are canonicalised too.
+    #[test]
+    fn a_system_directory_is_never_a_workspace() {
+        let base = temp_root();
+        let home = base.join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        for dir in ["/etc", "/usr", "/var"] {
+            let path = Path::new(dir);
+            assert!(path.is_dir(), "{dir} exists on both targets");
+            let refusal = match outbound_workspace(path, Some(&home), None) {
+                Err(refusal) => refusal,
+                Ok(accepted) => panic!("{dir} was accepted as {}", accepted.display()),
+            };
+            assert!(
+                refusal.contains("system directory"),
+                "{dir} is refused as a system directory, not incidentally: {refusal}"
+            );
+        }
+        // The per-process temp directory sits under `/var` on macOS and is
+        // not the host's; a workspace there is still usable.
+        let project = base.join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        assert!(outbound_workspace(&project, Some(&home), None).is_ok());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
     /// The original review's scenario, end to end on the fixed code: the
     /// harness is started from HOME (the remote-agent convention), a member
     /// asks the agent to quote `MEDIA:~/Documents/passport.pdf` back, and the
     /// engine obliges. HOME is refused as a root, the `~/` expansion lands
     /// outside the only remaining one, and nothing is published.
+    ///
+    /// S3 from the third confirmation pass: the attachment root is
+    /// deliberately *outside* HOME here, the way `default_attachment_base`
+    /// puts it (`XDG_RUNTIME_DIR` or the temp dir). With the root under HOME
+    /// the attachment-root rule refused this case and the test passed with
+    /// the HOME rule deleted, so it did not pin the scenario it is named for.
     #[test]
     fn a_quoted_home_path_publishes_nothing_when_the_harness_runs_from_home() {
-        let home = temp_root();
+        let base = temp_root();
+        let home = base.join("home");
         std::fs::create_dir_all(home.join("Documents")).unwrap();
         std::fs::write(home.join("Documents/passport.pdf"), b"%PDF passport").unwrap();
-        let attachment_root = home.join(".cache/buzz-acp/attachments");
+        let attachment_root = base.join("run/buzz-acp/attachments");
         let turn_dir = attachment_root.join("turn-1");
         std::fs::create_dir_all(&turn_dir).unwrap();
 
         let refusal = outbound_workspace(&home, Some(&home), Some(&attachment_root))
             .expect_err("cwd = HOME is not an outbound root");
+        assert!(
+            refusal.contains("HOME"),
+            "the HOME rule is what refuses it, not the attachment-root rule: {refusal}"
+        );
         let roots = OutboundRoots {
             turn_dir,
             workspace: None,
@@ -1978,18 +2349,25 @@ mod tests {
             "type": "text",
             "text": "Sure, you wrote: `MEDIA:~/Documents/passport.pdf`"
         }));
-        let scratch = scratch_under(&home);
+        let scratch = scratch_under(&base);
         let resolved = resolve_outbound_files(&capture, &roots, &scratch);
         assert!(resolved.files.is_empty(), "{resolved:?}");
+        let note = resolved
+            .notes
+            .iter()
+            .find(|n| n.contains("passport.pdf refused"))
+            .unwrap_or_else(|| panic!("{:?}", resolved.notes));
         assert!(
-            resolved
-                .notes
-                .iter()
-                .any(|n| n.contains("passport.pdf refused") && n.contains("no workspace root")),
-            "{:?}",
-            resolved.notes
+            note.contains("the working directory is not a publishable root"),
+            "{note}"
         );
-        let _ = std::fs::remove_dir_all(&home);
+        // N1: the note is posted into the channel, so it carries the class of
+        // refusal and never the host path the refusal reason names.
+        assert!(
+            !note.contains(&home.display().to_string()),
+            "the host's HOME path does not reach the channel: {note}"
+        );
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     /// S1: a workspace that contains the attachment root would publish other
@@ -2007,8 +2385,12 @@ mod tests {
         let other_blob = other_turn.join("1-voice-note.mp3");
         std::fs::write(&other_blob, b"another channel").unwrap();
 
-        let refusal = outbound_workspace(&base, None, Some(&attachments))
+        // HOME is elsewhere, so the attachment-root rule is the only one
+        // that can refuse this workspace.
+        let home = temp_root();
+        let refusal = outbound_workspace(&base, Some(&home), Some(&attachments))
             .expect_err("a workspace containing the attachment root is refused");
+        assert!(refusal.contains("attachment root"), "{refusal}");
         let roots = OutboundRoots {
             turn_dir: this_turn.clone(),
             workspace: None,
@@ -2027,11 +2409,12 @@ mod tests {
                 .notes
                 .iter()
                 .any(|n| n.contains("1-voice-note.mp3 refused")
-                    && n.contains("contains the attachment root")),
-            "the note names why: {:?}",
+                    && n.contains("the working directory is not a publishable root")),
+            "the note names the class of refusal: {:?}",
             resolved.notes
         );
         let _ = std::fs::remove_dir_all(&base);
+        let _ = std::fs::remove_dir_all(&home);
     }
 
     #[test]

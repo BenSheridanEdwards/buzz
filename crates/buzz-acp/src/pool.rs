@@ -2351,9 +2351,10 @@ async fn publish_reply_media_now(
         Err(reason) => return failed(format!("attachment storage unavailable: {reason}")),
     };
     // The scratch every staged copy, decoded inline block, and ffmpeg output
-    // goes into: created fresh for this publish, at a name nothing else
-    // knows, outside both the engine's working directory and the turn
-    // directory it was handed.
+    // goes into. It is outside both outbound roots, but it is not hidden
+    // from the engine (same uid, a constant `.outbound` beside the turn
+    // directories), so what protects it is that `PublishScratch` holds it
+    // open and works `openat`-relative to that descriptor from here on.
     let scratch = match ctx
         .attachment_dir
         .as_deref()
@@ -7971,7 +7972,14 @@ done"#
             .unwrap();
         let text = notice["content"].as_str().unwrap().to_string();
         assert!(text.contains("reply.txt refused"), "{text}");
-        assert!(text.contains("no workspace root"), "{text}");
+        assert!(
+            text.contains("the working directory is not a publishable root"),
+            "{text}"
+        );
+        assert!(
+            !text.contains(&scratch.display().to_string()),
+            "the notice names the class of refusal, not the host path: {text}"
+        );
         assert!(
             !requests.iter().any(|r| r.body == b"under the harness cwd"),
             "the file under the harness cwd never reached the wire"
