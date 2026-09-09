@@ -275,7 +275,15 @@ class DeviceVoiceNoteRecorder implements VoiceNoteRecorder {
     await _amplitudeSubscription?.cancel();
     // A stalled native stop would otherwise leave the composer finishing
     // forever; the timeout surfaces as a failure and disposal still cancels.
-    final recordedPath = await _recorder.stop().timeout(_stopTimeout) ?? _path;
+    // The stalled stop can still land later and write the file, so the
+    // abandoned path is deleted rather than left in the temp directory.
+    final String? recordedPath;
+    try {
+      recordedPath = await _recorder.stop().timeout(_stopTimeout) ?? _path;
+    } catch (_) {
+      await _deleteAbandonedFile();
+      rethrow;
+    }
     _nativeEnded = true;
     if (recordedPath == null || recordedPath.isEmpty) {
       throw StateError('Buzz could not finish the voice note.');
@@ -294,6 +302,20 @@ class DeviceVoiceNoteRecorder implements VoiceNoteRecorder {
       duration: duration,
       waveform: List.unmodifiable(_samples),
     );
+  }
+
+  /// Removes the capture file the composer will never be handed, for the
+  /// paths where the native recorder never confirmed the end of the take
+  /// (a timed-out stop that finishes writing on its own afterwards).
+  Future<void> _deleteAbandonedFile() async {
+    final path = _path;
+    if (path == null) return;
+    try {
+      final file = File(path);
+      if (await file.exists()) await file.delete();
+    } catch (_) {
+      // Best-effort cleanup must not mask the failure being reported.
+    }
   }
 
   @override
@@ -328,6 +350,9 @@ class DeviceVoiceNoteRecorder implements VoiceNoteRecorder {
     if (_disposed) return;
     _disposed = true;
     _lifecycleGeneration += 1;
+    // A take that ended without the native recorder confirming it (a stop
+    // that timed out) leaves a file nobody owns.
+    final abandonedCapture = _finished && !_nativeEnded;
     final terminalOperation =
         _terminalOperation ?? (!_finished ? cancel() : null);
     if (terminalOperation != null) {
@@ -347,6 +372,7 @@ class DeviceVoiceNoteRecorder implements VoiceNoteRecorder {
       await _recorder.cancel();
       _nativeEnded = true;
     }
+    if (abandonedCapture) await _deleteAbandonedFile();
     await _recorder.dispose();
     await _levels.close();
   }

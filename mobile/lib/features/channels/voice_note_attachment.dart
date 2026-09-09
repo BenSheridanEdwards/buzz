@@ -207,6 +207,7 @@ class VoiceNoteAttachment extends HookConsumerWidget {
                 state: state,
                 isRemote: isRemote,
                 player: player,
+                announcedDuration: isReview ? resolvedDuration : null,
               ),
               const SizedBox(width: Grid.xxs),
               Expanded(

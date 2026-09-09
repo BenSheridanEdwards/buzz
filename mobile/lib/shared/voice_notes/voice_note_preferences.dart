@@ -83,15 +83,26 @@ final voiceNoteTranscriptChoicesProvider =
       VoiceNoteTranscriptChoicesNotifier.new,
     );
 
+/// Most playback rates kept for this session; the oldest fall off so a long
+/// scroll through a channel of voice notes cannot grow the map without end.
+const voiceNotePlaybackRatesLimit = 200;
+
 /// Playback rate chosen on each voice-note card, keyed by its source, so
 /// scrolling a card off screen and back does not reset the speed pill.
 class VoiceNotePlaybackRatesNotifier extends Notifier<Map<String, double>> {
   @override
   Map<String, double> build() => const {};
 
-  /// Remembers [rate] for the card playing [source].
+  /// Remembers [rate] for the card playing [source], dropping the oldest
+  /// entries past [voiceNotePlaybackRatesLimit] (rule 4).
   void set(String source, double rate) {
-    state = {...state, source: rate};
+    final next = {...state}
+      ..remove(source)
+      ..[source] = rate;
+    while (next.length > voiceNotePlaybackRatesLimit) {
+      next.remove(next.keys.first);
+    }
+    state = next;
   }
 }
 

@@ -6,11 +6,17 @@ class _VoiceNotePlaybackButton extends StatelessWidget {
     required this.state,
     required this.isRemote,
     required this.player,
+    this.announcedDuration,
   });
 
   final VoiceNotePlaybackState state;
   final bool isRemote;
   final VoiceNotePlayerController player;
+
+  /// Length to append to this button's label. The review row hides its time
+  /// text from the screen reader (it is a tap target for playback), so the
+  /// button is where the take's length gets announced (rule 7).
+  final Duration? announcedDuration;
 
   @override
   Widget build(BuildContext context) {
@@ -23,7 +29,7 @@ class _VoiceNotePlaybackButton extends StatelessWidget {
             unawaited(HapticFeedback.selectionClick());
             unawaited(player.toggle());
           };
-    final playbackControlLabel = state.isLoading
+    final controlLabel = state.isLoading
         ? state.isPlaying
               ? 'Pause voice note'
               : canCancelLoading
@@ -34,6 +40,9 @@ class _VoiceNotePlaybackButton extends StatelessWidget {
         : state.isPlaying
         ? 'Pause voice note'
         : 'Play voice note';
+    final playbackControlLabel = announcedDuration == null
+        ? controlLabel
+        : '$controlLabel, ${formatVoiceNoteDuration(announcedDuration!)}';
     return SizedBox.square(
       dimension: 44,
       child: Semantics(
@@ -45,7 +54,7 @@ class _VoiceNotePlaybackButton extends StatelessWidget {
         child: ExcludeSemantics(
           child: IconButton.filledTonal(
             key: const ValueKey('voice-note-play-pause'),
-            tooltip: playbackControlLabel,
+            tooltip: controlLabel,
             onPressed: onPlaybackPressed,
             style: IconButton.styleFrom(
               minimumSize: const Size.square(44),

@@ -66,8 +66,8 @@ class VoiceNoteComposerRecorder extends HookConsumerWidget {
     final reviewBeforeSending = ref.watch(voiceNoteReviewSettingProvider);
     // The generation this element was mounted for, frozen for its lifetime.
     // The composer swaps the recorder in and out through a 140 ms fade, so an
-    // element from a finished take is still mounted — and still watching the
-    // phase — while the next take begins. Freezing the generation keeps that
+    // element from a finished take is still mounted, and still watching the
+    // phase, while the next take begins. Freezing the generation keeps that
     // outgoing element from adopting the new take: it never builds a second
     // recorder, it stops reacting to the phase, and it only ever releases the
     // generation it owned (rule 2).

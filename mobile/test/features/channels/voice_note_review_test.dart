@@ -298,7 +298,10 @@ void main() {
     await pumpComposer(tester, prefs: prefs);
     await reviewTake(tester);
 
-    expect(semanticsNodeCount(tester, 'Play voice note'), 1);
+    // The row's time text is a tap target, so it is hidden from the screen
+    // reader; the play button is where the take's length is announced.
+    expect(semanticsNodeCount(tester, 'Play voice note, 0:03'), 1);
+    expect(semanticsNodeCount(tester, 'Play voice note'), 0);
     expect(semanticsNodeCount(tester, 'Cancel recording'), 1);
     expect(semanticsNodeCount(tester, 'Discard voice note'), 1);
     expect(semanticsNodeCount(tester, 'Record again'), 1);

@@ -326,6 +326,21 @@ void main() {
     expect(notifier.choiceFor('message-0'), isNull);
   });
 
+  test('remembered playback rates stay bounded', () async {
+    final container = ProviderContainer(
+      overrides: [savedPrefsProvider.overrideWithValue(prefs)],
+    );
+    addTearDown(container.dispose);
+    final notifier = container.read(voiceNotePlaybackRatesProvider.notifier);
+    for (var index = 0; index < voiceNotePlaybackRatesLimit + 5; index++) {
+      notifier.set('https://example.com/note-$index.mp4', 1.5);
+    }
+    final rates = container.read(voiceNotePlaybackRatesProvider);
+    expect(rates, hasLength(voiceNotePlaybackRatesLimit));
+    expect(rates['https://example.com/note-0.mp4'], isNull);
+    expect(rates['https://example.com/note-5.mp4'], 1.5);
+  });
+
   testWidgets('no transcript row when the imeta carries no alt text', (
     tester,
   ) async {
