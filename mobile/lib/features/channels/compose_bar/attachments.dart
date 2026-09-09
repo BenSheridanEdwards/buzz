@@ -418,11 +418,13 @@ Future<void> _retainAndQueueImages(
 
 /// Uploads one queued attachment.
 ///
-/// [relayAudioSupport] is the relay's NIP-11 `buzz-audio` verdict, read once
-/// when the send starts; it is only awaited for voice notes so the other
-/// attachment kinds never wait on it. [onRelayAudioRejected] fires when the
-/// relay refuses the bare audio despite that verdict, before the note is
-/// resent as the envelope.
+/// [relayAudioSupport] is the relay's NIP-11 `buzz-audio` verdict. The caller
+/// only starts that read when the queue holds a voice note, so an image, video
+/// or file send never touches the network for it and this parameter is null;
+/// the await here is reached only on the voice-note arm. (A queued voice note
+/// is exclusive, see `_rejectsNonVoiceAttachment`, so no send mixes the two.)
+/// [onRelayAudioRejected] fires when the relay refuses the bare audio despite
+/// that verdict, before the note is resent as the envelope.
 Future<BlobDescriptor> _uploadPendingAttachment(
   MediaUploadService service,
   _PendingAttachment attachment, {

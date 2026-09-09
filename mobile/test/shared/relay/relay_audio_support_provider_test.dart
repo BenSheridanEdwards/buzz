@@ -169,6 +169,36 @@ void main() {
     );
   });
 
+  test('stops reading a chunked body once it crosses the bound', () async {
+    // A relay that sends no Content-Length gets past the declared-length
+    // check, so this is the case the streaming bound alone has to stop.
+    const chunkBytes = 64 * 1024;
+    var chunksSent = 0;
+    Stream<List<int>> oversizedBody() async* {
+      for (var index = 0; index < 10; index++) {
+        chunksSent++;
+        yield List<int>.filled(chunkBytes, 0x78); // 'x'
+      }
+    }
+
+    final client = http_testing.MockClient.streaming(
+      (_, _) async => http.StreamedResponse(oversizedBody(), 200),
+    );
+    final container = _container(client);
+
+    expect(
+      await container.read(relayAudioSupportProvider(_relay).future),
+      isFalse,
+    );
+    expect(
+      chunksSent,
+      relayInfoMaxBodyBytes ~/ chunkBytes + 1,
+      reason:
+          'the body stream is dropped one chunk past the bound '
+          'rather than drained to the end',
+    );
+  });
+
   test('is false when the relay does not answer within five seconds', () {
     fakeAsync((async) {
       var requestCount = 0;
