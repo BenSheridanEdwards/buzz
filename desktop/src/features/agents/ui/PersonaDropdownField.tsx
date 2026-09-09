@@ -39,6 +39,9 @@ export function PersonaDropdownField({
    * text explaining why it cannot be changed. Prefer this over `disabled` for
    * a value another surface owns: a `disabled` button is skipped by the tab
    * order and its `aria-describedby` is never announced.
+   *
+   * Inert here means inert on every modality, not just the keyboard: see the
+   * `onOpenChange` guard below.
    */
   readOnly?: boolean;
   value: string;
@@ -49,7 +52,27 @@ export function PersonaDropdownField({
 
   return (
     <div className={PERSONA_FIELD_SHELL_CLASS}>
-      <DropdownMenu modal={false} onOpenChange={setOpen} open={open}>
+      <DropdownMenu
+        modal={false}
+        onOpenChange={(next) => {
+          // Guard the state transition, not the events that cause it. Radix
+          // opens this menu from four places on the trigger (pointerdown,
+          // ArrowDown, Enter and Space) and every one of them funnels through
+          // this controlled setter, so one check covers every modality and a
+          // modality added later cannot slip past an event allowlist. An
+          // `onClick` guard in particular never worked: Radix has already
+          // toggled on pointerdown by the time click fires.
+          //
+          // Closing is never blocked, so a menu opened before the field turned
+          // inert stays dismissable. The menu's items only exist while it is
+          // open, so this is also the only way a pick can reach
+          // `onValueChange`: no second guard is needed there, and one that
+          // could never fire would be unfalsifiable (AGENTS.md rule 3).
+          if (next && isInert) return;
+          setOpen(next);
+        }}
+        open={open}
+      >
         <DropdownMenuTrigger asChild>
           <button
             aria-describedby={describedBy}
@@ -61,14 +84,6 @@ export function PersonaDropdownField({
             )}
             disabled={disabled}
             id={id}
-            onClick={(event) => {
-              if (readOnly) event.preventDefault();
-            }}
-            onKeyDown={(event) => {
-              if (readOnly && (event.key === "Enter" || event.key === " ")) {
-                event.preventDefault();
-              }
-            }}
             type="button"
           >
             <span
