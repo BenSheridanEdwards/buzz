@@ -1,0 +1,57 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" width="1024" height="1024">
+  <!-- Fleet mark: a formation. One lead wing and two wings in echelon, the
+       shape of a fleet moving as one, in the HUD's cyan on the HUD's night. -->
+  <defs>
+    <linearGradient id="night" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#101722"/>
+      <stop offset="1" stop-color="#070a10"/>
+    </linearGradient>
+    <radialGradient id="glow" cx="0.5" cy="0.42" r="0.55">
+      <stop offset="0" stop-color="#3fe9ff" stop-opacity="0.22"/>
+      <stop offset="1" stop-color="#3fe9ff" stop-opacity="0"/>
+    </radialGradient>
+    <linearGradient id="wing" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#9ff6ff"/>
+      <stop offset="0.55" stop-color="#3fe9ff"/>
+      <stop offset="1" stop-color="#19b9d8"/>
+    </linearGradient>
+    <linearGradient id="wingDim" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#5fd3e8"/>
+      <stop offset="1" stop-color="#1a8fa8"/>
+    </linearGradient>
+    <filter id="soft" x="-20%" y="-20%" width="140%" height="140%">
+      <feGaussianBlur stdDeviation="18"/>
+    </filter>
+    <clipPath id="squircle">
+      <path d="M512 64C236 64 64 236 64 512s172 448 448 448 448-172 448-448S788 64 512 64z" transform="scale(1) translate(0,0)"/>
+    </clipPath>
+  </defs>
+
+  <!-- macOS icon shape: squircle -->
+  <path d="M226 64h572c90 0 162 72 162 162v572c0 90-72 162-162 162H226c-90 0-162-72-162-162V226c0-90 72-162 162-162z" fill="url(#night)"/>
+  <path d="M226 64h572c90 0 162 72 162 162v572c0 90-72 162-162 162H226c-90 0-162-72-162-162V226c0-90 72-162 162-162z" fill="url(#glow)"/>
+
+  <!-- faint grid, the HUD's plane -->
+  <g stroke="#3fe9ff" stroke-opacity="0.07" stroke-width="2">
+    <path d="M64 320H960M64 512H960M64 704H960M320 64V960M512 64V960M704 64V960"/>
+  </g>
+
+  <!-- formation glow -->
+  <g filter="url(#soft)" opacity="0.55">
+    <path d="M512 198 L690 560 L512 486 L334 560 Z" fill="#3fe9ff"/>
+  </g>
+
+  <!-- trailing wings (echelon) -->
+  <path d="M300 560 L412 790 L300 744 L188 790 Z" fill="url(#wingDim)"/>
+  <path d="M724 560 L836 790 L724 744 L612 790 Z" fill="url(#wingDim)"/>
+
+  <!-- lead wing -->
+  <path d="M512 198 L690 560 L512 486 L334 560 Z" fill="url(#wing)"/>
+  <!-- the lead's heart: the HUD magenta -->
+  <circle cx="512" cy="420" r="26" fill="#d96bff"/>
+  <circle cx="512" cy="420" r="46" fill="none" stroke="#d96bff" stroke-opacity="0.45" stroke-width="6"/>
+
+  <!-- baseline, the command line all three hold -->
+  <path d="M250 812H774" stroke="#3fe9ff" stroke-opacity="0.55" stroke-width="8" stroke-linecap="round"/>
+  <text x="499" y="928" text-anchor="middle" font-family="Helvetica Neue, Helvetica, Arial, sans-serif" font-weight="700" font-size="106" letter-spacing="26" fill="#3fe9ff" fill-opacity="0.95">TEST</text>
+</svg>
