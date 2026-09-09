@@ -812,6 +812,30 @@ pub struct PromptContext {
     /// the desktop keys per (agent, relay) pair, e.g. `session_config_captured`,
     /// mirroring the `managed_agent_runtime_lifecycle` frames.
     pub relay_url: String,
+    /// Per-agent private root for inbound attachment blobs and outbound
+    /// scratch files, or the reason the harness has none (the root failed the
+    /// ownership, mode, or symlink checks in
+    /// `attachments::prepare_attachment_root`). One subdirectory per turn;
+    /// the oldest are pruned so the root stays bounded (see
+    /// `attachments::prepare_turn_dir`).
+    pub attachment_dir: Result<std::path::PathBuf, String>,
+    /// Turn directories that are still being prompted or published, kept out
+    /// of the prune (see `attachments::prune_turn_dirs`).
+    pub live_turn_dirs: crate::attachments::LiveTurnDirs,
+    /// How many reply-media publish tasks may run at once (rule 4). Each one
+    /// outlives its turn, holds a turn directory out of the prune, up to
+    /// `MAX_OUTBOUND_FILES` x `MAX_OUTBOUND_FILE_BYTES` on disk and in memory
+    /// and possibly an ffmpeg child, so without this a pool answering quickly
+    /// accumulates them without limit. A turn that cannot get a slot within
+    /// `PUBLISH_SLOT_WAIT` reports its media as failed through the notice
+    /// rather than queueing behind the others.
+    pub publish_slots: Arc<tokio::sync::Semaphore>,
+    /// Cached NIP-11 `buzz-audio` answer shared by every reply.
+    pub audio_support: crate::blossom::AudioSupportCache,
+    /// ffmpeg binary found at startup, if any. Without it voice-note
+    /// envelopes are passed through unextracted and outbound audio that the
+    /// relay refuses falls back to a generic file.
+    pub ffmpeg: Option<std::path::PathBuf>,
 }
 
 impl AgentPool {
@@ -2074,6 +2098,325 @@ fn with_canvas(prompt: Option<String>, canvas: Option<&str>) -> Option<String> {
     }
 }
 
+/// The events one batch fetches attachments for, in budget order.
+///
+/// Live events come first and cancelled ones last, so on a steer the message
+/// that caused the steer gets the 4-file, 25 MiB budget ahead of the blobs
+/// already fetched for the turn it superseded; the other order spends the
+/// budget on stale attachments and refuses the live voice note that prompted
+/// the steer.
+fn batch_attachment_events(batch: &FlushBatch) -> Vec<&nostr::Event> {
+    batch
+        .events
+        .iter()
+        .chain(batch.cancelled_events.iter())
+        .map(|be| &be.event)
+        .collect()
+}
+
+/// Fetch every `imeta` attachment on a batch into this turn's directory
+/// under the per-agent temp root.
+///
+/// Live events are admitted before the cancelled ones they superseded, so
+/// on a steer the message that caused it gets the attachment budget ahead of
+/// the blobs already fetched for the cancelled turn. The whole phase runs
+/// under `attachments::INBOUND_DEADLINE`.
+///
+/// When the directory cannot be created the attachments are still named in
+/// the prompt, each with that reason, so the engine knows what it did not get.
+async fn collect_batch_attachments(
+    ctx: &PromptContext,
+    batch: &FlushBatch,
+    turn_id: &str,
+) -> crate::attachments::InboundAttachments {
+    let events = batch_attachment_events(batch);
+    let has_imeta = events.iter().any(|event| {
+        event
+            .tags
+            .iter()
+            .any(|t| t.as_slice().first().map(String::as_str) == Some("imeta"))
+    });
+    if !has_imeta {
+        return crate::attachments::InboundAttachments::default();
+    }
+    let turn_dir = ctx
+        .attachment_dir
+        .as_deref()
+        .map_err(|reason| std::io::Error::other(reason.clone()))
+        .and_then(|root| crate::attachments::prepare_turn_dir(root, turn_id, &ctx.live_turn_dirs));
+    match turn_dir {
+        Ok(turn_dir) => {
+            crate::attachments::collect_inbound_attachments(
+                &ctx.rest_client,
+                &events,
+                &turn_dir,
+                ctx.ffmpeg.as_deref(),
+                tokio::time::Instant::now() + crate::attachments::INBOUND_DEADLINE,
+            )
+            .await
+        }
+        Err(e) => {
+            tracing::warn!(
+                target: "acp::media",
+                "attachment directory unavailable: {e}"
+            );
+            crate::attachments::InboundAttachments::unavailable(
+                &events,
+                &format!("attachment storage unavailable: {e}"),
+            )
+        }
+    }
+}
+
+/// Outer bound on one reply's media task: the upload deadline, the kind-9
+/// submit, and slack for the failure notice and resolving files on disk.
+const REPLY_MEDIA_TASK_TIMEOUT: Duration = crate::media_publish::OUTBOUND_DEADLINE
+    .saturating_add(crate::media_publish::PUBLISH_TIMEOUT)
+    .saturating_add(Duration::from_secs(20));
+
+/// How long a reply-media task waits for one of `PromptContext::publish_slots`
+/// before giving up and reporting its media as failed. Short on purpose: a
+/// queue of waiting tasks is the unbounded growth the semaphore exists to
+/// prevent, and the human is better served by "it did not go" than by an
+/// attachment that arrives half an hour after the text.
+const PUBLISH_SLOT_WAIT: Duration = Duration::from_secs(5);
+
+/// Observer plumbing detached from the agent so a task that outlives the
+/// turn can still emit frames under the turn's context.
+#[derive(Clone)]
+struct TurnObserver {
+    handle: Option<observer::ObserverHandle>,
+    agent_index: Option<usize>,
+    context: observer::ObserverContext,
+}
+
+impl TurnObserver {
+    fn for_agent(agent: &OwnedAgent) -> Self {
+        Self {
+            handle: agent.acp.observer_handle(),
+            agent_index: agent.acp.observer_agent_index(),
+            context: agent.acp.observer_context().clone(),
+        }
+    }
+
+    fn emit(&self, kind: &str, payload: serde_json::Value) {
+        if let Some(handle) = &self.handle {
+            handle.emit(kind, self.agent_index, &self.context, payload);
+        }
+    }
+}
+
+/// Publish any files the engine's reply named for a completed channel turn.
+///
+/// Always takes the capture (so it cannot leak into the next turn). When the
+/// turn had a channel to answer in and the reply named or carried media, the
+/// uploads and the kind-9 run on their own task so the agent slot returns to
+/// the pool at once; the task keeps the turn directory live (`guard`) until it
+/// is done and is bounded by [`REPLY_MEDIA_TASK_TIMEOUT`] end to end.
+///
+/// Anything that did not reach the relay is posted as a short notice in the
+/// same thread the media would have landed in, so the human who read "here
+/// is your voice note" is not left waiting for a file that never comes
+/// (rule 1); the log and the `turn_media_published` observer frame carry the
+/// full reasons. Returns the task handle so tests can await it.
+fn publish_reply_media(
+    ctx: &Arc<PromptContext>,
+    agent: &mut OwnedAgent,
+    batch: Option<&FlushBatch>,
+    turn_id: &str,
+    guard: crate::attachments::LiveTurnGuard,
+) -> Option<tokio::task::JoinHandle<()>> {
+    let capture = agent.acp.take_turn_media();
+    let Some(batch) = batch else {
+        if capture.references_media() {
+            // Heartbeat and initial-message replies have no channel to post
+            // into; say so rather than losing the reference silently.
+            tracing::warn!(
+                target: "acp::media",
+                blocks = capture.blocks().len(),
+                "reply named media outside a channel turn; only channel turns can attach files"
+            );
+            agent.acp.observe(
+                "turn_media_dropped",
+                serde_json::json!({
+                    "reason": "not a channel turn",
+                    "blocks": capture.blocks().len(),
+                }),
+            );
+        }
+        return None;
+    };
+    if !capture.references_media() {
+        return None;
+    }
+    let trigger = batch.events.last()?;
+    let observer = TurnObserver::for_agent(agent);
+    let ctx = Arc::clone(ctx);
+    let channel_id = batch.channel_id;
+    let trigger = trigger.event.clone();
+    let turn_id = turn_id.to_string();
+    Some(tokio::spawn(async move {
+        // Held for the whole task: the turn directory must survive the
+        // uploads, not just the prompt, or the prune reclaims the files
+        // being uploaded out from under it.
+        let _guard = guard;
+        let target = crate::media_publish::ReplyTarget::for_trigger(channel_id, &trigger);
+        let slot = tokio::time::timeout(
+            PUBLISH_SLOT_WAIT,
+            Arc::clone(&ctx.publish_slots).acquire_owned(),
+        )
+        .await;
+        let report = match slot {
+            Ok(Ok(permit)) => {
+                let work = publish_reply_media_now(&ctx, &target, capture, &turn_id);
+                match tokio::time::timeout(REPLY_MEDIA_TASK_TIMEOUT, work).await {
+                    Ok(report) => {
+                        drop(permit);
+                        report
+                    }
+                    Err(_) => crate::media_publish::PublishReport {
+                        published: Vec::new(),
+                        failed: vec![format!(
+                            "reply media task did not finish within {REPLY_MEDIA_TASK_TIMEOUT:?}"
+                        )],
+                        event_id: None,
+                    },
+                }
+            }
+            Ok(Err(_)) | Err(_) => crate::media_publish::PublishReport {
+                published: Vec::new(),
+                failed: vec![format!(
+                    "no reply media slot free within {PUBLISH_SLOT_WAIT:?}; too many replies are already publishing"
+                )],
+                event_id: None,
+            },
+        };
+        if !report.is_clean() {
+            tracing::warn!(
+                target: "acp::media",
+                channel = %channel_id,
+                published = report.published.len(),
+                "reply media partially failed: {}",
+                report.failed.join("; ")
+            );
+            let thread_tags = crate::queue::ThreadTags {
+                root_event_id: Some(target.root_event_id.to_hex()),
+                parent_event_id: Some(target.root_event_id.to_hex()),
+                mentioned_pubkeys: Vec::new(),
+            };
+            post_failure_notice(
+                &ctx.rest_client,
+                channel_id,
+                &thread_tags,
+                &crate::media_publish::failure_notice(&report),
+            )
+            .await;
+        }
+        observer.emit(
+            "turn_media_published",
+            serde_json::json!({
+                "published": report.published.len(),
+                "failed": report.failed,
+                "eventId": report.event_id,
+                "audioDelivery": report
+                    .published
+                    .iter()
+                    .filter_map(|p| p.delivery.map(|d| format!("{d:?}")))
+                    .collect::<Vec<_>>(),
+            }),
+        );
+    }))
+}
+
+/// Resolve the capture against the turn directory and the workspace, upload
+/// what passes, and post the kind-9. Every skipped reference is in `failed`.
+async fn publish_reply_media_now(
+    ctx: &PromptContext,
+    target: &crate::media_publish::ReplyTarget,
+    capture: crate::media_publish::TurnMediaCapture,
+    turn_id: &str,
+) -> crate::media_publish::PublishReport {
+    let failed = |reason: String| crate::media_publish::PublishReport {
+        published: Vec::new(),
+        failed: vec![reason],
+        event_id: None,
+    };
+    let turn_dir = match ctx.attachment_dir.as_deref() {
+        Ok(root) => {
+            match crate::attachments::prepare_turn_dir(root, turn_id, &ctx.live_turn_dirs) {
+                Ok(dir) => dir,
+                Err(e) => return failed(format!("attachment storage unavailable: {e}")),
+            }
+        }
+        Err(reason) => return failed(format!("attachment storage unavailable: {reason}")),
+    };
+    // The scratch every staged copy, decoded inline block, and ffmpeg output
+    // goes into. It is outside both outbound roots, but it is not hidden
+    // from the engine (same uid, a constant `.outbound` beside the turn
+    // directories), so what protects it is that `PublishScratch` holds it
+    // open and works `openat`-relative to that descriptor from here on.
+    let scratch = match ctx
+        .attachment_dir
+        .as_deref()
+        .map_err(|reason| std::io::Error::other(reason.clone()))
+        .and_then(crate::attachments::PublishScratch::create)
+    {
+        Ok(scratch) => Arc::new(scratch),
+        Err(e) => return failed(format!("publish scratch unavailable: {e}")),
+    };
+    tracing::debug!(
+        target: "acp::media",
+        scratch = %scratch.dir().display(),
+        "reply media staging into a private directory"
+    );
+    let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+    // The harness runs wherever it was started, which the remote-agent
+    // deployment documents as HOME; a working directory that broad is not a
+    // boundary at all, so it is refused as a root and named in the notes.
+    let workspace = crate::media_publish::outbound_workspace(
+        std::path::Path::new(&ctx.cwd),
+        home.as_deref(),
+        ctx.attachment_dir.as_deref().ok(),
+    );
+    if let Err(reason) = &workspace {
+        tracing::error!(
+            target: "acp::media",
+            cwd = %ctx.cwd,
+            "the working directory is not an outbound root: {reason}; only this turn's own directory is"
+        );
+    }
+    let roots = crate::media_publish::OutboundRoots {
+        turn_dir,
+        workspace: workspace.as_ref().ok().cloned(),
+        workspace_refused: workspace.err(),
+        home,
+    };
+    // Canonicalising, staging, and decoding inline data are disk work; keep
+    // them off the runtime threads.
+    let resolution = {
+        let roots = roots.clone();
+        let scratch = Arc::clone(&scratch);
+        match tokio::task::spawn_blocking(move || {
+            crate::media_publish::resolve_outbound_files(&capture, &roots, &scratch)
+        })
+        .await
+        {
+            Ok(resolution) => resolution,
+            Err(e) => return failed(format!("resolving reply files failed: {e}")),
+        }
+    };
+    let publisher = crate::media_publish::MediaPublisher {
+        rest: &ctx.rest_client,
+        audio_support: &ctx.audio_support,
+        ffmpeg: ctx.ffmpeg.as_deref(),
+    };
+    let deadline = tokio::time::Instant::now() + crate::media_publish::OUTBOUND_DEADLINE;
+    publisher
+        .publish_turn_media(target, resolution, &scratch, deadline)
+        .await
+        .unwrap_or_default()
+}
+
 /// Return `agent` to the pool via `result_tx`, clearing any steer receiver first.
 ///
 /// Every path that returns an `OwnedAgent` to the pool via `PromptResult` goes
@@ -2133,6 +2476,10 @@ pub async fn run_prompt_task(
     };
     let observer_channel_id = source.channel_id();
     let turn_started_at = chrono::Utc::now().to_rfc3339();
+    // This turn's attachment directory stays out of the prune while the
+    // engine may read it and, after the turn, while its reply media is
+    // published (the guard moves into that task).
+    let turn_dir_guard = ctx.live_turn_dirs.hold(&turn_id);
     agent.acp.set_observer_context(observer::context_for_turn(
         observer_channel_id,
         None,
@@ -2695,6 +3042,9 @@ pub async fn run_prompt_task(
     // Event IDs represented by this prompt. Commit only after ACP reports a
     // successful turn; failed/cancelled prompts must be retryable without loss.
     let mut pending_delivered_event_ids = HashSet::new();
+    // `resource_link` blocks for inbound attachments fetched for this batch.
+    // They ride in the same `session/prompt` as the text sections.
+    let mut inbound_blocks: Vec<crate::acp::PromptBlock> = Vec::new();
     let prompt_sections: Vec<String> = if let Some(text) = prompt_text {
         // Heartbeats create their session before this point, so a Goose method-not-found
         // probe has already selected the correct framing for this process.
@@ -2773,7 +3123,7 @@ pub async fn run_prompt_task(
             );
         }
 
-        crate::queue::format_prompt(
+        let mut sections = crate::queue::format_prompt(
             b,
             &crate::queue::FormatPromptArgs {
                 agent_core: standing.agent_core,
@@ -2789,7 +3139,36 @@ pub async fn run_prompt_task(
                 agent_canvas: standing.agent_canvas,
                 standing_context_sent,
             },
-        )
+        );
+
+        // Inbound attachments: fetch every `imeta` blob on the batch with the
+        // agent key and hand the engine local paths. Rendered after the event
+        // sections so the section headers the observer trimmer keys on are
+        // unchanged. Every failure is named in the section (rule 1).
+        let inbound = collect_batch_attachments(&ctx, b, &turn_id).await;
+        if let Some(section) = inbound.section() {
+            sections.push(section);
+        }
+        inbound_blocks = inbound.prompt_blocks();
+        if !inbound.is_empty() {
+            let stored = inbound.stored().count();
+            let total = inbound.outcomes.len();
+            tracing::info!(
+                target: "acp::media",
+                channel = %b.channel_id,
+                stored,
+                failed = total - stored,
+                "inbound attachments resolved for prompt"
+            );
+            agent.acp.observe(
+                "inbound_attachments",
+                serde_json::json!({
+                    "stored": stored,
+                    "failed": total - stored,
+                }),
+            );
+        }
+        sections
     } else {
         // Should not happen — batch is None only for heartbeats which have prompt_text.
         // Return the agent to the pool to prevent a permanent slot leak.
@@ -2821,13 +3200,24 @@ pub async fn run_prompt_task(
     // own block. Per-section blocks let the observer size trimmer elide a
     // section body in place while every `[Header]` line survives at the head
     // of its own leaf — so the "Prompt context" panel counts every section.
-    let prompt_blocks: Vec<&str> = match slash_command {
-        Some(ref cmd) => std::iter::once(cmd.as_str())
-            .chain(prompt_sections.iter().map(String::as_str))
+    let mut prompt_blocks: Vec<crate::acp::PromptBlock> = match slash_command {
+        Some(ref cmd) => std::iter::once(cmd.clone())
+            .chain(prompt_sections.iter().cloned())
+            .map(crate::acp::PromptBlock::Text)
             .collect(),
-        None => prompt_sections.iter().map(String::as_str).collect(),
+        None => prompt_sections
+            .iter()
+            .cloned()
+            .map(crate::acp::PromptBlock::Text)
+            .collect(),
     };
-    let prompt_bytes: usize = prompt_blocks.iter().map(|block| block.len()).sum();
+    // Attachment links follow every text section so the slash-command and
+    // header-first invariants above are untouched.
+    prompt_blocks.extend(inbound_blocks);
+    let prompt_bytes: usize = prompt_blocks
+        .iter()
+        .map(crate::acp::PromptBlock::text_len)
+        .sum();
     let has_standing_context = match &source {
         PromptSource::Channel(_) => !standing.sections().is_empty(),
         PromptSource::Heartbeat => ctx.base_prompt.is_some(),
@@ -2871,7 +3261,7 @@ pub async fn run_prompt_task(
             // Heartbeat / non-cancellable path.
             tokio::select! {
                 biased;
-                result = agent.acp.session_prompt_blocks_with_idle_timeout(
+                result = agent.acp.session_prompt_content_with_idle_timeout(
                     &session_id,
                     &prompt_blocks,
                     ctx.idle_timeout,
@@ -2882,7 +3272,7 @@ pub async fn run_prompt_task(
         Some(rx) => {
             tokio::select! {
                 biased;
-                result = agent.acp.session_prompt_blocks_with_idle_timeout(
+                result = agent.acp.session_prompt_content_with_idle_timeout(
                     &session_id,
                     &prompt_blocks,
                     ctx.idle_timeout,
@@ -3020,6 +3410,13 @@ pub async fn run_prompt_task(
                             &source,
                             &control_signal,
                         );
+                        publish_reply_media(
+                            &ctx,
+                            &mut agent,
+                            batch.as_ref(),
+                            &turn_id,
+                            turn_dir_guard,
+                        );
                         let usage = agent.acp.take_turn_usage();
                         publish_agent_turn_metric(
                             &ctx,
@@ -3091,6 +3488,15 @@ pub async fn run_prompt_task(
                     "rotating session for {source:?} after {stop_reason:?}",
                 );
                 agent.state.invalidate(&source);
+            }
+
+            // Files the reply named are published only for a turn the engine
+            // finished on its own terms; a cancelled or refused turn's capture
+            // is discarded with it.
+            if matches!(stop_reason, StopReason::Cancelled | StopReason::Refusal) {
+                let _ = agent.acp.take_turn_media();
+            } else {
+                publish_reply_media(&ctx, &mut agent, batch.as_ref(), &turn_id, turn_dir_guard);
             }
 
             let core_stop = acp_stop_to_core(&stop_reason);
@@ -6768,6 +7174,1041 @@ done"#
         );
     }
 
+    /// One HTTP request as the media test server saw it.
+    #[derive(Debug, Clone)]
+    struct SeenRequest {
+        method: String,
+        path: String,
+        /// Header names lower-cased.
+        headers: Vec<(String, String)>,
+        body: Vec<u8>,
+    }
+
+    impl SeenRequest {
+        fn header(&self, name: &str) -> Option<&str> {
+            self.headers
+                .iter()
+                .find(|(k, _)| k == name)
+                .map(|(_, v)| v.as_str())
+        }
+
+        fn json(&self) -> serde_json::Value {
+            serde_json::from_slice(&self.body).unwrap_or(serde_json::Value::Null)
+        }
+    }
+
+    /// A relay stand-in that serves one blob, accepts uploads and events, and
+    /// answers everything else with an empty JSON document. Keep-alive aware,
+    /// since the Blossom client pools connections.
+    async fn media_relay_server(
+        blob: Vec<u8>,
+        blob_sha: String,
+        upload_gate: Option<Arc<tokio::sync::Semaphore>>,
+    ) -> (String, std::sync::Arc<std::sync::Mutex<Vec<SeenRequest>>>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let base = format!("http://{addr}");
+        let seen: std::sync::Arc<std::sync::Mutex<Vec<SeenRequest>>> = Default::default();
+        let log = seen.clone();
+        let blob = std::sync::Arc::new(blob);
+        let descriptor_base = base.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    return;
+                };
+                let log = log.clone();
+                let blob = blob.clone();
+                let blob_sha = blob_sha.clone();
+                let base = descriptor_base.clone();
+                let upload_gate = upload_gate.clone();
+                tokio::spawn(async move {
+                    let mut buf: Vec<u8> = Vec::new();
+                    let mut chunk = vec![0u8; 65536];
+                    loop {
+                        // Read one request: headers, then Content-Length bytes.
+                        let header_end = loop {
+                            if let Some(p) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                                break p + 4;
+                            }
+                            match socket.read(&mut chunk).await {
+                                Ok(0) | Err(_) => return,
+                                Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                            }
+                        };
+                        let head = String::from_utf8_lossy(&buf[..header_end]).into_owned();
+                        let mut lines = head.lines();
+                        let request_line = lines.next().unwrap_or_default().to_string();
+                        let mut parts = request_line.split_whitespace();
+                        let method = parts.next().unwrap_or_default().to_string();
+                        let path = parts.next().unwrap_or_default().to_string();
+                        let headers: Vec<(String, String)> = lines
+                            .filter_map(|l| {
+                                let (k, v) = l.split_once(':')?;
+                                Some((k.trim().to_ascii_lowercase(), v.trim().to_string()))
+                            })
+                            .collect();
+                        let len = headers
+                            .iter()
+                            .find(|(k, _)| k == "content-length")
+                            .and_then(|(_, v)| v.parse::<usize>().ok())
+                            .unwrap_or(0);
+                        while buf.len() < header_end + len {
+                            match socket.read(&mut chunk).await {
+                                Ok(0) | Err(_) => return,
+                                Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                            }
+                        }
+                        let body = buf[header_end..header_end + len].to_vec();
+                        buf.drain(..header_end + len);
+                        let (content_type, response): (&str, Vec<u8>) = match (
+                            method.as_str(),
+                            path.as_str(),
+                        ) {
+                            ("GET", p) if p.contains(&blob_sha) => {
+                                ("application/octet-stream", blob.as_ref().clone())
+                            }
+                            ("PUT", "/upload") | ("PUT", "/media/upload") => {
+                                // A gated server logs the upload and then
+                                // holds the response, so a test can look at
+                                // the harness while a publish is in flight.
+                                if let Some(gate) = upload_gate.as_ref() {
+                                    log.lock().unwrap().push(SeenRequest {
+                                        method: "PUT-STARTED".into(),
+                                        path: path.clone(),
+                                        headers: headers.clone(),
+                                        body: body.clone(),
+                                    });
+                                    let _ = gate.acquire().await.map(|p| p.forget());
+                                }
+                                let sha = crate::blossom::sha256_hex(&body);
+                                let mime = headers
+                                    .iter()
+                                    .find(|(k, _)| k == "content-type")
+                                    .map(|(_, v)| v.clone())
+                                    .unwrap_or_else(|| "application/octet-stream".into());
+                                (
+                                        "application/json",
+                                        format!(
+                                            r#"{{"url":"{base}/media/{sha}.bin","sha256":"{sha}","size":{},"type":"{mime}","uploaded":1}}"#,
+                                            body.len()
+                                        )
+                                        .into_bytes(),
+                                    )
+                            }
+                            ("POST", "/events") => {
+                                ("application/json", br#"{"accepted":true}"#.to_vec())
+                            }
+                            ("POST", _) => ("application/json", b"[]".to_vec()),
+                            _ => ("application/json", b"{}".to_vec()),
+                        };
+                        log.lock().unwrap().push(SeenRequest {
+                            method,
+                            path,
+                            headers,
+                            body,
+                        });
+                        let mut resp = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\n\r\n",
+                            response.len()
+                        )
+                        .into_bytes();
+                        resp.extend_from_slice(&response);
+                        if socket.write_all(&resp).await.is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+        (base, seen)
+    }
+
+    /// Poll the server log until `pred` holds or ten seconds pass.
+    async fn wait_for_requests(
+        seen: &std::sync::Arc<std::sync::Mutex<Vec<SeenRequest>>>,
+        what: &str,
+        pred: impl Fn(&[SeenRequest]) -> bool,
+    ) -> Vec<SeenRequest> {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let snapshot = seen.lock().unwrap().clone();
+            if pred(&snapshot) {
+                return snapshot;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out waiting for {what}; saw {:?}",
+                snapshot
+                    .iter()
+                    .map(|r| format!("{} {}", r.method, r.path))
+                    .collect::<Vec<_>>()
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    fn kind9_posts(seen: &[SeenRequest]) -> Vec<serde_json::Value> {
+        seen.iter()
+            .filter(|r| r.method == "POST" && r.path == "/events")
+            .map(SeenRequest::json)
+            .filter(|e| e["kind"].as_u64() == Some(9))
+            .collect()
+    }
+
+    /// Review item 6: binds `run_prompt_task` end to end. A channel turn whose
+    /// trigger carries an `imeta` attachment gets the blob fetched (with the
+    /// auth tag on the wire) and handed to the engine as a `<buzz-attachments>`
+    /// section plus a `resource_link` block in the same `session/prompt`; a
+    /// reply that names a workspace file has it uploaded (auth tag again) and
+    /// announced in one kind-9 anchored to the trigger; a reference outside
+    /// the turn directory and the workspace is refused and the refusal is
+    /// posted as a short notice in the same thread. A turn the engine ends
+    /// with `cancelled` and a heartbeat turn publish nothing.
+    #[tokio::test]
+    async fn channel_turn_delivers_inbound_attachments_and_publishes_reply_media() {
+        let blob = b"voice note bytes".to_vec();
+        let blob_sha = crate::blossom::sha256_hex(&blob);
+        let (base, seen) = media_relay_server(blob.clone(), blob_sha.clone(), None).await;
+
+        let scratch = std::env::temp_dir().join(format!("buzz-acp-pool-media-{}", Uuid::new_v4()));
+        let workspace = scratch.join("workspace");
+        let elsewhere = scratch.join("elsewhere");
+        let attachment_root = scratch.join("attachments");
+        for d in [&workspace, &elsewhere, &attachment_root] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        let reply_file = workspace.join("reply.txt");
+        std::fs::write(&reply_file, b"hello from the workspace").unwrap();
+        let secret = elsewhere.join("secret.txt");
+        std::fs::write(&secret, b"not yours to publish").unwrap();
+
+        let capture = scratch.join("acp-requests.ndjson");
+        let quoted_capture = capture.to_string_lossy().replace('\'', "'\\''");
+        let reply_text = format!(
+            "Here you go.\\nMEDIA:{}\\nMEDIA:{}",
+            reply_file.display(),
+            secret.display()
+        );
+        // Every prompt gets the same reply: one workspace file, one file from
+        // outside every root. Turn 2 ends with `cancelled`, the rest `end_turn`.
+        let script = format!(
+            r#"count=0
+while IFS= read -r line; do
+  printf '%s\n' "$line" >> '{quoted_capture}'
+  count=$((count + 1))
+  printf '%s\n' '{{"jsonrpc":"2.0","method":"session/update","params":{{"sessionId":"live-session","update":{{"sessionUpdate":"agent_message_chunk","content":{{"type":"text","text":"{reply_text}"}}}}}}}}'
+  if [ "$count" -eq 2 ]; then stop=cancelled; else stop=end_turn; fi
+  printf '%s\n' "{{\"jsonrpc\":\"2.0\",\"id\":$((count - 1)),\"result\":{{\"stopReason\":\"$stop\"}}}}"
+done"#
+        );
+        let acp = AcpClient::spawn("bash", &["-c".to_string(), script], &[], false)
+            .await
+            .expect("spawn media ACP script");
+        let channel_id = Uuid::new_v4();
+        let mut agent = OwnedAgent {
+            index: 0,
+            acp,
+            state: SessionState::default(),
+            model_capabilities: None,
+            desired_model: None,
+            model_overridden: false,
+            desired_model_request_id: None,
+            desired_model_pending_ack: false,
+            startup_effort: None,
+            agent_name: "media-test-agent".into(),
+            goose_system_prompt_supported: None,
+            protocol_version: 1,
+        };
+        agent
+            .state
+            .sessions
+            .insert(conv(channel_id), "live-session".into());
+        agent
+            .state
+            .deliveries
+            .insert(conv(channel_id), ChannelDeliveryState::default());
+        agent.state.heartbeat_session = Some("live-session".into());
+
+        let mut ctx = make_prompt_context_no_owner();
+        ctx.rest_client.base_url = base.clone();
+        ctx.rest_client.auth_tag_json = Some(r#"{"tag":"member"}"#.into());
+        ctx.attachment_dir = Ok(attachment_root.clone());
+        ctx.cwd = workspace.to_string_lossy().into_owned();
+        let ctx = Arc::new(ctx);
+        let (result_tx, mut result_rx) = mpsc::unbounded_channel();
+
+        let author = Keys::generate();
+        let channel_batch = |content: &str, with_attachment: bool| {
+            let mut builder = EventBuilder::new(Kind::Custom(9), content);
+            if with_attachment {
+                let imeta = Tag::parse([
+                    "imeta",
+                    &format!("url {base}/media/{blob_sha}.bin"),
+                    "m audio/mpeg",
+                    &format!("x {blob_sha}"),
+                    &format!("size {}", blob.len()),
+                    "filename voice-note-1.mp3",
+                ])
+                .unwrap();
+                builder = builder.tags([imeta]);
+            }
+            let event = builder.sign_with_keys(&author).unwrap();
+            FlushBatch {
+                channel_id,
+                scope: SessionScope::Conversation { channel_id },
+                events: vec![crate::queue::BatchEvent {
+                    event,
+                    prompt_tag: "test".into(),
+                    received_at: std::time::Instant::now(),
+                }],
+                cancelled_events: vec![],
+                cancel_reason: None,
+            }
+        };
+
+        // Turn 1: attachment in, workspace file out, refusal noticed.
+        let batch = channel_batch("listen to this", true);
+        let trigger_id = batch.events[0].event.id.to_hex();
+        run_prompt_task(
+            agent,
+            Some(batch),
+            None,
+            Arc::clone(&ctx),
+            result_tx.clone(),
+            None,
+            "turn-1".into(),
+        )
+        .await;
+        let result = result_rx.recv().await.expect("prompt result");
+        assert!(matches!(
+            result.outcome,
+            PromptOutcome::Ok(StopReason::EndTurn)
+        ));
+        agent = result.agent;
+
+        let requests = wait_for_requests(&seen, "turn 1 media kind-9 and failure notice", |seen| {
+            let posts = kind9_posts(seen);
+            posts
+                .iter()
+                .any(|e| e["content"].as_str().unwrap_or("").contains("reply.txt"))
+                && posts.iter().any(|e| {
+                    e["content"]
+                        .as_str()
+                        .unwrap_or("")
+                        .contains("Could not attach")
+                })
+        })
+        .await;
+
+        // Inbound: the blob was fetched with the auth tag and the prompt the
+        // engine saw carries the section and the link in one request.
+        let download = requests
+            .iter()
+            .find(|r| r.method == "GET" && r.path.contains(&blob_sha))
+            .expect("blob downloaded");
+        assert_eq!(download.header("x-auth-tag"), Some(r#"{"tag":"member"}"#));
+        let acp_requests: Vec<serde_json::Value> = std::fs::read_to_string(&capture)
+            .unwrap()
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        assert_eq!(acp_requests[0]["method"], "session/prompt");
+        let prompt = acp_requests[0]["params"]["prompt"].as_array().unwrap();
+        let section = prompt
+            .iter()
+            .filter(|b| b["type"] == "text")
+            .find_map(|b| {
+                b["text"]
+                    .as_str()
+                    .filter(|t| t.contains("<buzz-attachments>"))
+            })
+            .expect("attachments section in the prompt");
+        assert!(section.contains("voice-note-1.mp3"), "{section}");
+        let link = prompt
+            .iter()
+            .find(|b| b["type"] == "resource_link")
+            .expect("resource_link in the same prompt");
+        let uri = link["uri"].as_str().unwrap();
+        let stored = std::path::Path::new(uri.strip_prefix("file://").unwrap());
+        assert!(
+            stored.starts_with(attachment_root.join("turn-1")),
+            "{uri} is under this turn's directory"
+        );
+        assert_eq!(
+            std::fs::read(stored).unwrap(),
+            blob,
+            "the verified blob is what the engine reads"
+        );
+        assert_eq!(link["mimeType"], "audio/mpeg");
+
+        // Outbound: one upload of the workspace file, with the auth tag.
+        let uploads: Vec<&SeenRequest> = requests
+            .iter()
+            .filter(|r| r.method == "PUT" && r.path.contains("upload"))
+            .collect();
+        assert_eq!(uploads.len(), 1, "exactly one upload for turn 1");
+        assert_eq!(uploads[0].body, b"hello from the workspace");
+        assert_eq!(uploads[0].header("x-auth-tag"), Some(r#"{"tag":"member"}"#));
+
+        // One kind-9 for the media, anchored to the trigger and in the channel.
+        let posts = kind9_posts(&requests);
+        let media_post = posts
+            .iter()
+            .find(|e| e["content"].as_str().unwrap().contains("reply.txt"))
+            .unwrap();
+        let tags = media_post["tags"].as_array().unwrap();
+        assert!(
+            tags.iter()
+                .any(|t| t[0] == "e" && t[1] == trigger_id.as_str()),
+            "media kind-9 anchors to the trigger: {tags:?}"
+        );
+        assert!(tags
+            .iter()
+            .any(|t| t[0] == "h" && t[1] == channel_id.to_string().as_str()));
+        assert!(tags.iter().any(|t| t[0] == "imeta"), "{tags:?}");
+        assert!(media_post["content"].as_str().unwrap().contains("/media/"));
+
+        // The refusal reached the humans in the same thread, in one short line.
+        let notice = posts
+            .iter()
+            .find(|e| e["content"].as_str().unwrap().contains("Could not attach"))
+            .unwrap();
+        let text = notice["content"].as_str().unwrap();
+        assert!(text.contains("secret.txt refused"), "{text}");
+        assert!(text.contains("outside the turn directory"), "{text}");
+        assert!(text.contains("(1 attached)"), "{text}");
+        assert!(text.len() <= 280, "{text}");
+        let notice_tags = notice["tags"].as_array().unwrap();
+        assert!(
+            notice_tags
+                .iter()
+                .any(|t| t[0] == "e" && t[1] == trigger_id.as_str()),
+            "notice anchors where the media would have: {notice_tags:?}"
+        );
+        assert!(
+            !requests.iter().any(|r| r.body == b"not yours to publish"),
+            "the out-of-root file never reached the wire"
+        );
+
+        // Turn 2: the engine ends with `cancelled`; its reply media is discarded.
+        run_prompt_task(
+            agent,
+            Some(channel_batch("again", false)),
+            None,
+            Arc::clone(&ctx),
+            result_tx.clone(),
+            None,
+            "turn-2".into(),
+        )
+        .await;
+        let result = result_rx.recv().await.unwrap();
+        assert!(matches!(
+            result.outcome,
+            PromptOutcome::Ok(StopReason::Cancelled)
+        ));
+        agent = result.agent;
+
+        // Turn 3: a heartbeat has no channel to publish into.
+        run_prompt_task(
+            agent,
+            None,
+            Some("heartbeat".into()),
+            Arc::clone(&ctx),
+            result_tx.clone(),
+            None,
+            "turn-3".into(),
+        )
+        .await;
+        let result = result_rx.recv().await.unwrap();
+        assert!(matches!(
+            result.outcome,
+            PromptOutcome::Ok(StopReason::EndTurn)
+        ));
+        agent = result.agent;
+
+        // Turn 4: a normal channel turn publishes again, which bounds the wait
+        // for anything turns 2 and 3 might have leaked.
+        run_prompt_task(
+            agent,
+            Some(channel_batch("once more", false)),
+            None,
+            Arc::clone(&ctx),
+            result_tx.clone(),
+            None,
+            "turn-4".into(),
+        )
+        .await;
+        let result = result_rx.recv().await.unwrap();
+        assert!(matches!(
+            result.outcome,
+            PromptOutcome::Ok(StopReason::EndTurn)
+        ));
+        agent = result.agent;
+        let requests = wait_for_requests(&seen, "turn 4 media kind-9", |seen| {
+            kind9_posts(seen)
+                .iter()
+                .filter(|e| e["content"].as_str().unwrap_or("").contains("reply.txt"))
+                .count()
+                >= 2
+        })
+        .await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let requests = if seen.lock().unwrap().len() == requests.len() {
+            requests
+        } else {
+            seen.lock().unwrap().clone()
+        };
+        let uploads = requests
+            .iter()
+            .filter(|r| r.method == "PUT" && r.path.contains("upload"))
+            .count();
+        assert_eq!(
+            uploads, 2,
+            "turns 1 and 4 uploaded; the cancelled turn and the heartbeat did not"
+        );
+        assert_eq!(
+            kind9_posts(&requests)
+                .iter()
+                .filter(|e| e["content"]
+                    .as_str()
+                    .unwrap_or("")
+                    .contains("Could not attach"))
+                .count(),
+            2,
+            "one notice per publishing turn"
+        );
+        assert!(
+            ctx.live_turn_dirs.is_empty(),
+            "every turn released its directory once its media task finished"
+        );
+
+        agent.acp.shutdown().await;
+        let _ = std::fs::remove_dir_all(&scratch);
+    }
+
+    /// S4 and S3 from the confirmation pass. The publish task outlives its
+    /// turn, so it must hold the turn directory out of the prune for as long
+    /// as it runs, and the number of those tasks must be bounded. Both are
+    /// exercised against a relay that holds the upload open: the live turn's
+    /// directory survives a prune that has every reason to take it, and a
+    /// second turn that cannot get a publish slot says so in the channel
+    /// instead of queueing behind the first.
+    #[tokio::test]
+    async fn publish_task_holds_its_turn_dir_and_bounds_how_many_run() {
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        let (base, seen) =
+            media_relay_server(b"unused".to_vec(), "unused".into(), Some(gate.clone())).await;
+
+        let scratch = std::env::temp_dir().join(format!("buzz-acp-pool-hold-{}", Uuid::new_v4()));
+        let workspace = scratch.join("workspace");
+        let attachment_root = scratch.join("attachments");
+        for d in [&workspace, &attachment_root] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        let reply_file = workspace.join("reply.txt");
+        std::fs::write(&reply_file, b"held upload").unwrap();
+        let reply_text = format!("here\\nMEDIA:{}", reply_file.display());
+        let script = format!(
+            r#"count=0
+while IFS= read -r line; do
+  count=$((count + 1))
+  printf '%s\n' '{{"jsonrpc":"2.0","method":"session/update","params":{{"sessionId":"live-session","update":{{"sessionUpdate":"agent_message_chunk","content":{{"type":"text","text":"{reply_text}"}}}}}}}}'
+  printf '%s\n' "{{\"jsonrpc\":\"2.0\",\"id\":$((count - 1)),\"result\":{{\"stopReason\":\"end_turn\"}}}}"
+done"#
+        );
+        let acp = AcpClient::spawn("bash", &["-c".to_string(), script], &[], false)
+            .await
+            .expect("spawn hold ACP script");
+        let channel_id = Uuid::new_v4();
+        let mut agent = OwnedAgent {
+            index: 0,
+            acp,
+            state: SessionState::default(),
+            model_capabilities: None,
+            desired_model: None,
+            model_overridden: false,
+            desired_model_request_id: None,
+            desired_model_pending_ack: false,
+            startup_effort: None,
+            agent_name: "hold-test-agent".into(),
+            goose_system_prompt_supported: None,
+            protocol_version: 1,
+        };
+        agent
+            .state
+            .sessions
+            .insert(conv(channel_id), "live-session".into());
+        agent
+            .state
+            .deliveries
+            .insert(conv(channel_id), ChannelDeliveryState::default());
+
+        let mut ctx = make_prompt_context_no_owner();
+        ctx.rest_client.base_url = base.clone();
+        ctx.attachment_dir = Ok(attachment_root.clone());
+        ctx.cwd = workspace.to_string_lossy().into_owned();
+        // One slot, so the second turn's media cannot start while the first
+        // is still uploading.
+        ctx.publish_slots = Arc::new(tokio::sync::Semaphore::new(1));
+        let ctx = Arc::new(ctx);
+        let (result_tx, mut result_rx) = mpsc::unbounded_channel();
+
+        let author = Keys::generate();
+        let batch = |content: &str| {
+            let event = EventBuilder::new(Kind::Custom(9), content)
+                .sign_with_keys(&author)
+                .unwrap();
+            FlushBatch {
+                channel_id,
+                scope: SessionScope::Conversation { channel_id },
+                events: vec![crate::queue::BatchEvent {
+                    event,
+                    prompt_tag: "test".into(),
+                    received_at: std::time::Instant::now(),
+                }],
+                cancelled_events: vec![],
+                cancel_reason: None,
+            }
+        };
+
+        run_prompt_task(
+            agent,
+            Some(batch("first")),
+            None,
+            Arc::clone(&ctx),
+            result_tx.clone(),
+            None,
+            "turn-live".into(),
+        )
+        .await;
+        let result = result_rx.recv().await.expect("prompt result");
+        agent = result.agent;
+        // The slot came back before the upload did.
+        wait_for_requests(&seen, "the held upload to start", |seen| {
+            seen.iter().any(|r| r.method == "PUT-STARTED")
+        })
+        .await;
+
+        // Everything the prune uses to choose a victim now points at the
+        // publishing turn: it is the oldest directory and the root is well
+        // over the keep count.
+        for i in 0..20 {
+            std::fs::create_dir_all(attachment_root.join(format!("stale-{i}"))).unwrap();
+        }
+        let live_dir = attachment_root.join("turn-live");
+        assert!(live_dir.is_dir(), "the publish task created its turn dir");
+        assert!(
+            ctx.live_turn_dirs.is_live("turn-live"),
+            "the publish task holds its turn directory"
+        );
+        crate::attachments::prune_turn_dirs(&attachment_root, &ctx.live_turn_dirs, None).unwrap();
+        assert!(
+            live_dir.is_dir(),
+            "the directory of a turn that is still publishing survives the prune"
+        );
+        assert!(
+            attachment_root.join(".outbound").is_dir(),
+            "the publish scratch is not a turn directory and is never pruned"
+        );
+
+        // A second turn cannot get the one publish slot and says so in the
+        // channel rather than queueing behind the held upload.
+        run_prompt_task(
+            agent,
+            Some(batch("second")),
+            None,
+            Arc::clone(&ctx),
+            result_tx.clone(),
+            None,
+            "turn-queued".into(),
+        )
+        .await;
+        let result = result_rx.recv().await.expect("second prompt result");
+        agent = result.agent;
+        let requests = wait_for_requests(&seen, "the no-slot notice", |seen| {
+            kind9_posts(seen).iter().any(|e| {
+                e["content"]
+                    .as_str()
+                    .unwrap_or("")
+                    .contains("no reply media slot free")
+            })
+        })
+        .await;
+        assert!(
+            !requests
+                .iter()
+                .any(|r| r.method == "PUT" && r.body == b"held upload"),
+            "the queued turn never uploaded"
+        );
+
+        // Release the upload; the task finishes, drops the guard, and the
+        // directory becomes prunable again.
+        gate.add_permits(8);
+        wait_for_requests(&seen, "the media kind-9", |seen| {
+            kind9_posts(seen)
+                .iter()
+                .any(|e| e["content"].as_str().unwrap_or("").contains("reply.txt"))
+        })
+        .await;
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !ctx.live_turn_dirs.is_empty() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "guards never released"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        // The first prune already took its five victims; give the next one
+        // work to do so the released directory is a candidate again.
+        for i in 20..30 {
+            std::fs::create_dir_all(attachment_root.join(format!("stale-{i}"))).unwrap();
+        }
+        crate::attachments::prune_turn_dirs(&attachment_root, &ctx.live_turn_dirs, None).unwrap();
+        assert!(
+            !live_dir.exists(),
+            "once the task is done the directory is prunable like any other"
+        );
+
+        agent.acp.shutdown().await;
+        let _ = std::fs::remove_dir_all(&scratch);
+    }
+
+    /// B2 and S1 at the pool seam: the harness working directory is only an
+    /// outbound root when it is a real project directory. Here it contains
+    /// the attachment root, so a reply naming a file under it publishes
+    /// nothing and the channel is told why.
+    #[tokio::test]
+    async fn a_workspace_that_is_not_a_boundary_publishes_nothing() {
+        let (base, seen) = media_relay_server(b"unused".to_vec(), "unused".into(), None).await;
+        let scratch = std::env::temp_dir().join(format!("buzz-acp-pool-cwd-{}", Uuid::new_v4()));
+        let attachment_root = scratch.join("attachments");
+        std::fs::create_dir_all(&attachment_root).unwrap();
+        let reply_file = scratch.join("reply.txt");
+        std::fs::write(&reply_file, b"under the harness cwd").unwrap();
+        let reply_text = format!("here\\nMEDIA:{}", reply_file.display());
+        let script = format!(
+            r#"count=0
+while IFS= read -r line; do
+  count=$((count + 1))
+  printf '%s\n' '{{"jsonrpc":"2.0","method":"session/update","params":{{"sessionId":"live-session","update":{{"sessionUpdate":"agent_message_chunk","content":{{"type":"text","text":"{reply_text}"}}}}}}}}'
+  printf '%s\n' "{{\"jsonrpc\":\"2.0\",\"id\":$((count - 1)),\"result\":{{\"stopReason\":\"end_turn\"}}}}"
+done"#
+        );
+        let acp = AcpClient::spawn("bash", &["-c".to_string(), script], &[], false)
+            .await
+            .expect("spawn cwd ACP script");
+        let channel_id = Uuid::new_v4();
+        let mut agent = OwnedAgent {
+            index: 0,
+            acp,
+            state: SessionState::default(),
+            model_capabilities: None,
+            desired_model: None,
+            model_overridden: false,
+            desired_model_request_id: None,
+            desired_model_pending_ack: false,
+            startup_effort: None,
+            agent_name: "cwd-test-agent".into(),
+            goose_system_prompt_supported: None,
+            protocol_version: 1,
+        };
+        agent
+            .state
+            .sessions
+            .insert(conv(channel_id), "live-session".into());
+        agent
+            .state
+            .deliveries
+            .insert(conv(channel_id), ChannelDeliveryState::default());
+
+        let mut ctx = make_prompt_context_no_owner();
+        ctx.rest_client.base_url = base.clone();
+        ctx.attachment_dir = Ok(attachment_root.clone());
+        // The documented remote-agent shape in miniature: the harness was
+        // started from a directory that holds everything, this turn's
+        // attachment root included.
+        ctx.cwd = scratch.to_string_lossy().into_owned();
+        let ctx = Arc::new(ctx);
+        let (result_tx, mut result_rx) = mpsc::unbounded_channel();
+
+        let author = Keys::generate();
+        let event = EventBuilder::new(Kind::Custom(9), "send me that file")
+            .sign_with_keys(&author)
+            .unwrap();
+        run_prompt_task(
+            agent,
+            Some(FlushBatch {
+                channel_id,
+                scope: SessionScope::Conversation { channel_id },
+                events: vec![crate::queue::BatchEvent {
+                    event,
+                    prompt_tag: "test".into(),
+                    received_at: std::time::Instant::now(),
+                }],
+                cancelled_events: vec![],
+                cancel_reason: None,
+            }),
+            None,
+            Arc::clone(&ctx),
+            result_tx.clone(),
+            None,
+            "turn-1".into(),
+        )
+        .await;
+        let result = result_rx.recv().await.expect("prompt result");
+        let mut agent = result.agent;
+
+        let requests = wait_for_requests(&seen, "the refusal notice", |seen| {
+            kind9_posts(seen)
+                .iter()
+                .any(|e| e["content"].as_str().unwrap_or("").contains("refused"))
+        })
+        .await;
+        let notice = kind9_posts(&requests)
+            .into_iter()
+            .find(|e| e["content"].as_str().unwrap_or("").contains("refused"))
+            .unwrap();
+        let text = notice["content"].as_str().unwrap().to_string();
+        assert!(text.contains("reply.txt refused"), "{text}");
+        assert!(
+            text.contains("the working directory is not a publishable root"),
+            "{text}"
+        );
+        assert!(
+            !text.contains(&scratch.display().to_string()),
+            "the notice names the class of refusal, not the host path: {text}"
+        );
+        assert!(
+            !requests.iter().any(|r| r.body == b"under the harness cwd"),
+            "the file under the harness cwd never reached the wire"
+        );
+
+        agent.acp.shutdown().await;
+        let _ = std::fs::remove_dir_all(&scratch);
+    }
+
+    /// S1 from the third confirmation pass. The storage checks run again at
+    /// publish time, and their reason is wrapped straight into the reply's
+    /// failure notice, which every member of the channel reads. In production
+    /// the attachment root is `<host temp dir>/buzz-acp/<agent pubkey
+    /// prefix>/attachments`, and the engine can make this fire on demand by
+    /// replacing the root or `.outbound` with a link, so the notice must
+    /// carry the class and not the path.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_storage_refusal_notice_carries_the_class_and_not_the_host_path() {
+        let (base, seen) = media_relay_server(b"unused".to_vec(), "unused".into(), None).await;
+        let scratch = std::env::temp_dir().join(format!("buzz-acp-pool-store-{}", Uuid::new_v4()));
+        let elsewhere = scratch.join("elsewhere");
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        // The root the harness was given is a link to a directory it does not
+        // own the name of: `create_dir_all` walks through it, and
+        // `check_private_dir` is the thing that refuses it.
+        let attachment_root = scratch.join("attachments");
+        std::os::unix::fs::symlink(&elsewhere, &attachment_root).unwrap();
+        let reply_file = scratch.join("reply.txt");
+        std::fs::write(&reply_file, b"under the harness cwd").unwrap();
+        let reply_text = format!("here\\nMEDIA:{}", reply_file.display());
+        let script = format!(
+            r#"count=0
+while IFS= read -r line; do
+  count=$((count + 1))
+  printf '%s\n' '{{"jsonrpc":"2.0","method":"session/update","params":{{"sessionId":"live-session","update":{{"sessionUpdate":"agent_message_chunk","content":{{"type":"text","text":"{reply_text}"}}}}}}}}'
+  printf '%s\n' "{{\"jsonrpc\":\"2.0\",\"id\":$((count - 1)),\"result\":{{\"stopReason\":\"end_turn\"}}}}"
+done"#
+        );
+        let acp = AcpClient::spawn("bash", &["-c".to_string(), script], &[], false)
+            .await
+            .expect("spawn storage-refusal ACP script");
+        let channel_id = Uuid::new_v4();
+        let mut agent = OwnedAgent {
+            index: 0,
+            acp,
+            state: SessionState::default(),
+            model_capabilities: None,
+            desired_model: None,
+            model_overridden: false,
+            desired_model_request_id: None,
+            desired_model_pending_ack: false,
+            startup_effort: None,
+            agent_name: "storage-test-agent".into(),
+            goose_system_prompt_supported: None,
+            protocol_version: 1,
+        };
+        agent
+            .state
+            .sessions
+            .insert(conv(channel_id), "live-session".into());
+        agent
+            .state
+            .deliveries
+            .insert(conv(channel_id), ChannelDeliveryState::default());
+
+        let mut ctx = make_prompt_context_no_owner();
+        ctx.rest_client.base_url = base.clone();
+        ctx.attachment_dir = Ok(attachment_root.clone());
+        ctx.cwd = scratch.to_string_lossy().into_owned();
+        let ctx = Arc::new(ctx);
+        let (result_tx, mut result_rx) = mpsc::unbounded_channel();
+
+        let author = Keys::generate();
+        let event = EventBuilder::new(Kind::Custom(9), "send me that file")
+            .sign_with_keys(&author)
+            .unwrap();
+        run_prompt_task(
+            agent,
+            Some(FlushBatch {
+                channel_id,
+                scope: SessionScope::Conversation { channel_id },
+                events: vec![crate::queue::BatchEvent {
+                    event,
+                    prompt_tag: "test".into(),
+                    received_at: std::time::Instant::now(),
+                }],
+                cancelled_events: vec![],
+                cancel_reason: None,
+            }),
+            None,
+            Arc::clone(&ctx),
+            result_tx.clone(),
+            None,
+            "turn-1".into(),
+        )
+        .await;
+        let result = result_rx.recv().await.expect("prompt result");
+        let mut agent = result.agent;
+
+        let requests = wait_for_requests(&seen, "the storage refusal notice", |seen| {
+            kind9_posts(seen).iter().any(|e| {
+                e["content"]
+                    .as_str()
+                    .unwrap_or("")
+                    .contains("attachment storage unavailable")
+            })
+        })
+        .await;
+        let notice = kind9_posts(&requests)
+            .into_iter()
+            .find(|e| {
+                e["content"]
+                    .as_str()
+                    .unwrap_or("")
+                    .contains("attachment storage unavailable")
+            })
+            .unwrap();
+        let text = notice["content"].as_str().unwrap().to_string();
+        assert!(text.contains("symlink"), "{text}");
+        assert!(
+            !text.contains(&scratch.display().to_string())
+                && !text.contains(&elsewhere.display().to_string()),
+            "the notice names the class of failure, not the host path: {text}"
+        );
+        assert!(
+            !requests.iter().any(|r| r.body == b"under the harness cwd"),
+            "nothing was published"
+        );
+
+        agent.acp.shutdown().await;
+        let _ = std::fs::remove_dir_all(&scratch);
+    }
+
+    /// S5 from the confirmation pass: on a steer the live message must get
+    /// the attachment budget before the blobs of the turn it superseded.
+    /// Swapping the two chains in `batch_attachment_events` makes the
+    /// cancelled event's attachment the one that is stored and the live one
+    /// the one refused, which is exactly what this asserts against.
+    #[tokio::test]
+    async fn live_events_take_the_attachment_budget_before_cancelled_ones() {
+        let base = "http://127.0.0.1:1".to_string();
+        let author = Keys::generate();
+        let imeta_event = |name: &str, sha_seed: char| {
+            let sha: String = std::iter::repeat_n(sha_seed, 64).collect();
+            let imeta = Tag::parse([
+                "imeta",
+                &format!("url {base}/media/{sha}.bin"),
+                "m audio/mpeg",
+                &format!("x {sha}"),
+                "size 1024",
+                &format!("filename {name}"),
+            ])
+            .unwrap();
+            EventBuilder::new(Kind::Custom(9), name)
+                .tags([imeta])
+                .sign_with_keys(&author)
+                .unwrap()
+        };
+        let batch_event = |event: nostr::Event| crate::queue::BatchEvent {
+            event,
+            prompt_tag: "test".into(),
+            received_at: std::time::Instant::now(),
+        };
+        // Four live attachments fill the per-turn budget; the cancelled
+        // turn's blob is the one that must be turned away.
+        let live: Vec<nostr::Event> = ('a'..='d')
+            .map(|c| imeta_event(&format!("live-{c}.mp3"), c))
+            .collect();
+        let stale = imeta_event("stale.mp3", 'e');
+        let channel_id = Uuid::new_v4();
+        let batch = FlushBatch {
+            channel_id,
+            scope: SessionScope::Conversation { channel_id },
+            events: live.iter().cloned().map(batch_event).collect(),
+            cancelled_events: vec![batch_event(stale.clone())],
+            cancel_reason: Some(crate::queue::CancelReason::Steer),
+        };
+
+        let ordered = batch_attachment_events(&batch);
+        assert_eq!(
+            ordered.last().map(|e| e.id),
+            Some(stale.id),
+            "the cancelled turn's events come last"
+        );
+
+        let rest = crate::relay::RestClient {
+            http: reqwest::Client::new(),
+            base_url: base.clone(),
+            keys: Keys::generate(),
+            auth_tag_json: None,
+        };
+        let root = std::env::temp_dir().join(format!("buzz-acp-budget-{}", Uuid::new_v4()));
+        let turn_dir = crate::attachments::prepare_turn_dir(
+            &root,
+            "turn-1",
+            &crate::attachments::LiveTurnDirs::default(),
+        )
+        .unwrap();
+        let inbound = crate::attachments::collect_inbound_attachments(
+            &rest,
+            &ordered,
+            &turn_dir,
+            None,
+            tokio::time::Instant::now() + Duration::from_secs(10),
+        )
+        .await;
+
+        let over_budget: Vec<&str> = inbound
+            .outcomes
+            .iter()
+            .filter_map(|o| match o {
+                crate::attachments::AttachmentOutcome::Rejected { event_id, reason }
+                    if reason.contains("attachment limit") =>
+                {
+                    Some(event_id.as_str())
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            over_budget,
+            vec![stale.id.to_hex().as_str()],
+            "only the superseded turn's attachment is over budget: {:?}",
+            inbound.outcomes
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     #[tokio::test]
     async fn merged_cancel_prompt_commits_and_deduplicates_all_rendered_event_ids() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -8970,6 +10411,11 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
             memory_enabled: false,
             harness_name: "goose".to_string(),
             relay_url: "ws://127.0.0.1:3000".to_string(),
+            attachment_dir: Ok(std::env::temp_dir().join("buzz-acp-test-attachments")),
+            publish_slots: Arc::new(tokio::sync::Semaphore::new(4)),
+            live_turn_dirs: crate::attachments::LiveTurnDirs::default(),
+            audio_support: crate::blossom::AudioSupportCache::default(),
+            ffmpeg: None,
         }
     }
 

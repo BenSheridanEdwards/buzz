@@ -1,9 +1,13 @@
 #![deny(unsafe_code)]
 
 mod acp;
+mod attachments;
+mod blossom;
 mod config;
 mod engram_fetch;
+mod ffmpeg;
 mod filter;
+mod media_publish;
 mod observer;
 mod pi_launcher;
 mod pool;
@@ -2802,7 +2806,53 @@ async fn tokio_main() -> Result<()> {
         );
     }
 
+    // Attachment blobs and reply scratch files live under a private
+    // (mode 0700, owned by this process) root keyed by agent, so two harnesses
+    // never share a directory and another local user cannot plant one. A root
+    // that fails those checks is refused for the life of the process: every
+    // turn then names its attachments with that reason instead of storing
+    // them (rule 4: containment failures are errors, not warnings).
+    let attachment_base = crate::attachments::default_attachment_base();
+    let attachment_dir = crate::attachments::prepare_attachment_root(
+        &attachment_base,
+        pubkey_hex.get(..16).unwrap_or(pubkey_hex.as_str()),
+    )
+    .map_err(|e| {
+        // The reason is kept path-free because it reaches a channel: a reply
+        // that names a file gets it back as its failure notice, and the base
+        // is the host temp directory plus the agent's pubkey. The path is on
+        // the log line beside it.
+        tracing::error!(
+            target: "acp::media",
+            base = %attachment_base.display(),
+            "attachment root refused: {e}; attachments are disabled"
+        );
+        format!("attachment root refused: {e}")
+    });
+    let ffmpeg = crate::ffmpeg::find_ffmpeg();
+    tracing::info!(
+        target: "acp::media",
+        attachment_dir = %attachment_dir.as_deref().map(|p| p.display().to_string()).unwrap_or_else(|_| "disabled".into()),
+        ffmpeg = ffmpeg.as_deref().map(|p| p.display().to_string()).unwrap_or_else(|| "none".into()),
+        "attachment handling ready"
+    );
+
     let ctx = Arc::new(PromptContext {
+        attachment_dir,
+        live_turn_dirs: crate::attachments::LiveTurnDirs::default(),
+        // Two in-flight reply-media publishes per agent slot: the tasks are
+        // detached from the turn, so nothing else bounds how many pile up,
+        // and the agent slot returns as soon as the prompt does. Sizing this
+        // to the agent count alone made a second turn finishing behind a
+        // still-uploading first one wait `PUBLISH_SLOT_WAIT` and then post a
+        // failure notice for media that was fine, under ordinary load rather
+        // than under attack. The bound is what matters (rule 4), not the
+        // exact multiple.
+        publish_slots: Arc::new(tokio::sync::Semaphore::new(
+            config.agents.max(1) as usize * 2,
+        )),
+        audio_support: crate::blossom::AudioSupportCache::default(),
+        ffmpeg,
         mcp_servers: build_mcp_servers(&config),
         initial_message: config.initial_message.clone(),
         idle_timeout: Duration::from_secs(config.idle_timeout_secs),
