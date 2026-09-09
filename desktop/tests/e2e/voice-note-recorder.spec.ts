@@ -35,6 +35,14 @@ function liveStatus(page: Page): Locator {
   return page.getByTestId("voice-note-live-status");
 }
 
+/**
+ * A toast, scoped to the toaster. An unscoped `getByText` matches the same
+ * words anywhere on the page, which TESTING.md calls a strict-mode flake.
+ */
+function toastWithText(page: Page, text: string): Locator {
+  return page.locator("[data-sonner-toast]").filter({ hasText: text });
+}
+
 function activeElement(page: Page) {
   return page.evaluate(() => {
     const element = document.activeElement;
@@ -886,8 +894,9 @@ test("only one composer in the window can record", async ({ page }) => {
   await threadInput.click();
   await page.keyboard.press("Space");
   await expect(recorder(page)).toHaveCount(1);
+  // ProseMirror renders a trailing space as a non-breaking space.
   expect(await threadInput.evaluate((element) => element.textContent)).toMatch(
-    /[ {2}]/,
+    /[  ]/,
   );
   // Two composers, two live regions, but only one of them may be announcing.
   const statuses = page.getByTestId("voice-note-live-status");
@@ -912,6 +921,211 @@ test("only one composer in the window can record", async ({ page }) => {
   await expect(recorder(page)).toHaveCount(0);
 });
 
+test("re-recording while another composer holds the microphone keeps the note", async ({
+  page,
+}) => {
+  await page.addInitScript(() => {
+    window.localStorage.setItem("buzz.voiceNote.reviewBeforeSend", "on");
+  });
+  await openGeneral(page);
+  const threadId = await seedThreadRoot(page);
+
+  // A finished take waiting in the channel composer's review row.
+  await holdMic(page);
+  await page.mouse.up();
+  const composerCard = page.getByTestId("composer-voice-note-card");
+  await expect(composerCard).toBeVisible();
+  const review = page.getByTestId("voice-note-review");
+  const rerecord = review.getByRole("button", { name: "Re-record" });
+  await expect(rerecord).toBeVisible();
+
+  // The docked thread composer takes the microphone beside it.
+  await page
+    .locator(
+      `[data-testid="message-thread-summary"][data-thread-head-id="${threadId}"]`,
+    )
+    .click();
+  const threadPanel = page.getByTestId("message-thread-panel");
+  await expect(threadPanel).toBeVisible();
+  const threadMic = threadPanel.getByRole("button", {
+    name: "Record voice note",
+  });
+  await threadMic.click();
+  await expect(threadPanel.getByTestId("voice-note-recorder")).toHaveAttribute(
+    "data-voice-note-state",
+    "locked",
+  );
+
+  // Re-record has to refuse before it destroys anything: the queued file is
+  // the only copy of the audio, and the start behind it cannot succeed.
+  await rerecord.click();
+  await expect(
+    toastWithText(page, "Finish or discard the other voice note first."),
+  ).toBeVisible();
+  await expect(composerCard).toBeVisible();
+  await expect(review).toBeVisible();
+  await expect(page.getByTestId("voice-note-recorder")).toHaveCount(1);
+  await expect(sentCards(page)).toHaveCount(0);
+
+  // And it is a refusal, not a dead button: the microphone comes back.
+  await threadPanel.getByTestId("voice-note-discard").click();
+  await expect(threadPanel.getByTestId("voice-note-recorder")).toHaveCount(0);
+  await rerecord.click();
+  await expect(composerCard).toHaveCount(0);
+  await expect(recorder(page)).toHaveAttribute(
+    "data-voice-note-state",
+    "locked",
+  );
+});
+
+test("a start that never opens the microphone frees it for the next one", async ({
+  page,
+}) => {
+  // No `MediaRecorder` in this webview: `start` returns without the recorder
+  // ever leaving idle, so nothing keyed on a status change can clean up after
+  // it. Registered after the beforeEach hook, so the restored constructor is
+  // the instrumented one.
+  await page.addInitScript(() => {
+    const real = window.MediaRecorder;
+    (
+      window as Window & { MediaRecorder?: typeof MediaRecorder }
+    ).MediaRecorder = undefined;
+    (
+      window as Window & { __BUZZ_E2E_RESTORE_MEDIA_RECORDER__?: () => void }
+    ).__BUZZ_E2E_RESTORE_MEDIA_RECORDER__ = () => {
+      window.MediaRecorder = real;
+    };
+  });
+  await openGeneral(page);
+
+  const mic = page.getByRole("button", { name: "Record voice note" });
+  await mic.click();
+  await expect(
+    toastWithText(
+      page,
+      "Voice recording is not available in this environment.",
+    ),
+  ).toBeVisible();
+  await expect(recorder(page)).toHaveCount(0);
+
+  // The failed start must not still be holding the microphone: a claim with
+  // no recording behind it disables every other composer's mic for the life
+  // of the page and swallows Escape with it.
+  await page.evaluate(() =>
+    (
+      window as Window & { __BUZZ_E2E_RESTORE_MEDIA_RECORDER__?: () => void }
+    ).__BUZZ_E2E_RESTORE_MEDIA_RECORDER__?.(),
+  );
+  await mic.click();
+  await expect(recorder(page)).toHaveAttribute(
+    "data-voice-note-state",
+    "locked",
+  );
+  await expect(
+    toastWithText(page, "Finish or discard the other voice note first."),
+  ).toHaveCount(0);
+  await page.keyboard.press("Escape");
+  await expect(recorder(page)).toHaveCount(0);
+  await expect(liveStatus(page)).toHaveText("Voice note discarded");
+});
+
+test("a sibling composer's Escape cannot cancel a note that is already sending", async ({
+  page,
+}) => {
+  await page.addInitScript(() => {
+    const pendingDecodes: Array<(buffer: AudioBuffer) => void> = [];
+    let released = false;
+    const drain = () => {
+      while (released && pendingDecodes.length > 0) {
+        pendingDecodes.shift()?.({
+          duration: 1,
+          getChannelData: () => new Float32Array([0]),
+          numberOfChannels: 1,
+          sampleRate: 8_000,
+        } as AudioBuffer);
+      }
+    };
+    (
+      window as Window & {
+        __BUZZ_E2E_RESOLVE_VOICE_NOTE_DECODE__?: () => void;
+      }
+    ).__BUZZ_E2E_RESOLVE_VOICE_NOTE_DECODE__ = () => {
+      released = true;
+      drain();
+    };
+    AudioContext.prototype.decodeAudioData = () =>
+      new Promise<AudioBuffer>((resolve) => {
+        pendingDecodes.push(resolve);
+        drain();
+      });
+  });
+  await openGeneral(page);
+  const threadId = await seedThreadRoot(page);
+  await page
+    .locator(
+      `[data-testid="message-thread-summary"][data-thread-head-id="${threadId}"]`,
+    )
+    .click();
+  const threadPanel = page.getByTestId("message-thread-panel");
+  await expect(threadPanel).toBeVisible();
+
+  await page.getByRole("button", { name: "Record voice note" }).first().click();
+  const row = recorder(page);
+  await expect(row).toHaveAttribute("data-voice-note-state", "locked");
+  await page.waitForTimeout(150);
+  await page.getByTestId("send-voice-note").click();
+  await expect(row).toHaveAttribute("data-voice-note-state", "processing");
+
+  // The sibling route past ProseMirror is the registry, so it has to carry
+  // the same refusal the composer's own Escape does: a note the user has
+  // committed to is not cancellable by an ambient key in another composer.
+  await threadPanel.getByTestId("message-input").click();
+  await page.keyboard.press("Escape");
+  await expect(row).toHaveAttribute("data-voice-note-state", "processing");
+  await expect(liveStatus(page).first()).toHaveText("Preparing voice note");
+  await expect(threadPanel).toBeVisible();
+
+  await page.evaluate(() =>
+    (
+      window as Window & {
+        __BUZZ_E2E_RESOLVE_VOICE_NOTE_DECODE__?: () => void;
+      }
+    ).__BUZZ_E2E_RESOLVE_VOICE_NOTE_DECODE__?.(),
+  );
+  await expectSent(page);
+});
+
+test("Escape from a recorder control closes the mention list before it discards", async ({
+  page,
+}) => {
+  await openGeneral(page);
+  await startHandsFree(page);
+  const input = page.getByTestId("message-input");
+  await input.click();
+  await input.pressSequentially("@al");
+  const mentions = page.getByTestId("mention-autocomplete");
+  await expect(mentions).toBeVisible();
+
+  // Same key, different focus (rule 8). The row's controls are reachable by
+  // Tab from the editor, and the row claims Escape in the window capture
+  // phase, ahead of every editor handler that would have closed the list.
+  await recorder(page).getByTestId("voice-note-pause-resume").focus();
+  const stopsBefore = await mediaRecorderStops(page);
+  await page.keyboard.press("Escape");
+  await expect(mentions).toHaveCount(0);
+  await expect(recorder(page)).toHaveAttribute(
+    "data-voice-note-state",
+    "locked",
+  );
+  expect(await mediaRecorderStops(page)).toBe(stopsBefore);
+  await expect(liveStatus(page)).not.toHaveText("Voice note discarded");
+
+  // With the list gone the same press discards, exactly as from the editor.
+  await page.keyboard.press("Escape");
+  await expect(recorder(page)).toHaveCount(0);
+  await expect(liveStatus(page)).toHaveText("Voice note discarded");
+});
+
 test("losing the composer to navigation says the recording is gone", async ({
   page,
 }) => {
@@ -934,7 +1148,7 @@ test("losing the composer to navigation says the recording is gone", async ({
   await expect.poll(() => mediaRecorderStops(page)).toBe(stopsBefore + 1);
   // A toast, not the live region: the live region left with the composer.
   await expect(
-    page.getByText("Voice note discarded when the composer closed."),
+    toastWithText(page, "Voice note discarded when the composer closed."),
   ).toBeVisible();
   await expect(sentCards(page)).toHaveCount(0);
 });

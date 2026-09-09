@@ -77,6 +77,7 @@ function isEditableTarget(target: EventTarget | null): boolean {
 }
 
 export function useComposerVoiceNote({
+  dismissAutocomplete,
   draftKey,
   editTargetId,
   focusEditor,
@@ -85,6 +86,13 @@ export function useComposerVoiceNote({
   setFormattingOpen,
   submit,
 }: {
+  /**
+   * Closes any open composer autocomplete list, reporting whether one was
+   * open. The row's Escape runs in the window capture phase, ahead of the
+   * editor handlers that would otherwise close the list, so it has to be able
+   * to do it itself when focus is on a recorder control.
+   */
+  dismissAutocomplete: () => boolean;
   draftKey: string | null | undefined;
   editTargetId: string | null;
   /** Put the caret back in the editor (keyboard starts and row unmounts). */
@@ -107,6 +115,8 @@ export function useComposerVoiceNote({
   const otherComposerIsRecording =
     recordingOwner !== null && recordingOwner !== composerId;
   const releaseRecordingRef = React.useRef<(() => void) | null>(null);
+  const dismissAutocompleteRef = React.useRef(dismissAutocomplete);
+  dismissAutocompleteRef.current = dismissAutocomplete;
   const reviewEnabled = useVoiceNoteReviewEnabled();
   const reviewEnabledRef = React.useRef(reviewEnabled);
   reviewEnabledRef.current = reviewEnabled;
@@ -171,15 +181,23 @@ export function useComposerVoiceNote({
   discardRef.current = discard;
 
   /**
-   * Escape's discard. Once Send has been pressed the note is on its way out,
-   * and an ambient key must not cancel an upload the user just committed to:
-   * the row says "Preparing voice note" and finishes. The trash keeps working
-   * throughout, because pressing it is a deliberate "throw this away" and it
-   * is the only way back once the encode has started.
+   * Escape's discard, and the callback the recording claim carries. Reports
+   * whether it actually discarded, so a caller can let the key fall through
+   * to whatever is behind it instead of swallowing it on a refusal.
+   *
+   * It declines twice over. Once Send has been pressed the note is on its way
+   * out, and an ambient key must not cancel an upload the user just committed
+   * to: the row says "Preparing voice note" and finishes. The trash keeps
+   * working throughout, because pressing it is a deliberate "throw this away"
+   * and it is the only way back once the encode has started. And an idle
+   * recorder has nothing to discard: if a claim ever outlives its recording,
+   * saying "handled" here would kill Escape for the whole window.
    */
-  const requestDiscard = React.useCallback(() => {
-    if (outcomeRef.current === "finished") return;
+  const requestDiscard = React.useCallback((): boolean => {
+    if (statusRef.current === "idle") return false;
+    if (outcomeRef.current === "finished") return false;
     discard();
+    return true;
   }, [discard]);
   const requestDiscardRef = React.useRef(requestDiscard);
   requestDiscardRef.current = requestDiscard;
@@ -240,6 +258,17 @@ export function useComposerVoiceNote({
   }, [send, recorder.elapsedSeconds, recorder.status]);
 
   /**
+   * The microphone half of the rule: only one composer in the window may hold
+   * it. Separate from the attachment half because re-recording asks only this
+   * one — it is replacing the attachment it already has.
+   */
+  const acceptsRecordingClaim = React.useCallback(() => {
+    if (getVoiceNoteRecordingOwner() === null) return true;
+    toast.error("Finish or discard the other voice note first.");
+    return false;
+  }, []);
+
+  /**
    * A voice note must be the only attachment, and only one composer in the
    * window may hold the microphone.
    */
@@ -250,29 +279,41 @@ export function useComposerVoiceNote({
   }, []);
 
   const acceptsStart = React.useCallback(() => {
+    if (!acceptsRecordingClaim()) return false;
     if (canStart()) return true;
-    toast.error(
-      getVoiceNoteRecordingOwner() !== null
-        ? "Finish or discard the other voice note first."
-        : "A voice note must be the only attachment.",
-    );
+    toast.error("A voice note must be the only attachment.");
     return false;
-  }, [canStart]);
+  }, [acceptsRecordingClaim, canStart]);
 
   const beginRecording = React.useCallback(
     ({ locked }: { locked: boolean }) => {
       // Claim before the microphone opens: a second composer that gets here
       // in the same tick is refused rather than opening a rival recorder.
+      // The claim carries `requestDiscard`, not the raw discard, so a sibling
+      // composer's Escape obeys the same rules as this composer's own.
       releaseRecordingRef.current?.();
-      releaseRecordingRef.current = claimVoiceNoteRecording(composerId, () =>
-        discardRef.current(),
+      const release = claimVoiceNoteRecording(composerId, () =>
+        requestDiscardRef.current(),
       );
-      if (releaseRecordingRef.current === null) return;
+      releaseRecordingRef.current = release;
+      if (release === null) return;
       recordingContextRef.current = currentContextRef.current;
       outcomeRef.current = null;
       onBeforeStartRef.current();
       lockedRef.current = locked;
-      void startRef.current();
+      void startRef.current().then((started) => {
+        // A start that never leaves idle (no MediaRecorder in this webview, a
+        // denied microphone, a cancel that lands first) changes no status, so
+        // the release effect below never runs. Without this the claim is held
+        // by a composer that is not recording, for the life of the page: every
+        // other microphone stays disabled and Escape is swallowed window-wide.
+        // Token-guarded, so a newer claim is never the one released here.
+        if (started || statusRef.current !== "idle") return;
+        release();
+        if (releaseRecordingRef.current === release) {
+          releaseRecordingRef.current = null;
+        }
+      });
       if (locked) recorder.lock();
     },
     [composerId, recorder.lock],
@@ -480,8 +521,20 @@ export function useComposerVoiceNote({
       if (event.key !== "Escape" || event.defaultPrevented) return;
       if (!surface.isTopmost()) return;
       if (rowOwnsTarget(event.target) !== insideRow) return;
+      // An open autocomplete owns Escape wherever focus is. From the editor
+      // the list's own handler closes it and the recorder declines; from a
+      // focused recorder control this pass runs before every other handler,
+      // so it has to close the list itself rather than discard the recording
+      // out from under a key the user aimed at the list (rule 8).
+      if (dismissAutocompleteRef.current()) {
+        event.preventDefault();
+        return;
+      }
+      // Only claim the key if the recording actually took it: a note that is
+      // already encoding declines, and Escape then belongs to whatever is
+      // behind the composer, as it would with no recorder on screen at all.
+      if (!requestDiscardRef.current()) return;
       event.preventDefault();
-      requestDiscardRef.current();
     };
     const onCapture = (event: KeyboardEvent) => handle(event, true);
     const onBubble = (event: KeyboardEvent) => handle(event, false);
@@ -647,6 +700,12 @@ export function useComposerVoiceNote({
 
   const rerecord = React.useCallback(() => {
     if (statusRef.current !== "idle") return;
+    // Refuse before destroying anything. The queued note is the only copy of
+    // the audio, and `beginRecording` bails the moment the claim is refused,
+    // so removing it first and asking afterwards deletes the take and starts
+    // nothing. The toast is the whole feedback the user gets here: the review
+    // row has no other way to say why the button did nothing.
+    if (!acceptsRecordingClaim()) return;
     const attachments = getAttachmentsRef.current();
     for (const attachment of attachments.queued) {
       if (isVoiceNoteFile(attachment.file)) {
@@ -664,7 +723,12 @@ export function useComposerVoiceNote({
       }
     }
     beginRecording({ locked: true });
-  }, [beginRecording, media.removeAttachment, media.removeQueuedAttachment]);
+  }, [
+    acceptsRecordingClaim,
+    beginRecording,
+    media.removeAttachment,
+    media.removeQueuedAttachment,
+  ]);
 
   const submitReview = React.useCallback(() => submitRef.current(), []);
 

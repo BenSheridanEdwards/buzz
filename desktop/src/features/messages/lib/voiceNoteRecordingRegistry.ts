@@ -12,11 +12,21 @@
  * Shaped like `escapeSurfaces`: module state, because the composers are
  * siblings with no common owner, and community switching remounts the tree
  * rather than reloading the page. The claim is released by the holder's own
- * cleanup (idle, discard, unmount), and a stale release cannot clear a newer
- * holder's claim.
+ * cleanup (idle, discard, failed start, unmount), and a stale release cannot
+ * clear a newer holder's claim.
+ *
+ * Scope: one webview, deliberately. Module state dies with the realm, so the
+ * claim cannot outlive the composers it describes — the symptoms it exists to
+ * prevent (two rows on one screen, two live regions announcing into one
+ * screen-reader context, one Escape key that can only reach one of them) are
+ * all properties of a single document. The huddle companion window is a
+ * second webview on `index.html` with its own registry, so it can record
+ * alongside the main window; see the PR discussion for why a process-wide
+ * claim is a separate change rather than a bigger constant here.
  */
 type RecordingClaim = {
-  discard: () => void;
+  /** Discards the live recording, reporting whether it actually did. */
+  discard: () => boolean;
   owner: string;
   token: number;
 };
@@ -48,7 +58,7 @@ export function getVoiceNoteRecordingOwner(): string | null {
  */
 export function claimVoiceNoteRecording(
   owner: string,
-  discard: () => void,
+  discard: () => boolean,
 ): (() => void) | null {
   if (claim !== null && claim.owner !== owner) return null;
   const token = nextToken;
@@ -65,12 +75,16 @@ export function claimVoiceNoteRecording(
 }
 
 /**
- * Discards the live recording wherever it is, and reports whether there was
- * one. Lets a sibling composer's Escape reach a recorder it does not own.
+ * Discards the live recording wherever it is, and reports whether it actually
+ * went. Lets a sibling composer's Escape reach a recorder it does not own.
+ *
+ * The holder answers, not the registry: a note that is already encoding
+ * declines (an ambient key must not cancel a send the user committed to), and
+ * a claim with nothing behind it declines too. A caller that treats the mere
+ * existence of a claim as "handled" swallows Escape for the whole window.
  */
 export function discardActiveVoiceNoteRecording(): boolean {
   const active = claim;
   if (!active) return false;
-  active.discard();
-  return true;
+  return active.discard();
 }

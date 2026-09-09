@@ -87,12 +87,19 @@ export function useVoiceNoteRecorder() {
     }
   }, []);
 
-  const start = React.useCallback(async () => {
-    if (status !== "idle" || sessionRef.current) return;
+  /**
+   * Opens the microphone. Resolves true only once the recorder is running:
+   * every bail (no media APIs, a denied or failed `getUserMedia`, a cancel
+   * that lands first) resolves false, so a caller holding a resource on the
+   * recording's behalf knows to let it go. The status alone cannot say —
+   * these paths never leave `idle`, so nothing keyed on a status change runs.
+   */
+  const start = React.useCallback(async (): Promise<boolean> => {
+    if (status !== "idle" || sessionRef.current) return false;
     setError(null);
     if (!navigator.mediaDevices?.getUserMedia || !window.MediaRecorder) {
       setError("Voice recording is not available in this environment.");
-      return;
+      return false;
     }
 
     const session: RecordingSession = {
@@ -125,7 +132,7 @@ export function useVoiceNoteRecorder() {
         sessionRef.current !== session
       ) {
         releaseSessionAudio(session);
-        return;
+        return false;
       }
 
       const mimeType = supportedMimeType();
@@ -231,6 +238,7 @@ export function useVoiceNoteRecorder() {
         setLevels((previous) => [...previous, level]);
         setElapsedSeconds(sessionElapsedSeconds(session, performance.now()));
       }, 90);
+      return true;
     } catch (cause) {
       releaseSessionAudio(session);
       if (
@@ -238,7 +246,7 @@ export function useVoiceNoteRecorder() {
         !mountedRef.current ||
         sessionRef.current !== session
       ) {
-        return;
+        return false;
       }
       sessionRef.current = null;
       setStatus("idle");
@@ -251,6 +259,7 @@ export function useVoiceNoteRecorder() {
           ? "Allow Buzz to access your microphone to record a voice note."
           : "Buzz could not start the voice recorder.",
       );
+      return false;
     }
   }, [status]);
 

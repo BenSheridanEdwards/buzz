@@ -170,7 +170,32 @@ function MessageComposerImpl({
     () => voiceNoteFocusEditorRef.current(),
     [],
   );
+  // Escape belongs to an open autocomplete list wherever focus is. From the
+  // editor each list closes itself and the recorder declines; from a focused
+  // recorder control the row's capture-phase handler is the first listener in
+  // the window, so it closes the lists through this instead.
+  const dismissAutocomplete = React.useCallback(() => {
+    if (
+      !mentions.isMentionOpen &&
+      !channelLinks.isChannelOpen &&
+      !emojiAutocomplete.isEmojiAutocompleteOpen
+    ) {
+      return false;
+    }
+    mentions.cancelMentionAutocomplete();
+    channelLinks.clearChannels();
+    emojiAutocomplete.clearEmojis();
+    return true;
+  }, [
+    channelLinks.clearChannels,
+    channelLinks.isChannelOpen,
+    emojiAutocomplete.clearEmojis,
+    emojiAutocomplete.isEmojiAutocompleteOpen,
+    mentions.cancelMentionAutocomplete,
+    mentions.isMentionOpen,
+  ]);
   const voiceNote = useComposerVoiceNote({
+    dismissAutocomplete,
     draftKey: effectiveDraftKey,
     editTargetId: editTarget?.id ?? null,
     focusEditor: focusEditorForVoiceNote,
