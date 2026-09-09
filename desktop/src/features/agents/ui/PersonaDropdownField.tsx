@@ -40,6 +40,13 @@ export function PersonaDropdownField({
    * a value another surface owns: a `disabled` button is skipped by the tab
    * order and its `aria-describedby` is never announced.
    *
+   * Focusable means the tab order, not the mouse. Radix cancels its own
+   * pointerdown on the trigger whenever the menu is closed
+   * (`react-dropdown-menu`: `if (!context.open) event.preventDefault()`), which
+   * for an inert pin is every click, so clicking never lands focus here. Tab
+   * focus is what carries the announcement and it is unaffected; a sighted
+   * mouse user has the same explanation rendered beneath the field.
+   *
    * Inert here means inert on every modality, not just the keyboard: see the
    * `onOpenChange` guard below.
    */
@@ -64,10 +71,10 @@ export function PersonaDropdownField({
           // toggled on pointerdown by the time click fires.
           //
           // Closing is never blocked, so a menu opened before the field turned
-          // inert stays dismissable. The menu's items only exist while it is
-          // open, so this is also the only way a pick can reach
-          // `onValueChange`: no second guard is needed there, and one that
-          // could never fire would be unfalsifiable (AGENTS.md rule 3).
+          // inert stays dismissable (AGENTS.md rule 6). That leaves the items
+          // of an already-open menu alive after `isInert` flips, so this is
+          // not the only route to `onValueChange`: the pick handler below
+          // carries its own guard for exactly that window.
           if (next && isInert) return;
           setOpen(next);
         }}
@@ -114,8 +121,14 @@ export function PersonaDropdownField({
           >
             <DropdownMenuRadioGroup
               onValueChange={(nextValue) => {
-                onValueChange(nextValue);
                 setOpen(false);
+                // The field can turn inert while this menu is open: on an
+                // instance form the pin becomes inherited the moment the
+                // persona query settles, and the open guard above
+                // deliberately leaves the open menu alone. Dismissing still
+                // works; the write does not.
+                if (isInert) return;
+                onValueChange(nextValue);
               }}
               value={value}
             >

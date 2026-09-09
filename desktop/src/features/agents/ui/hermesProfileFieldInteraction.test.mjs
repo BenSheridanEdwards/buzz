@@ -5,8 +5,10 @@
  * see `aria-disabled` but cannot see whether the control is actually inert:
  * markup has no pointer and no keyboard. These tests mount the production
  * component in JSDOM and drive the real Radix trigger on every modality that
- * can open it (pointerdown, ArrowDown, Enter and Space), plus the item click
- * and the "Edit definition" escape hatch.
+ * can open it (pointerdown, ArrowDown, Enter and Space), plus the item click,
+ * the "Edit definition" escape hatch, and the one sequence that reaches the
+ * pick handler with the pin inherited: a menu opened before the field turned
+ * inert.
  *
  * Every negative assertion is paired with a positive control on the same
  * component without the inherited pin, so "the menu did not open" can never
@@ -57,12 +59,6 @@ before(async () => {
     addEventListener() {},
     removeEventListener() {},
   });
-  // JSDOM has no PointerEvent. Radix's trigger opens on pointerdown and reads
-  // `event.button`/`event.ctrlKey`, which a bare `Event` does not carry, so
-  // without this the pointer path would look inert for the wrong reason and
-  // the negative assertions below would be vacuous.
-  dom.window.PointerEvent = dom.window.MouseEvent;
-  globalThis.PointerEvent = dom.window.MouseEvent;
   dom.window.HTMLElement.prototype.hasPointerCapture = () => false;
   dom.window.HTMLElement.prototype.setPointerCapture = () => {};
   dom.window.HTMLElement.prototype.releasePointerCapture = () => {};
@@ -103,20 +99,28 @@ const sky = {
 /** Mount the production field; returns its trigger and the picks it reported. */
 async function mountField(overrides = {}) {
   const picks = [];
+  const props = {
+    disabled: false,
+    envVars: { HERMES_HOME: bond.path },
+    onProfileChange: (profile) => picks.push(profile),
+    profiles: [bond, sky],
+    status: "ready",
+    ...overrides,
+  };
+  let view;
   await act(async () => {
-    render(
-      React.createElement(HermesProfileField, {
-        disabled: false,
-        envVars: { HERMES_HOME: bond.path },
-        onProfileChange: (profile) => picks.push(profile),
-        profiles: [bond, sky],
-        status: "ready",
-        ...overrides,
-      }),
-    );
+    view = render(React.createElement(HermesProfileField, props));
   });
   return {
     picks,
+    /** Change props on the mounted field, without remounting it. */
+    rerender: async (next) => {
+      await act(async () => {
+        view.rerender(
+          React.createElement(HermesProfileField, { ...props, ...next }),
+        );
+      });
+    },
     trigger: dom.window.document.getElementById(
       overrides.id ?? "persona-hermes-profile",
     ),
@@ -180,6 +184,38 @@ describe("HermesProfileField inherited pin, driven", () => {
       assert.equal(menuItems().length, 3, `${name} rendered the wrong menu`);
     });
   }
+
+  it("refuses a pick when the pin turns inherited under an open menu", async () => {
+    // The open guard blocks the transition, not the events, and deliberately
+    // leaves an already-open menu dismissable (rule 6). Its items therefore
+    // outlive the flip to inert, and the flip is real: on an instance form
+    // `inherited` is empty while the persona query is cold, so the field
+    // renders interactive, and the pin lands inherited when the query settles.
+    const { picks, rerender, trigger } = await mountField({
+      inherited: { isInherited: false, path: "" },
+    });
+    await act(async () => {
+      fireEvent.pointerDown(trigger);
+    });
+    assert.equal(isOpen(trigger), true, "the harness failed to open the menu");
+    assert.equal(menuItems().length, 3, "the harness opened the wrong menu");
+
+    await rerender({ inherited: inheritedPin });
+    assert.equal(trigger.getAttribute("aria-disabled"), "true");
+    assert.equal(
+      menuItems().length,
+      3,
+      "the open menu must survive the flip, or the pick below proves nothing",
+    );
+
+    await act(async () => {
+      fireEvent.click(
+        menuItems().find((item) => item.textContent?.includes("Sky")),
+      );
+    });
+    assert.deepEqual(picks, [], "a pick wrote an override to an inherited pin");
+    assert.equal(isOpen(trigger), false, "the pick must still close the menu");
+  });
 
   it("reaches the definition through Edit definition", async () => {
     // Markup can show the button exists; only a click shows it is wired.
