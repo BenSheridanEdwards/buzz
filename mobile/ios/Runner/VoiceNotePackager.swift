@@ -217,6 +217,8 @@ enum VoiceNotePackager {
         let sourceAsset = AVURLAsset(url: sourceURL)
         let videoAsset = AVURLAsset(url: videoURL)
         let composition = AVMutableComposition()
+        let sourcePriming: CMTime
+        let sourcePlayable: CMTime
         do {
             guard
                 let sourceAudio = sourceAsset.tracks(withMediaType: .audio).first,
@@ -236,6 +238,8 @@ enum VoiceNotePackager {
                     userInfo: [NSLocalizedDescriptionKey: "Unable to assemble the voice note envelope."]
                 )
             }
+            sourcePriming = sourceAudio.segments.first?.timeMapping.source.start ?? .zero
+            sourcePlayable = sourceAudio.timeRange.duration
             let sourceVideoRange = sourceVideo.timeRange
             try destinationVideo.insertTimeRange(sourceVideoRange, of: sourceVideo, at: .zero)
             destinationVideo.scaleTimeRange(
@@ -277,7 +281,14 @@ enum VoiceNotePackager {
         exportSession.shouldOptimizeForNetworkUse = true
         exportSession.metadata = []
         exportSession.metadataItemFilter = nil
-        runExport(exportSession, outputURL: outputURL, videoURL: videoURL, result: result)
+        runExport(
+            exportSession,
+            outputURL: outputURL,
+            videoURL: videoURL,
+            mediaTime: sourcePriming,
+            segmentDuration: sourcePlayable,
+            result: result
+        )
     }
 
     /// Exports the recording as bare AAC audio for relays that accept `audio/mp4`.
@@ -299,6 +310,8 @@ enum VoiceNotePackager {
         let readerOutput: AVAssetReaderTrackOutput
         let writer: AVAssetWriter
         let writerInput: AVAssetWriterInput
+        let sourcePriming: CMTime
+        let sourcePlayable: CMTime
         do {
             guard let sourceAudio = sourceAsset.tracks(withMediaType: .audio).first else {
                 throw NSError(
@@ -307,6 +320,11 @@ enum VoiceNotePackager {
                     userInfo: [NSLocalizedDescriptionKey: "Unable to assemble the voice note audio."]
                 )
             }
+            // The recorder's AAC priming, which CoreAudio records only in
+            // `iTunSMPB` and the passthrough writer drops: kept here so the
+            // finished file's edit list can be restored from it.
+            sourcePriming = sourceAudio.segments.first?.timeMapping.source.start ?? .zero
+            sourcePlayable = sourceAudio.timeRange.duration
             let formatHint = sourceAudio.formatDescriptions.first.map { $0 as! CMFormatDescription }
             reader = try AVAssetReader(asset: sourceAsset)
             readerOutput = AVAssetReaderTrackOutput(track: sourceAudio, outputSettings: nil)
@@ -410,7 +428,14 @@ enum VoiceNotePackager {
                             }
                             completion.exportDidFinish(
                                 succeeded: true,
-                                deliver: { deliverCanonicalized(outputURL: outputURL, result: result) }
+                                deliver: {
+                                    deliverCanonicalized(
+                                        outputURL: outputURL,
+                                        mediaTime: sourcePriming,
+                                        segmentDuration: sourcePlayable,
+                                        result: result
+                                    )
+                                }
                             )
                         }
                     }
@@ -426,10 +451,25 @@ enum VoiceNotePackager {
         }
     }
 
-    /// Neutralizes `sdtp` in a finished export and hands its path to Flutter.
-    private static func deliverCanonicalized(outputURL: URL, result: @escaping FlutterResult) {
+    /// Neutralizes `sdtp` in a finished export, restores the edit list the
+    /// writer flattened, and hands the path to Flutter.
+    ///
+    /// [mediaTime] and [segmentDuration] come from the source track's mapping;
+    /// see `MP4Canonicalizer.restoreAudioEditListPriming` for when they are
+    /// applied and when the file is left alone.
+    private static func deliverCanonicalized(
+        outputURL: URL,
+        mediaTime: CMTime,
+        segmentDuration: CMTime,
+        result: @escaping FlutterResult
+    ) {
         do {
             try MP4Canonicalizer.neutralizeSampleDependencyBoxes(at: outputURL)
+            try MP4Canonicalizer.restoreAudioEditListPriming(
+                at: outputURL,
+                mediaTime: mediaTime,
+                segmentDuration: segmentDuration
+            )
             result(outputURL.path)
         } catch {
             try? FileManager.default.removeItem(at: outputURL)
@@ -449,6 +489,8 @@ enum VoiceNotePackager {
         _ exportSession: AVAssetExportSession,
         outputURL: URL,
         videoURL: URL?,
+        mediaTime: CMTime,
+        segmentDuration: CMTime,
         result: @escaping FlutterResult
     ) {
         let completionQueue = DispatchQueue(label: "xyz.block.buzz.voice-note-export")
@@ -477,7 +519,12 @@ enum VoiceNotePackager {
                     deliver: {
                         switch exportSession.status {
                         case .completed:
-                            deliverCanonicalized(outputURL: outputURL, result: result)
+                            deliverCanonicalized(
+                                outputURL: outputURL,
+                                mediaTime: mediaTime,
+                                segmentDuration: segmentDuration,
+                                result: result
+                            )
                         default:
                             result(
                                 FlutterError(
