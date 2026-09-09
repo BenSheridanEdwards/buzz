@@ -1,7 +1,8 @@
-import 'dart:convert';
-
 import 'package:hooks_riverpod/hooks_riverpod.dart';
 import 'package:http/http.dart' as http;
+
+import '../relay/relay_info_document.dart';
+import '../relay/relay_info_uri.dart';
 
 /// Supplies the HTTP client used for NIP-11 community icon lookups.
 ///
@@ -20,40 +21,16 @@ final communityIconHttpClientProvider = Provider<http.Client>((ref) {
 /// metadata updates can be retried without background polling.
 final communityIconProvider = FutureProvider.autoDispose
     .family<String?, String>((ref, relayUrl) async {
-      final uri = _relayInfoUri(relayUrl);
+      final uri = relayInfoUri(relayUrl);
       if (uri == null) return null;
 
-      try {
-        final response = await ref
-            .read(communityIconHttpClientProvider)
-            .get(uri, headers: const {'Accept': 'application/nostr+json'})
-            .timeout(const Duration(seconds: 5));
-        if (response.statusCode < 200 || response.statusCode >= 300) {
-          return null;
-        }
+      final document = await readRelayInfoDocument(
+        ref.read(communityIconHttpClientProvider),
+        uri,
+      );
+      if (document == null) return null;
 
-        final document = jsonDecode(response.body);
-        if (document is! Map<String, dynamic>) return null;
-
-        final icon = document['icon'];
-        if (icon is! String || icon.trim().isEmpty) return null;
-        return icon.trim();
-      } catch (_) {
-        return null;
-      }
+      final icon = document['icon'];
+      if (icon is! String || icon.trim().isEmpty) return null;
+      return icon.trim();
     });
-
-Uri? _relayInfoUri(String relayUrl) {
-  try {
-    final uri = Uri.parse(relayUrl.trim());
-    final scheme = switch (uri.scheme) {
-      'wss' => 'https',
-      'ws' => 'http',
-      'https' || 'http' => uri.scheme,
-      _ => null,
-    };
-    return scheme == null ? null : uri.replace(scheme: scheme);
-  } on FormatException {
-    return null;
-  }
-}

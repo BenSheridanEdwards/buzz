@@ -1,0 +1,158 @@
+{
+ "artboards": [
+  {
+   "file": "ReceivedIdle.dc.html",
+   "x": 0,
+   "y": 0,
+   "w": 390,
+   "h": 844,
+   "title": "1 \u00b7 Idle: mic in the composer"
+  },
+  {
+   "file": "ComposerTyping.dc.html",
+   "x": 480,
+   "y": 0,
+   "w": 390,
+   "h": 844,
+   "title": "2 \u00b7 Typing: mic becomes send"
+  },
+  {
+   "file": "RecordingHold.dc.html",
+   "x": 960,
+   "y": 0,
+   "w": 390,
+   "h": 844,
+   "title": "3 \u00b7 Hold to record"
+  },
+  {
+   "file": "RecordingLocked.dc.html",
+   "x": 1440,
+   "y": 0,
+   "w": 390,
+   "h": 844,
+   "title": "4 \u00b7 Locked, hands free"
+  },
+  {
+   "file": "Preview.dc.html",
+   "x": 1920,
+   "y": 0,
+   "w": 390,
+   "h": 844,
+   "title": "5 \u00b7 Review before sending"
+  },
+  {
+   "file": "Main.dc.html",
+   "x": 2400,
+   "y": 0,
+   "w": 390,
+   "h": 844,
+   "title": "6 \u00b7 Received from Neo, transcript open"
+  },
+  {
+   "file": "ReceivedCollapsed.dc.html",
+   "x": 2880,
+   "y": 0,
+   "w": 390,
+   "h": 844,
+   "title": "6b \u00b7 Transcript hidden"
+  },
+  {
+   "file": "DesktopComposer.dc.html",
+   "x": 0,
+   "y": 1180,
+   "w": 900,
+   "h": 640,
+   "title": "Desktop composer states"
+  },
+  {
+   "file": "DesktopReceived.dc.html",
+   "x": 980,
+   "y": 1180,
+   "w": 900,
+   "h": 420,
+   "title": "Desktop: received voice note"
+  }
+ ],
+ "annotations": [
+  {
+   "id": "row-1",
+   "x": 0,
+   "y": -230,
+   "w": 900,
+   "text": "ROW 1 \u00b7 THE MOBILE FLOW, left to right. One recording, from idle to Neo's reply."
+  },
+  {
+   "id": "flow-1",
+   "x": 0,
+   "y": -150,
+   "w": 390,
+   "text": "Idle. Mic lives at the right of the composer, 44px target. Plus for attachments on the left."
+  },
+  {
+   "id": "flow-2",
+   "x": 480,
+   "y": -150,
+   "w": 390,
+   "text": "Type one character and the mic swaps to send. Delete the text and the mic comes back. Same slot, no layout jump."
+  },
+  {
+   "id": "flow-3",
+   "x": 960,
+   "y": -170,
+   "w": 390,
+   "text": "Hold the mic. Red dot, timer, live waveform. Slide left to cancel, slide up into the lock chip to go hands free. Release sends."
+  },
+  {
+   "id": "flow-4",
+   "x": 1440,
+   "y": -170,
+   "w": 390,
+   "text": "Locked. Thumb is free. Trash discards, pause holds the clip, Send is full width. Max 5:00."
+  },
+  {
+   "id": "flow-5",
+   "x": 1920,
+   "y": -150,
+   "w": 390,
+   "text": "Optional review step (a setting, off by default): listen back, re-record, or send."
+  },
+  {
+   "id": "flow-6",
+   "x": 2400,
+   "y": -170,
+   "w": 390,
+   "text": "Received. Neo's MP3 as a voice note: play, waveform fills as it plays, time, speed pill, transcript folded under."
+  },
+  {
+   "id": "row-3",
+   "x": 0,
+   "y": 970,
+   "w": 1350,
+   "text": "ROW 3 \u00b7 DESKTOP. Buzz's existing recorder row plus the lock (hold L or click the chip). Received card adds title, time left and transcript."
+  },
+  {
+   "id": "desk-1",
+   "x": 0,
+   "y": 1050,
+   "w": 900,
+   "text": "Four composer states stacked for comparison; only one shows at a time."
+  },
+  {
+   "id": "desk-2",
+   "x": 980,
+   "y": 1050,
+   "w": 900,
+   "text": "Buzz's attachment card with its audio player, plus title, remaining time and the transcript row. Download stays."
+  },
+  {
+   "id": "flow-6b",
+   "x": 2880,
+   "y": -170,
+   "w": 390,
+   "text": "Direction A chosen. Transcript row is a toggle: tap the header to fold it away. Buzz remembers the choice per device; folded is the default in channels, open in DMs."
+  }
+ ],
+ "launch": {
+  "view": "canvas"
+ }
+}

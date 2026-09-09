@@ -863,6 +863,15 @@ impl Config {
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(100 * 1024 * 1024),
+            max_audio_bytes: std::env::var("BUZZ_MAX_AUDIO_BYTES")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(25 * 1024 * 1024),
+            // Real audio attachments (MP3 / M4A). Off by default until the
+            // operator opts in; advertised as the `buzz-audio` NIP-11 extension.
+            audio_uploads_enabled: std::env::var("BUZZ_MEDIA_AUDIO_UPLOADS")
+                .map(|v| v == "true" || v == "1")
+                .unwrap_or(false),
             public_base_url: std::env::var("BUZZ_MEDIA_BASE_URL")
                 .unwrap_or_else(|_| "http://localhost:3000/media".to_string()),
             // Per-upload-event records (`_uploads/` moderation side channel).

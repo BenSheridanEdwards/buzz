@@ -655,9 +655,21 @@ pub async fn cmd_send_message(
             .upload_file(file_path)
             .await
             .map_err(|e| CliError::Other(format!("upload failed for {file_path}: {e}")))?;
-        media_tags.push(crate::client::build_imeta_tag(&desc));
+        let filename = std::path::Path::new(file_path)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .map(crate::client::sanitize_filename);
+        media_tags.push(crate::client::build_imeta_tag(&desc, filename.as_deref()));
         if desc.mime_type.starts_with("video/") {
             media_content.push_str("\n![video](");
+        } else if desc.mime_type.starts_with("audio/") {
+            // Audio renders from the imeta tag; the body carries a plain link
+            // labelled with the filename so text-only clients still show it.
+            media_content.push_str("\n[");
+            media_content.push_str(&crate::client::escape_markdown_label(
+                filename.as_deref().unwrap_or("audio"),
+            ));
+            media_content.push_str("](");
         } else {
             media_content.push_str("\n![image](");
         }

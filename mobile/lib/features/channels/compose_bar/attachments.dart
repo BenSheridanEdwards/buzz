@@ -75,6 +75,7 @@ enum _AttachmentSurface { closed, menu, camera, photos }
 const _attachmentMenuWidth = 216.0;
 const _attachmentMenuPadding = Grid.xs;
 const _attachmentMenuItemHeight = 52.0;
+const _attachmentMenuItemCount = 4;
 const _attachmentMenuItemSpacing = Grid.xxs;
 const _attachmentMenuIconSize = 24.0;
 const _attachmentMenuIconSlotWidth = 28.0;
@@ -106,8 +107,8 @@ class _AttachmentMenuLayout {
     textPainter.dispose();
     final contentHeight =
         (_attachmentMenuPadding * 2) +
-        (itemHeight * 5) +
-        (_attachmentMenuItemSpacing * 4);
+        (itemHeight * _attachmentMenuItemCount) +
+        (_attachmentMenuItemSpacing * (_attachmentMenuItemCount - 1));
 
     return _AttachmentMenuLayout(
       itemHeight: itemHeight,
@@ -126,7 +127,6 @@ class _AttachmentSurfacePanel extends HookWidget {
   final VoidCallback onCamera;
   final VoidCallback onPhotos;
   final VoidCallback onVideo;
-  final VoidCallback onVoiceNote;
   final VoidCallback onFiles;
   final Future<void> Function(XFile image) onCapture;
   final Future<List<XFile>> Function() onPickAllPhotos;
@@ -141,7 +141,6 @@ class _AttachmentSurfacePanel extends HookWidget {
     required this.onCamera,
     required this.onPhotos,
     required this.onVideo,
-    required this.onVoiceNote,
     required this.onFiles,
     required this.onCapture,
     required this.onPickAllPhotos,
@@ -290,7 +289,6 @@ class _AttachmentSurfacePanel extends HookWidget {
                           onCamera: onCamera,
                           onPhotos: onPhotos,
                           onVideo: onVideo,
-                          onVoiceNote: onVoiceNote,
                           onFiles: onFiles,
                         ),
                       ),
@@ -416,29 +414,42 @@ Future<void> _retainAndQueueImages(
   }
 }
 
+/// Uploads one queued attachment.
+///
+/// [relayAudioSupport] is the relay's NIP-11 `buzz-audio` verdict. The caller
+/// only starts that read when the queue holds a voice note, so an image, video
+/// or file send never touches the network for it and this parameter is null;
+/// the await here is reached only on the voice-note arm. (A queued voice note
+/// is exclusive, see `_rejectsNonVoiceAttachment`, so no send mixes the two.)
+/// [onRelayAudioRejected] fires when the relay refuses the bare audio despite
+/// that verdict, before the note is resent as the envelope.
 Future<BlobDescriptor> _uploadPendingAttachment(
   MediaUploadService service,
   _PendingAttachment attachment, {
+  Future<bool>? relayAudioSupport,
+  VoidCallback? onRelayAudioRejected,
   ValueChanged<double>? onProgress,
   UploadCancellationToken? cancellationToken,
-}) => switch (attachment.kind) {
-  _PendingAttachmentKind.image => service.uploadImage(
+}) async => switch (attachment.kind) {
+  _PendingAttachmentKind.image => await service.uploadImage(
     attachment.file,
     onProgress: onProgress,
     cancellationToken: cancellationToken,
   ),
-  _PendingAttachmentKind.video => service.uploadVideo(
+  _PendingAttachmentKind.video => await service.uploadVideo(
     attachment.file,
     onProgress: onProgress,
     cancellationToken: cancellationToken,
   ),
-  _PendingAttachmentKind.voiceNote => service.uploadVoiceNote(
+  _PendingAttachmentKind.voiceNote => await service.uploadVoiceNote(
     attachment.file,
     duration: attachment.duration ?? Duration.zero,
+    relayAcceptsAudio: (await relayAudioSupport) ?? false,
+    onAudioRejected: onRelayAudioRejected,
     onProgress: onProgress,
     cancellationToken: cancellationToken,
   ),
-  _PendingAttachmentKind.file => service.uploadFile(
+  _PendingAttachmentKind.file => await service.uploadFile(
     attachment.file,
     onProgress: onProgress,
     cancellationToken: cancellationToken,
@@ -525,7 +536,6 @@ class _AttachmentMenu extends StatelessWidget {
   final VoidCallback onCamera;
   final VoidCallback onPhotos;
   final VoidCallback onVideo;
-  final VoidCallback onVoiceNote;
   final VoidCallback onFiles;
 
   const _AttachmentMenu({
@@ -533,7 +543,6 @@ class _AttachmentMenu extends StatelessWidget {
     required this.onCamera,
     required this.onPhotos,
     required this.onVideo,
-    required this.onVoiceNote,
     required this.onFiles,
   });
 
@@ -543,7 +552,6 @@ class _AttachmentMenu extends StatelessWidget {
       (LucideIcons.camera, 'Camera', onCamera),
       (LucideIcons.images, 'Photos', onPhotos),
       (LucideIcons.video, 'Video', onVideo),
-      (LucideIcons.mic, 'Voice note', onVoiceNote),
       (LucideIcons.file, 'Files', onFiles),
     ];
     return SizedBox(

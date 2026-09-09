@@ -221,12 +221,13 @@ pub fn validate_file_content(
 /// Whether a stored blob should be served inline (rendered in the client) or as
 /// an attachment (forced download).
 ///
-/// Images and video are previewed inline by the renderer; everything else is a
-/// generic file card with a download action, so it serves as an attachment.
+/// Images, video and audio are previewed inline by the renderer; everything
+/// else is a generic file card with a download action, so it serves as an
+/// attachment.
 /// PDF is intentionally *not* inline yet — inline PDF preview is a planned
 /// fast-follow; until the renderer handles it, force download like any other file.
 pub fn serve_inline(mime: &str) -> bool {
-    mime.starts_with("image/") || mime.starts_with("video/")
+    mime.starts_with("image/") || mime.starts_with("video/") || mime.starts_with("audio/")
 }
 
 /// Metadata extracted from a validated MP4 file.
@@ -299,6 +300,33 @@ pub fn validate_content(bytes: &[u8], config: &MediaConfig) -> Result<String, Me
 ///
 /// Returns [`VideoMeta`] on success.
 pub fn validate_video_file(path: &Path, config: &MediaConfig) -> Result<VideoMeta, MediaError> {
+    let parsed = parse_mp4_file(path, config.max_video_bytes, MediaError::InvalidVideo)?;
+    inspect_video_tracks(&parsed)
+}
+
+/// An ISO-BMFF file that passed the structural checks and parsed cleanly.
+///
+/// Produced once per upload so the video and audio-only track inspections
+/// share a single parse instead of each re-opening and re-walking the file.
+pub(crate) struct ParsedMp4 {
+    /// The parsed `moov` tree.
+    pub(crate) mp4: mp4::Mp4Reader<BufReader<std::fs::File>>,
+    /// File size in bytes.
+    pub(crate) size: u64,
+}
+
+/// Open an ISO-BMFF file, enforce `max_bytes`, run the structural checks
+/// (`moov` before `mdat`, metadata-free box tree, not a QuickTime `qt  `
+/// brand) and parse the header.
+///
+/// `invalid` is the error reported when the mp4 crate cannot parse the file,
+/// so the video path reports [`MediaError::InvalidVideo`] and the audio path
+/// [`MediaError::InvalidAudio`].
+pub(crate) fn parse_mp4_file(
+    path: &Path,
+    max_bytes: u64,
+    invalid: MediaError,
+) -> Result<ParsedMp4, MediaError> {
     // --- moov-before-mdat check (raw byte scan) ---
     // We scan the top-level atom sequence before handing off to the mp4 crate,
     // because the mp4 crate parses the whole file regardless of atom order.
@@ -311,17 +339,17 @@ pub fn validate_video_file(path: &Path, config: &MediaConfig) -> Result<VideoMet
         .len();
 
     // Size guard (belt-and-suspenders — the streaming layer also enforces this).
-    if size > config.max_video_bytes {
+    if size > max_bytes {
         return Err(MediaError::FileTooLarge {
             size,
-            max: config.max_video_bytes,
+            max: max_bytes,
         });
     }
 
     validate_mp4_metadata_free(path)?;
 
     let reader = BufReader::new(file);
-    let mp4 = mp4::Mp4Reader::read_header(reader, size).map_err(|_| MediaError::InvalidVideo)?;
+    let mp4 = mp4::Mp4Reader::read_header(reader, size).map_err(|_| invalid)?;
 
     // --- Container check ---
     // QuickTime (MOV) uses brand "qt  ". We reject it — only ISO-base MP4.
@@ -332,11 +360,40 @@ pub fn validate_video_file(path: &Path, config: &MediaConfig) -> Result<VideoMet
         return Err(MediaError::UnsupportedContainer);
     }
 
-    // --- Track inspection ---
+    Ok(ParsedMp4 { mp4, size })
+}
+
+/// Duration of a track in seconds, from its `mdhd` `duration` and `timescale`.
+///
+/// `mp4::Mp4Track::duration` multiplies `duration * 1_000_000` in unchecked
+/// `u64`, so a version-1 `mdhd` with a large duration wraps in release builds
+/// (a 2^58-tick track reads as one second) and panics in debug builds. This
+/// computes in `u128` and reports `None` for a zero timescale or a microsecond
+/// count that does not fit `u64`; callers map that to their container's
+/// invalid-data error so the file is rejected rather than admitted with a
+/// duration the sidecar cannot vouch for.
+pub(crate) fn track_duration_secs(track: &mp4::Mp4Track) -> Option<f64> {
+    let mdhd = &track.trak.mdia.mdhd;
+    if mdhd.timescale == 0 {
+        return None;
+    }
+    let micros = u128::from(mdhd.duration)
+        .checked_mul(1_000_000)?
+        .checked_div(u128::from(mdhd.timescale))?;
+    let micros = u64::try_from(micros).ok()?;
+    Some(std::time::Duration::from_micros(micros).as_secs_f64())
+}
+
+/// Walk the tracks of a parsed MP4 and apply the video constraints.
+///
+/// An audio-only file fails with `DisallowedContentType("audio/mp4")`, which
+/// the audio path (`crate::audio::validate_iso_bmff_file`) turns into an M4A
+/// inspection of the same parse when audio uploads are enabled.
+pub(crate) fn inspect_video_tracks(parsed: &ParsedMp4) -> Result<VideoMeta, MediaError> {
     let mut video_meta: Option<VideoMeta> = None;
     let mut has_audio = false;
 
-    for track in mp4.tracks().values() {
+    for track in parsed.mp4.tracks().values() {
         match track.track_type().map_err(|_| MediaError::InvalidVideo)? {
             mp4::TrackType::Video => {
                 if video_meta.is_some() {
@@ -353,16 +410,11 @@ pub fn validate_video_file(path: &Path, config: &MediaConfig) -> Result<VideoMet
                     return Err(MediaError::WrongCodec);
                 }
 
-                // Duration from mvhd timescale (track duration / timescale).
-                // Reject zero/negative (malformed) and >600s (too long).
+                // Duration from the track's mdhd (duration / timescale), with
+                // checked arithmetic: a zero timescale or an overflowing
+                // product is malformed. Reject zero/negative and >600s.
                 // Must match imeta validation which requires duration > 0.0.
-                // Guard: timescale=0 causes division-by-zero in the mp4 crate's
-                // duration() method. Fail fast before it panics.
-                if track.timescale() == 0 {
-                    return Err(MediaError::InvalidVideo);
-                }
-                let duration_ms = track.duration().as_millis();
-                let duration_secs = duration_ms as f64 / 1000.0;
+                let duration_secs = track_duration_secs(track).ok_or(MediaError::InvalidVideo)?;
                 if duration_secs <= 0.0 {
                     return Err(MediaError::InvalidVideo);
                 }
@@ -954,6 +1006,101 @@ pub fn mime_to_ext(mime: &str) -> &'static str {
     }
 }
 
+/// Fixture surgery shared by the video and audio validator tests: rewrite the
+/// first `moov/trak/mdia/mdhd` box of an MP4 so a test can pin what the
+/// duration helper does with a version-1 header, a huge duration, or a zero
+/// timescale without committing a binary fixture per case.
+#[cfg(test)]
+pub(crate) mod mp4_test_support {
+    /// Find the first box named `fourcc` among the siblings in `bytes[start..end]`.
+    /// Returns `(box_start, box_end)`. Only 32-bit box sizes are handled, which
+    /// is all the fixtures use.
+    fn find_box(
+        bytes: &[u8],
+        start: usize,
+        end: usize,
+        fourcc: &[u8; 4],
+    ) -> Option<(usize, usize)> {
+        let mut offset = start;
+        while offset + 8 <= end {
+            let size = u32::from_be_bytes(bytes[offset..offset + 4].try_into().ok()?) as usize;
+            if size < 8 {
+                return None;
+            }
+            if &bytes[offset + 4..offset + 8] == fourcc {
+                return Some((offset, offset + size));
+            }
+            offset += size;
+        }
+        None
+    }
+
+    fn bump_size(bytes: &mut [u8], box_start: usize, delta: isize) {
+        let size = u32::from_be_bytes(
+            bytes[box_start..box_start + 4]
+                .try_into()
+                .expect("box size bytes"),
+        ) as isize;
+        let new_size = u32::try_from(size + delta).expect("box size fits u32");
+        bytes[box_start..box_start + 4].copy_from_slice(&new_size.to_be_bytes());
+    }
+
+    /// Replace the payload of the first `moov/trak/mdia/mdhd` box with
+    /// `rewrite(old_payload)`, fixing every ancestor's size.
+    pub(crate) fn rewrite_first_mdhd(
+        bytes: &[u8],
+        rewrite: impl FnOnce(&[u8]) -> Vec<u8>,
+    ) -> Vec<u8> {
+        let (moov_start, moov_end) = find_box(bytes, 0, bytes.len(), b"moov").expect("moov box");
+        let (trak_start, trak_end) =
+            find_box(bytes, moov_start + 8, moov_end, b"trak").expect("trak box");
+        let (mdia_start, mdia_end) =
+            find_box(bytes, trak_start + 8, trak_end, b"mdia").expect("mdia box");
+        let (mdhd_start, mdhd_end) =
+            find_box(bytes, mdia_start + 8, mdia_end, b"mdhd").expect("mdhd box");
+
+        let new_payload = rewrite(&bytes[mdhd_start + 8..mdhd_end]);
+        let delta = new_payload.len() as isize - (mdhd_end - mdhd_start - 8) as isize;
+        let mut out = bytes.to_vec();
+        out.splice(mdhd_start + 8..mdhd_end, new_payload);
+        for start in [moov_start, trak_start, mdia_start, mdhd_start] {
+            bump_size(&mut out, start, delta);
+        }
+        out
+    }
+
+    /// Timescale field of a version-0 or version-1 `mdhd` payload.
+    pub(crate) fn mdhd_timescale(payload: &[u8]) -> u32 {
+        let at = if payload[0] == 1 { 20 } else { 12 };
+        u32::from_be_bytes(payload[at..at + 4].try_into().expect("timescale bytes"))
+    }
+
+    /// A version-0 `mdhd` payload (32-bit duration) with zero timestamps and
+    /// the undetermined language.
+    pub(crate) fn mdhd_v0(timescale: u32, duration: u32) -> Vec<u8> {
+        let mut b = vec![0u8; 4];
+        b.extend_from_slice(&0u32.to_be_bytes());
+        b.extend_from_slice(&0u32.to_be_bytes());
+        b.extend_from_slice(&timescale.to_be_bytes());
+        b.extend_from_slice(&duration.to_be_bytes());
+        b.extend_from_slice(&0u16.to_be_bytes());
+        b.extend_from_slice(&0u16.to_be_bytes());
+        b
+    }
+
+    /// A version-1 `mdhd` payload (64-bit timestamps and duration).
+    pub(crate) fn mdhd_v1(timescale: u32, duration: u64) -> Vec<u8> {
+        let mut b = vec![1u8, 0, 0, 0];
+        b.extend_from_slice(&0u64.to_be_bytes());
+        b.extend_from_slice(&0u64.to_be_bytes());
+        b.extend_from_slice(&timescale.to_be_bytes());
+        b.extend_from_slice(&duration.to_be_bytes());
+        b.extend_from_slice(&0u16.to_be_bytes());
+        b.extend_from_slice(&0u16.to_be_bytes());
+        b
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -970,6 +1117,8 @@ mod tests {
             max_gif_bytes: 10 * 1024 * 1024,
             max_video_bytes: 524_288_000,
             max_file_bytes: 104_857_600,
+            max_audio_bytes: 26_214_400,
+            audio_uploads_enabled: false,
             public_base_url: String::new(),
             upload_records_enabled: false,
             upload_ip_header: None,
@@ -2537,6 +2686,42 @@ mod tests {
         );
     }
 
+    /// A version-1 `mdhd` carries a 64-bit duration. `mp4::Mp4Track::duration`
+    /// computes `duration * 1_000_000` unchecked, so 2^58 + timescale wraps
+    /// to exactly one second in release builds (admitting a file that
+    /// declares 6.5e12 seconds) and panics in debug builds. The shared helper
+    /// must reject it as too long, and a sane version-1 header must still be
+    /// measured correctly so the rejection is about the value, not the version.
+    #[test]
+    fn test_validate_video_version1_mdhd_uses_checked_duration() {
+        use super::mp4_test_support::{mdhd_v1, rewrite_first_mdhd};
+        let config = test_config();
+        let base = build_minimal_mp4_moov_first();
+
+        let sane = rewrite_first_mdhd(&base, |_| mdhd_v1(1000, 1_000));
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(tmp.path(), &sane).unwrap();
+        let meta = validate_video_file(tmp.path(), &config).expect("sane version-1 mdhd");
+        assert!((meta.duration_secs - 1.0).abs() < 1e-9, "{meta:?}");
+
+        let huge = rewrite_first_mdhd(&base, |_| mdhd_v1(44_100, (1u64 << 58) + 44_100));
+        std::fs::write(tmp.path(), &huge).unwrap();
+        let result = validate_video_file(tmp.path(), &config);
+        assert!(
+            matches!(result, Err(MediaError::DurationTooLong)),
+            "expected DurationTooLong, got {result:?}"
+        );
+
+        // Microseconds beyond u64 are an overflow, not a duration.
+        let overflow = rewrite_first_mdhd(&base, |_| mdhd_v1(1, u64::MAX));
+        std::fs::write(tmp.path(), &overflow).unwrap();
+        let result = validate_video_file(tmp.path(), &config);
+        assert!(
+            matches!(result, Err(MediaError::InvalidVideo)),
+            "expected InvalidVideo, got {result:?}"
+        );
+    }
+
     #[test]
     fn test_validate_video_zero_duration_rejected() {
         let config = test_config();
@@ -2721,7 +2906,9 @@ mod tests {
         assert!(!serve_inline("application/pdf"));
         assert!(!serve_inline("application/zip"));
         assert!(!serve_inline("application/octet-stream"));
-        assert!(!serve_inline("audio/mpeg"));
+        // Audio renders inline as a voice note / audio card.
+        assert!(serve_inline("audio/mpeg"));
+        assert!(serve_inline("audio/mp4"));
         assert!(!serve_inline("text/plain"));
     }
 }

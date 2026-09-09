@@ -2,7 +2,8 @@
 //!
 //! Routes:
 //!   PUT  /upload                — BUD-02 exact-byte upload (auth required)
-//!   PUT  /media/upload          — temporary media-only legacy alias
+//!   PUT  /media/upload          — temporary media-only legacy alias (images,
+//!                                  video, and audio when audio uploads are on)
 //!   GET  /media/{sha256_ext}    — BUD-01 serve blob
 //!   HEAD /media/{sha256_ext}    — BUD-01 existence check
 
@@ -50,6 +51,63 @@ enum UploadRouteMode {
 fn should_stream_as_video(sniff: &[u8]) -> bool {
     infer::get(sniff).is_some_and(|kind| kind.mime_type() == "video/mp4")
         || buzz_media::looks_like_iso_bmff(sniff)
+}
+
+/// Pipeline a buffered (non-streaming) upload body is dispatched to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BufferedUploadKind {
+    /// Sniffed raster image: thumbnailing pipeline.
+    Image,
+    /// Sniffed MPEG audio with audio uploads enabled: audio validator.
+    Audio,
+    /// Not previewable media on the media-only legacy alias: rejected.
+    LegacyRejected,
+    /// Anything else on `/upload`: exact-byte generic attachment.
+    GenericFile,
+}
+
+/// Decide the buffered-path pipeline for a fully buffered body.
+///
+/// Images go first. Audio takes its own validated path only when the
+/// operator has enabled it, on both `/upload` and the legacy `/media/upload`
+/// alias (audio is media). With audio disabled, an MP3 falls through to the
+/// generic path, which rejects recognised audio exactly as before the
+/// feature existed. Anything the audio sniff does not claim, such as text
+/// whose leading bytes merely look like one frame header, keeps its old
+/// route regardless of the flag.
+fn classify_buffered_upload(
+    bytes: &[u8],
+    audio_uploads_enabled: bool,
+    route_mode: UploadRouteMode,
+) -> BufferedUploadKind {
+    let sniffed = infer::get(bytes).map(|t| t.mime_type());
+    if matches!(
+        sniffed,
+        Some("image/jpeg" | "image/png" | "image/gif" | "image/webp")
+    ) {
+        return BufferedUploadKind::Image;
+    }
+    if audio_uploads_enabled && buzz_media::sniff_audio_mime(bytes).is_some() {
+        return BufferedUploadKind::Audio;
+    }
+    if route_mode == UploadRouteMode::LegacyMedia {
+        BufferedUploadKind::LegacyRejected
+    } else {
+        BufferedUploadKind::GenericFile
+    }
+}
+
+/// Largest body the buffered path will hold in memory: the larger of the
+/// image and generic-file caps, widened to the audio cap only when audio
+/// uploads are enabled. With audio off, `BUZZ_MAX_AUDIO_BYTES` must not let
+/// larger generic bodies be buffered just to be rejected.
+fn buffered_upload_cap(media: &buzz_media::MediaConfig) -> u64 {
+    let base = media.max_image_bytes.max(media.max_file_bytes);
+    if media.audio_uploads_enabled {
+        base.max(media.max_audio_bytes)
+    } else {
+        base
+    }
 }
 
 fn upload_route_mode(path: &str) -> Result<UploadRouteMode, MediaError> {
@@ -376,51 +434,62 @@ pub async fn upload_blob(
                 )
                 .await?
             } else {
-                // Non-video path: buffer the body (bounded by the larger of the image
-                // and generic-file caps), then decide image-vs-generic by sniffed MIME.
-                // Images go through the thumbnailing pipeline; non-media attachments
-                // (docs, archives, text, data) take the generic file path and are
-                // served as downloads. Recognized audio/video cannot fall through it.
-                let max = state
-                    .config
-                    .media
-                    .max_image_bytes
-                    .max(state.config.media.max_file_bytes);
+                // Non-video path: buffer the body (see `buffered_upload_cap`), then
+                // dispatch by sniffed MIME (see `classify_buffered_upload`). Images
+                // go through the thumbnailing pipeline; audio through its validator
+                // when enabled; non-media attachments (docs, archives, text, data)
+                // take the generic file path and are served as downloads.
+                // Recognized audio/video cannot fall through it.
+                let max = buffered_upload_cap(&state.config.media);
                 let bytes =
                     axum::body::to_bytes(axum::body::Body::from_stream(replay), max as usize)
                         .await
                         .map_err(|_| MediaError::FileTooLarge { size: 0, max })?;
 
-                let is_image = matches!(
-                    infer::get(&bytes).map(|t| t.mime_type()),
-                    Some("image/jpeg" | "image/png" | "image/gif" | "image/webp")
-                );
-
-                if is_image {
-                    buzz_media::process_upload(
-                        &state.media_storage,
-                        &state.config.media,
-                        &auth.tenant,
-                        &auth.auth_event,
-                        bytes,
-                        attribution,
-                    )
-                    .await?
-                } else if auth.route_mode == UploadRouteMode::LegacyMedia {
-                    let mime = infer::get(&bytes)
-                        .map(|kind| kind.mime_type().to_string())
-                        .unwrap_or_else(|| "application/octet-stream".to_string());
-                    return Err(MediaError::DisallowedContentType(mime));
-                } else {
-                    buzz_media::process_file_upload(
-                        &state.media_storage,
-                        &state.config.media,
-                        &auth.tenant,
-                        &auth.auth_event,
-                        bytes,
-                        attribution,
-                    )
-                    .await?
+                match classify_buffered_upload(
+                    &bytes,
+                    state.config.media.audio_uploads_enabled,
+                    auth.route_mode,
+                ) {
+                    BufferedUploadKind::Image => {
+                        buzz_media::process_upload(
+                            &state.media_storage,
+                            &state.config.media,
+                            &auth.tenant,
+                            &auth.auth_event,
+                            bytes,
+                            attribution,
+                        )
+                        .await?
+                    }
+                    BufferedUploadKind::Audio => {
+                        buzz_media::process_audio_upload(
+                            &state.media_storage,
+                            &state.config.media,
+                            &auth.tenant,
+                            &auth.auth_event,
+                            bytes,
+                            attribution,
+                        )
+                        .await?
+                    }
+                    BufferedUploadKind::LegacyRejected => {
+                        let mime = infer::get(&bytes)
+                            .map(|kind| kind.mime_type().to_string())
+                            .unwrap_or_else(|| "application/octet-stream".to_string());
+                        return Err(MediaError::DisallowedContentType(mime));
+                    }
+                    BufferedUploadKind::GenericFile => {
+                        buzz_media::process_file_upload(
+                            &state.media_storage,
+                            &state.config.media,
+                            &auth.tenant,
+                            &auth.auth_event,
+                            bytes,
+                            attribution,
+                        )
+                        .await?
+                    }
                 }
             })
         })
@@ -444,9 +513,8 @@ pub async fn upload_blob(
 
     // Normalize MIME to a known set to bound label cardinality.
     let mime_label = match descriptor.mime_type.as_str() {
-        "image/jpeg" | "image/png" | "image/gif" | "image/webp" | "video/mp4" => {
-            &descriptor.mime_type
-        }
+        "image/jpeg" | "image/png" | "image/gif" | "image/webp" | "video/mp4" | "audio/mpeg"
+        | "audio/mp4" => &descriptor.mime_type,
         _ => "other",
     };
     metrics::counter!(
@@ -1121,6 +1189,89 @@ mod tests {
             upload_route_mode("/media"),
             Err(MediaError::NotFound)
         ));
+    }
+
+    /// Real MPEG-2 encoder output; `infer` does not recognise its header.
+    const CLEAN_MP3: &[u8] =
+        include_bytes!("../../../buzz-media/tests/fixtures/audio/sine-clean.mp3");
+
+    /// A UTF-16LE BOM plus text: the first four bytes parse as one MPEG frame
+    /// header, which is exactly the file the audio sniff must not claim.
+    fn utf16le_text() -> Vec<u8> {
+        let mut bytes = vec![0xFF, 0xFE];
+        for unit in "Hello world, quarterly notes".encode_utf16() {
+            bytes.extend_from_slice(&unit.to_le_bytes());
+        }
+        bytes
+    }
+
+    /// The relay-side audio gate, on and off, on both upload routes. This is
+    /// the seam `upload_blob` dispatches through; a full handler test needs
+    /// Postgres, Redis and S3, so the decision is pinned at the function that
+    /// makes it.
+    #[test]
+    fn buffered_upload_dispatch_routes_audio_only_when_enabled() {
+        assert!(infer::get(CLEAN_MP3).is_none());
+        for route in [UploadRouteMode::Upload, UploadRouteMode::LegacyMedia] {
+            assert_eq!(
+                classify_buffered_upload(CLEAN_MP3, true, route),
+                BufferedUploadKind::Audio,
+                "audio on: {route:?}"
+            );
+        }
+        // Audio off: the old behaviour, byte for byte. `/upload` hands the
+        // MP3 to the generic validator (which rejects recognised audio); the
+        // legacy alias rejects it outright.
+        assert_eq!(
+            classify_buffered_upload(CLEAN_MP3, false, UploadRouteMode::Upload),
+            BufferedUploadKind::GenericFile
+        );
+        assert_eq!(
+            classify_buffered_upload(CLEAN_MP3, false, UploadRouteMode::LegacyMedia),
+            BufferedUploadKind::LegacyRejected
+        );
+        // Images are never mistaken for audio, whatever the flag says.
+        let png = [0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
+        assert_eq!(
+            classify_buffered_upload(&png, true, UploadRouteMode::Upload),
+            BufferedUploadKind::Image
+        );
+    }
+
+    /// Regression: with audio enabled, a UTF-16LE text file (whose BOM parses
+    /// as one frame header) must keep the generic route it had before.
+    #[test]
+    fn utf16le_text_keeps_the_generic_path_with_audio_on_and_off() {
+        let text = utf16le_text();
+        for enabled in [true, false] {
+            assert_eq!(
+                classify_buffered_upload(&text, enabled, UploadRouteMode::Upload),
+                BufferedUploadKind::GenericFile,
+                "audio enabled = {enabled}"
+            );
+            assert_eq!(
+                classify_buffered_upload(&text, enabled, UploadRouteMode::LegacyMedia),
+                BufferedUploadKind::LegacyRejected,
+                "audio enabled = {enabled}"
+            );
+        }
+    }
+
+    #[test]
+    fn buffered_cap_widens_to_the_audio_cap_only_when_audio_is_enabled() {
+        let mut config = crate::config::Config::from_env()
+            .expect("default config loads")
+            .media;
+        config.max_image_bytes = 10;
+        config.max_file_bytes = 20;
+        config.max_audio_bytes = 30;
+        config.audio_uploads_enabled = false;
+        assert_eq!(buffered_upload_cap(&config), 20);
+        config.audio_uploads_enabled = true;
+        assert_eq!(buffered_upload_cap(&config), 30);
+        // A smaller audio cap never shrinks the buffer.
+        config.max_audio_bytes = 5;
+        assert_eq!(buffered_upload_cap(&config), 20);
     }
 
     #[test]

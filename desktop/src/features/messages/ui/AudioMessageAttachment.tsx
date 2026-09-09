@@ -1,5 +1,12 @@
 import * as React from "react";
-import { AlertCircle, Download, Loader2, X } from "lucide-react";
+import {
+  AlertCircle,
+  ChevronDown,
+  Download,
+  FileText,
+  Loader2,
+  X,
+} from "lucide-react";
 import { motion, useReducedMotion } from "motion/react";
 import { toast } from "sonner";
 
@@ -8,10 +15,14 @@ import {
   isVoiceNoteAttachment,
   nextVoiceNotePlaybackRate,
   resolveAudioAttachment,
+  resolveTranscriptOpen,
   summarizeWaveform,
   voiceNoteBarHeight,
+  voiceNoteTranscript,
   waveformPeaks,
+  writeTranscriptPreference,
   type AudioAttachmentImetaEntry,
+  type VoiceNoteConversationContext,
 } from "@/features/messages/lib/audioAttachment";
 import { scheduleAudioMediaLoad } from "@/features/messages/lib/audioMediaLoadScheduler";
 import { invokeTauri } from "@/shared/api/tauri";
@@ -26,6 +37,7 @@ import {
   AttachmentMedia,
   AttachmentTitle,
 } from "@/shared/ui/attachment";
+import type { VoiceNoteCardContext } from "@/shared/ui/markdown/types";
 import { useSmoothCorners } from "@/shared/ui/smoothCorners";
 import { MorphingPlayPauseIcon } from "./MorphingPlayPauseIcon";
 
@@ -41,22 +53,42 @@ function dotPeaks(count: number): number[] {
 }
 
 function playbackRateLabel(rate: number): string {
-  return `${rate === 0.5 ? ".5" : rate}×`;
+  return `${rate}×`;
 }
+
+/** Accessible name for the speed pill; "x" reads the same as the glyph. */
+function playbackRateName(rate: number): string {
+  return `${rate}x`;
+}
+
+/** Keyboard scrub steps on the playback position slider, in seconds. */
+const SCRUB_STEP_SECONDS = 1;
+const SCRUB_LARGE_STEP_SECONDS = 5;
 
 export function renderAudioMessageAttachment(
   entry: AudioAttachmentImetaEntry | undefined,
   href: string | undefined,
   label: string,
   downloadUrl?: string,
+  voiceNoteCard?: VoiceNoteCardContext,
 ) {
   const attachment = resolveAudioAttachment(entry, href, label);
-  return attachment ? (
+  if (!attachment) return null;
+  const voiceNote = isVoiceNoteAttachment(entry);
+  const transcript = voiceNoteTranscript(entry);
+  return (
     <AudioMessageAttachment
       {...attachment}
-      downloadUrl={isVoiceNoteAttachment(entry) ? undefined : downloadUrl}
+      downloadUrl={voiceNote ? undefined : downloadUrl}
+      sender={voiceNoteCard?.sender}
+      transcript={
+        transcript === undefined
+          ? undefined
+          : (voiceNoteCard?.renderTranscript?.(transcript) ?? transcript)
+      }
+      transcriptContext={voiceNoteCard?.conversation}
     />
-  ) : null;
+  );
 }
 
 function audioMimeForUrl(url: string): string {
@@ -115,6 +147,9 @@ export function AudioMessageAttachment({
   filename,
   href,
   onRemove,
+  sender,
+  transcript,
+  transcriptContext = "channel",
 }: {
   composer?: boolean;
   duration?: number;
@@ -122,9 +157,26 @@ export function AudioMessageAttachment({
   filename: string;
   href: string;
   onRemove?: () => void;
+  /** Display name of the sender, shown as the card title. */
+  sender?: string;
+  /** The attachment's transcript, already rendered; no row when absent. */
+  transcript?: React.ReactNode;
+  /** Decides the transcript default: open in DMs, folded in channels. */
+  transcriptContext?: VoiceNoteConversationContext;
 }) {
   const audioRef = React.useRef<HTMLAudioElement | null>(null);
   const playbackId = React.useId();
+  const transcriptId = React.useId();
+  const [transcriptOpen, setTranscriptOpen] = React.useState(() =>
+    resolveTranscriptOpen(transcriptContext),
+  );
+  const toggleTranscript = React.useCallback(() => {
+    // The write lives in the handler, not the updater: updaters must stay
+    // pure (StrictMode replays them).
+    const next = !transcriptOpen;
+    setTranscriptOpen(next);
+    writeTranscriptPreference(next);
+  }, [transcriptOpen]);
   const mediaRef = React.useRef<HTMLDivElement | null>(null);
   const playbackRateRef = React.useRef<HTMLButtonElement | null>(null);
   const waveformRef = React.useRef<HTMLDivElement | null>(null);
@@ -375,10 +427,58 @@ export function AudioMessageAttachment({
     }));
   }, [href]);
 
-  const timeLabel = isPlaying
-    ? formatVoiceNoteDuration(Math.max(0, duration - currentTime))
-    : formatVoiceNoteDuration(duration);
+  const timeLabel = `${formatVoiceNoteDuration(currentTime)} / ${formatVoiceNoteDuration(duration)}`;
   const nextPlaybackRate = nextVoiceNotePlaybackRate(playbackRate);
+  // A seek that lands on the last frame ends the media as surely as playing
+  // to it does, and the element fires `ended` either way. Only playback
+  // running out rewinds the head; a scrub the user aimed at the end stays
+  // there. Recorded at the seek because the `ended` event cannot tell them
+  // apart, and `paused` at that moment is a browser detail.
+  const seekedToEndRef = React.useRef(false);
+  const seekTo = React.useCallback(
+    (next: number, knownDuration: number) => {
+      const clamped = Math.max(0, Math.min(next, knownDuration));
+      if (audioRef.current && Number.isFinite(clamped)) {
+        audioRef.current.currentTime = clamped;
+      }
+      seekedToEndRef.current = knownDuration > 0 && clamped >= knownDuration;
+      setCurrentTime(clamped);
+      paintProgress(clamped, knownDuration);
+    },
+    [paintProgress],
+  );
+  const handleScrubKeyDown = React.useCallback(
+    (event: React.KeyboardEvent<HTMLInputElement>) => {
+      if (event.altKey || event.ctrlKey || event.metaKey) return;
+      const max = Number(event.currentTarget.max);
+      const current = Number(event.currentTarget.value);
+      const step = event.shiftKey
+        ? SCRUB_LARGE_STEP_SECONDS
+        : SCRUB_STEP_SECONDS;
+      let next: number | null = null;
+      switch (event.key) {
+        case "ArrowRight":
+        case "ArrowUp":
+          next = current + step;
+          break;
+        case "ArrowLeft":
+        case "ArrowDown":
+          next = current - step;
+          break;
+        case "Home":
+          next = 0;
+          break;
+        case "End":
+          next = max;
+          break;
+        default:
+          return;
+      }
+      event.preventDefault();
+      seekTo(next, max);
+    },
+    [seekTo],
+  );
 
   const waveformBars = React.useCallback(
     (active: boolean) =>
@@ -403,171 +503,231 @@ export function AudioMessageAttachment({
     [peaks, shouldReduceMotion],
   );
 
+  const speedPill = !composer ? (
+    <button
+      ref={playbackRateRef}
+      aria-label={`Playback speed ${playbackRateName(playbackRate)}; next ${playbackRateName(nextPlaybackRate)}`}
+      className="grid rounded-full bg-primary px-2.5 py-0.5 text-2xs font-semibold tabular-nums text-primary-foreground transition-transform duration-150 ease-out active:scale-95 focus-visible:outline-hidden focus-visible:ring-1 focus-visible:ring-ring focus-visible:ring-offset-1 motion-reduce:transition-none motion-reduce:active:scale-100"
+      data-testid="voice-note-playback-rate"
+      onClick={() => {
+        const next = nextVoiceNotePlaybackRate(playbackRate);
+        setPlaybackRate(next);
+        if (audioRef.current) {
+          audioRef.current.defaultPlaybackRate = next;
+          audioRef.current.playbackRate = next;
+        }
+      }}
+      type="button"
+    >
+      <span aria-hidden="true" className="invisible col-start-1 row-start-1">
+        1.5×
+      </span>
+      <span
+        className="col-start-1 row-start-1 text-center"
+        data-testid="voice-note-playback-rate-value"
+      >
+        {playbackRateLabel(playbackRate)}
+      </span>
+    </button>
+  ) : null;
+
   return (
     <Attachment
       className={cn(
-        "my-1 w-full max-w-[21rem] gap-2.5 px-2.5 py-2",
-        composer && "shadow-none",
+        "my-1 w-full gap-2 px-2.5 py-2",
+        composer ? "max-w-[21rem] shadow-none" : "max-w-[32rem]",
       )}
       data-testid={
         composer ? "composer-voice-note-card" : "audio-message-attachment"
       }
+      orientation="vertical"
       size="sm"
     >
-      <AttachmentMedia
-        ref={mediaRef}
-        className="rounded-lg bg-primary text-primary-foreground"
-        data-testid="voice-note-playback-control"
-      >
-        <button
-          aria-label={
-            playbackError
-              ? "Retry voice note"
-              : pendingPlay
-                ? "Loading voice note"
-                : isPlaying
-                  ? "Pause voice note"
-                  : "Play voice note"
-          }
-          className="flex h-full w-full items-center justify-center rounded-md focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-ring"
-          onClick={playbackError ? retryPlayback : togglePlayback}
-          type="button"
+      <div className="flex w-full min-w-0 items-center gap-2.5">
+        <AttachmentMedia
+          ref={mediaRef}
+          className="rounded-lg bg-primary text-primary-foreground"
+          data-testid="voice-note-playback-control"
         >
-          {playbackError ? (
-            <AlertCircle aria-hidden="true" />
-          ) : pendingPlay ? (
-            <Loader2 aria-hidden="true" className="animate-spin" />
-          ) : (
-            <MorphingPlayPauseIcon isPlaying={isPlaying} />
-          )}
-        </button>
-      </AttachmentMedia>
-      <AttachmentContent className="min-w-0">
-        <AttachmentTitle className="sr-only">{filename}</AttachmentTitle>
-        {playbackError ? (
-          <div className="text-xs font-medium text-destructive" role="alert">
-            Audio unavailable. Retry playback.
-          </div>
-        ) : (
-          <div
-            className="relative h-6 overflow-hidden rounded-sm focus-within:ring-2 focus-within:ring-ring focus-within:ring-offset-1"
-            data-testid="voice-note-playback-waveform"
-            data-waveform-state={
-              waveformError ? "error" : waveformReady ? "ready" : "loading"
-            }
-            ref={waveformRef}
-          >
-            {waveformError ? (
-              <span className="sr-only" role="status">
-                Waveform preview unavailable. Playback may still work.
-              </span>
-            ) : null}
-            <div className="flex h-full items-center gap-0.5">
-              {waveformBars(false)}
-            </div>
-            <div
-              aria-hidden="true"
-              className="pointer-events-none absolute inset-0 flex items-center gap-0.5 will-change-[clip-path]"
-              data-testid="voice-note-progress-waveform"
-              ref={progressWaveformRef}
-              style={{ clipPath: "inset(0 100% 0 0)" }}
-            >
-              {waveformBars(true)}
-            </div>
-            <input
-              aria-label="Voice note playback position"
-              className="absolute inset-0 h-full w-full cursor-pointer opacity-0"
-              max={Math.max(duration, 0.01)}
-              min="0"
-              onInput={(event) => {
-                const next = Number(event.currentTarget.value);
-                if (audioRef.current && Number.isFinite(next)) {
-                  audioRef.current.currentTime = next;
-                  setCurrentTime(next);
-                  paintProgress(next, Number(event.currentTarget.max));
-                }
-              }}
-              step="0.01"
-              type="range"
-              value={Math.min(currentTime, Math.max(duration, 0.01))}
-            />
-          </div>
-        )}
-      </AttachmentContent>
-      <AttachmentActions className="grid min-w-9 place-items-center">
-        <span
-          aria-hidden={!composer}
-          className={cn(
-            "pointer-events-none col-start-1 row-start-1 text-xs tabular-nums text-muted-foreground transition-[opacity,transform] duration-150 ease-out motion-reduce:transition-none",
-            !composer &&
-              "group-hover/attachment:-translate-y-0.5 group-hover/attachment:opacity-0 group-focus-within/attachment:-translate-y-0.5 group-focus-within/attachment:opacity-0",
-          )}
-        >
-          {timeLabel}
-        </span>
-        {!composer ? (
           <button
-            ref={playbackRateRef}
-            aria-label={`Playback speed ${playbackRateLabel(playbackRate)}; next ${playbackRateLabel(nextPlaybackRate)}`}
-            className="col-start-1 row-start-1 grid rounded-full bg-primary px-2.5 py-0.5 text-2xs font-semibold tabular-nums text-primary-foreground opacity-0 transition-[opacity,transform] duration-150 ease-out active:scale-95 group-hover/attachment:opacity-100 group-focus-within/attachment:opacity-100 focus-visible:opacity-100 motion-reduce:transition-none motion-reduce:active:scale-100"
-            data-testid="voice-note-playback-rate"
-            onClick={() => {
-              const next = nextVoiceNotePlaybackRate(playbackRate);
-              setPlaybackRate(next);
-              if (audioRef.current) {
-                audioRef.current.defaultPlaybackRate = next;
-                audioRef.current.playbackRate = next;
-              }
-            }}
+            aria-label={
+              playbackError
+                ? "Retry voice note"
+                : pendingPlay
+                  ? "Loading voice note"
+                  : isPlaying
+                    ? "Pause voice note"
+                    : "Play voice note"
+            }
+            className="flex h-full w-full items-center justify-center rounded-md focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-ring"
+            onClick={playbackError ? retryPlayback : togglePlayback}
             type="button"
           >
-            <span
-              aria-hidden="true"
-              className="invisible col-start-1 row-start-1"
-            >
-              1.5×
-            </span>
-            <span
-              className="col-start-1 row-start-1 text-center"
-              data-testid="voice-note-playback-rate-value"
-            >
-              {playbackRateLabel(playbackRate)}
-            </span>
+            {playbackError ? (
+              <AlertCircle aria-hidden="true" />
+            ) : pendingPlay ? (
+              <Loader2 aria-hidden="true" className="animate-spin" />
+            ) : (
+              <MorphingPlayPauseIcon isPlaying={isPlaying} />
+            )}
           </button>
+        </AttachmentMedia>
+        <AttachmentContent className="min-w-0">
+          <AttachmentTitle className="sr-only">{filename}</AttachmentTitle>
+          {playbackError ? (
+            <div className="text-xs font-medium text-destructive" role="alert">
+              Audio unavailable. Retry playback.
+            </div>
+          ) : (
+            <div
+              className="relative h-6 overflow-hidden rounded-sm has-[:focus-visible]:ring-2 has-[:focus-visible]:ring-ring has-[:focus-visible]:ring-offset-1"
+              data-testid="voice-note-playback-waveform"
+              data-waveform-state={
+                waveformError ? "error" : waveformReady ? "ready" : "loading"
+              }
+              ref={waveformRef}
+            >
+              {waveformError ? (
+                <span className="sr-only" role="status">
+                  Waveform preview unavailable. Playback may still work.
+                </span>
+              ) : null}
+              <div className="flex h-full items-center gap-0.5">
+                {waveformBars(false)}
+              </div>
+              <div
+                aria-hidden="true"
+                className="pointer-events-none absolute inset-0 flex items-center gap-0.5 will-change-[clip-path]"
+                data-testid="voice-note-progress-waveform"
+                ref={progressWaveformRef}
+                style={{ clipPath: "inset(0 100% 0 0)" }}
+              >
+                {waveformBars(true)}
+              </div>
+              <input
+                aria-label="Voice note playback position"
+                aria-valuetext={timeLabel}
+                className="absolute inset-0 h-full w-full cursor-pointer opacity-0"
+                max={Math.max(duration, 0.01)}
+                min="0"
+                onInput={(event) => {
+                  seekTo(
+                    Number(event.currentTarget.value),
+                    Number(event.currentTarget.max),
+                  );
+                }}
+                onKeyDown={handleScrubKeyDown}
+                step="0.01"
+                type="range"
+                value={Math.min(currentTime, Math.max(duration, 0.01))}
+              />
+            </div>
+          )}
+          {!composer ? (
+            <div
+              className="mt-1 flex min-w-0 items-center gap-2 text-xs text-muted-foreground"
+              data-testid="voice-note-meta"
+            >
+              {sender ? (
+                <>
+                  <span
+                    className="truncate font-medium text-foreground"
+                    data-testid="voice-note-sender"
+                  >
+                    {sender}
+                  </span>
+                  <span aria-hidden="true">·</span>
+                </>
+              ) : null}
+              <span
+                className="shrink-0 tabular-nums"
+                data-testid="voice-note-time"
+              >
+                {timeLabel}
+              </span>
+            </div>
+          ) : null}
+        </AttachmentContent>
+        {composer ? (
+          <AttachmentActions className="min-w-9 justify-end">
+            <span
+              className="text-xs tabular-nums text-muted-foreground"
+              data-testid="voice-note-time"
+            >
+              {timeLabel}
+            </span>
+          </AttachmentActions>
+        ) : (
+          <AttachmentActions>{speedPill}</AttachmentActions>
+        )}
+        {!composer && downloadUrl ? (
+          <AttachmentActions>
+            <AttachmentAction
+              aria-label={`Download ${filename}`}
+              onClick={() => {
+                invokeTauri("download_file", {
+                  filename,
+                  url: downloadUrl,
+                }).catch((error: unknown) => {
+                  toast.error(
+                    error instanceof Error ? error.message : "Download failed",
+                  );
+                });
+              }}
+              title="Download"
+              type="button"
+            >
+              <Download />
+            </AttachmentAction>
+          </AttachmentActions>
         ) : null}
-      </AttachmentActions>
-      {!composer && downloadUrl ? (
-        <AttachmentActions>
-          <AttachmentAction
-            aria-label={`Download ${filename}`}
-            onClick={() => {
-              invokeTauri("download_file", {
-                filename,
-                url: downloadUrl,
-              }).catch((error: unknown) => {
-                toast.error(
-                  error instanceof Error ? error.message : "Download failed",
-                );
-              });
-            }}
-            title="Download"
+        {!composer && onRemove ? (
+          <AttachmentActions>
+            <AttachmentAction
+              aria-label="Remove voice note"
+              onClick={onRemove}
+              title="Remove"
+              type="button"
+            >
+              <X />
+            </AttachmentAction>
+          </AttachmentActions>
+        ) : null}
+      </div>
+      {!composer && transcript !== undefined ? (
+        <div
+          className="w-full border-t border-border/60 pt-2"
+          data-testid="voice-note-transcript"
+        >
+          <button
+            aria-controls={transcriptId}
+            aria-expanded={transcriptOpen}
+            className="flex w-full items-center justify-between gap-2 rounded-sm text-xs font-medium text-muted-foreground transition-colors hover:text-foreground focus-visible:outline-hidden focus-visible:ring-1 focus-visible:ring-ring"
+            data-testid="voice-note-transcript-toggle"
+            onClick={toggleTranscript}
             type="button"
           >
-            <Download />
-          </AttachmentAction>
-        </AttachmentActions>
-      ) : null}
-      {!composer && onRemove ? (
-        <AttachmentActions>
-          <AttachmentAction
-            aria-label="Remove voice note"
-            onClick={onRemove}
-            title="Remove"
-            type="button"
+            <span className="inline-flex items-center gap-2">
+              <FileText aria-hidden="true" className="h-3.5 w-3.5" />
+              Transcript
+            </span>
+            <ChevronDown
+              aria-hidden="true"
+              className={cn(
+                "h-4 w-4 transition-transform motion-reduce:transition-none",
+                transcriptOpen && "rotate-180",
+              )}
+            />
+          </button>
+          <div
+            className="mt-1.5 pl-[1.375rem] text-xs leading-relaxed text-muted-foreground [&_p]:whitespace-pre-wrap"
+            data-testid="voice-note-transcript-text"
+            hidden={!transcriptOpen}
+            id={transcriptId}
           >
-            <X />
-          </AttachmentAction>
-        </AttachmentActions>
+            {transcript}
+          </div>
+        </div>
       ) : null}
       {/* biome-ignore lint/a11y/useMediaCaption: voice notes are user-provided audio */}
       <audio
@@ -579,12 +739,17 @@ export function AudioMessageAttachment({
           }
         }}
         onEnded={() => {
-          setCurrentTime(0);
           setIsPlaying(false);
+          // Reached by a scrub to the last frame, not by playing out: leave
+          // the head where the user put it. `play()` from the end rewinds on
+          // its own, so nothing is stranded.
+          if (seekedToEndRef.current) return;
+          setCurrentTime(0);
           paintProgress(0);
         }}
         onPause={() => setIsPlaying(false)}
         onPlay={() => {
+          seekedToEndRef.current = false;
           setPlaybackError(false);
           setIsPlaying(true);
         }}

@@ -2,29 +2,45 @@ part of '../compose_bar.dart';
 
 class _ComposerVoiceNote {
   const _ComposerVoiceNote({
-    required this.start,
+    required this.beginHold,
     required this.onKeyboardHidden,
     required this.onDraftIdentityChanged,
+    required this.generation,
     required ValueNotifier<bool> isPreparing,
     required ValueNotifier<bool> isRecording,
+    required VoidCallback onCancel,
     required ValueChanged<VoiceNoteRecording> onRecorded,
+    required ValueChanged<String> onError,
   }) : _isPreparing = isPreparing,
        _isRecording = isRecording,
-       _onRecorded = onRecorded;
+       _onCancel = onCancel,
+       _onRecorded = onRecorded,
+       _onError = onError;
 
-  final VoidCallback start;
+  /// Starts recording from the mic slot. With a [pointer] the finger is held
+  /// and tracked; without one the recording is hands free (tap, screen
+  /// reader, or keyboard path).
+  final void Function({int? pointer, Offset origin}) beginHold;
   final VoidCallback onKeyboardHidden;
   final VoidCallback onDraftIdentityChanged;
+
+  /// Take the phase machine is on. It keys the recorder, so every take gets
+  /// its own element instead of reusing the one that is still fading out.
+  final int generation;
   final ValueNotifier<bool> _isPreparing;
   final ValueNotifier<bool> _isRecording;
+  final VoidCallback _onCancel;
   final ValueChanged<VoiceNoteRecording> _onRecorded;
+  final ValueChanged<String> _onError;
 
   bool get isPreparing => _isPreparing.value;
   bool get isRecording => _isRecording.value;
   Widget? get recorder => isRecording
       ? VoiceNoteComposerRecorder(
-          onCancel: () => _isRecording.value = false,
+          key: ValueKey('voice-note-recorder-take-$generation'),
+          onCancel: _onCancel,
           onRecorded: _onRecorded,
+          onError: _onError,
         )
       : null;
 }
@@ -50,35 +66,123 @@ _ComposerVoiceNote _useComposerVoiceNote({
 }) {
   final isPreparing = useState(false);
   final isRecording = useState(false);
+  final phaseNotifier = ref.read(voiceNoteRecorderPhaseProvider.notifier);
+  final generation = ref.watch(
+    voiceNoteRecorderPhaseProvider.select((state) => state.generation),
+  );
 
   final resetForDraftIdentityChange = useCallback(() {
     isPreparing.value = false;
     isRecording.value = false;
-  }, [isPreparing, isRecording]);
+    // Draft identity changes are observed during build; the provider may
+    // only be written once the frame is out of it.
+    scheduleMicrotask(phaseNotifier.reset);
+  }, [isPreparing, isRecording, phaseNotifier]);
+
+  // Every exit from the phase machine (slide-to-cancel, failure, finish)
+  // clears the composer's own flags here so no path can leave `isRecording`
+  // stuck behind a phase that already returned to idle.
+  ref.listen<VoiceNoteRecorderState>(voiceNoteRecorderPhaseProvider, (
+    previous,
+    next,
+  ) {
+    switch (next.phase) {
+      case VoiceNoteRecorderPhase.idle:
+        isPreparing.value = false;
+        isRecording.value = false;
+      case VoiceNoteRecorderPhase.finishing when !isRecording.value:
+        // Released before the recorder mounted (the keyboard was still
+        // hiding): nothing was captured, so say why instead of vanishing.
+        uploadError.value = voiceNoteHoldToRecordHint;
+        isPreparing.value = false;
+        phaseNotifier.reset();
+      case VoiceNoteRecorderPhase.holding:
+      case VoiceNoteRecorderPhase.locked:
+      case VoiceNoteRecorderPhase.paused:
+      case VoiceNoteRecorderPhase.finishing:
+      case VoiceNoteRecorderPhase.reviewing:
+        break;
+    }
+  });
+
+  void cancel() {
+    isPreparing.value = false;
+    isRecording.value = false;
+    phaseNotifier.reset();
+  }
+
+  bool isBackgrounded() {
+    final lifecycle = ref.read(appLifecycleProvider);
+    return lifecycle == AppLifecycleState.paused ||
+        lifecycle == AppLifecycleState.detached;
+  }
 
   void beginRecording() {
     if (!isPreparing.value) return;
+    // A start deferred behind the keyboard can land after the app has gone
+    // away. The recorder's own lifecycle guard is not mounted yet, so this is
+    // the only fence: never open the mic where the user cannot see it.
+    if (isBackgrounded()) {
+      cancel();
+      return;
+    }
     isPreparing.value = false;
     isRecording.value = true;
   }
 
-  void start() {
+  // The recorder cancels its own capture when the app leaves, but the window
+  // between the mic press and the recorder mounting (the keyboard is still
+  // hiding) belongs to nobody else.
+  useEffect(() {
+    final subscription = ref.listenManual(appLifecycleProvider, (
+      previous,
+      next,
+    ) {
+      if (next != AppLifecycleState.paused &&
+          next != AppLifecycleState.detached) {
+        return;
+      }
+      if (!isPreparing.value) return;
+      cancel();
+    });
+    return subscription.close;
+  }, const []);
+
+  bool start() {
+    // Validate before touching the composer, so a refused start keeps the
+    // keyboard, the expanded editor, and the attachment surface as they were.
     if (attachments.value.isNotEmpty) {
       uploadError.value = 'A voice note must be the only attachment.';
-      return;
+      return false;
+    }
+    if (ref.read(huddleSessionProvider).isInSession) {
+      uploadError.value = 'Leave the Huddle before recording a voice note.';
+      return false;
     }
     attachmentSurface.value = _AttachmentSurface.closed;
     showFormatting.value = false;
     isComposerExpanded.value = false;
     _dismissComposerKeyboard(focusNode);
-    if (ref.read(huddleSessionProvider).isInSession) {
-      uploadError.value = 'Leave the Huddle before recording a voice note.';
-      return;
-    }
     uploadError.value = null;
     draftRevision.value += 1;
     isPreparing.value = true;
     if (View.of(context).viewInsets.bottom == 0) beginRecording();
+    return true;
+  }
+
+  void beginHold({int? pointer, Offset origin = Offset.zero}) {
+    if (ref.read(voiceNoteRecorderPhaseProvider).isActive) return;
+    if (!start()) return;
+    phaseNotifier.begin(
+      pointer: pointer,
+      origin: origin,
+      textDirection: Directionality.of(context),
+    );
+  }
+
+  void fail(String message) {
+    uploadError.value = message;
+    cancel();
   }
 
   void complete(VoiceNoteRecording recording) {
@@ -95,14 +199,18 @@ _ComposerVoiceNote _useComposerVoiceNote({
       ),
     ];
     isRecording.value = false;
+    phaseNotifier.reset();
   }
 
   return _ComposerVoiceNote(
-    start: start,
+    beginHold: beginHold,
     onKeyboardHidden: beginRecording,
     onDraftIdentityChanged: resetForDraftIdentityChange,
+    generation: generation,
     isPreparing: isPreparing,
     isRecording: isRecording,
+    onCancel: cancel,
     onRecorded: complete,
+    onError: fail,
   );
 }

@@ -6,6 +6,7 @@ class _SendButton extends StatelessWidget {
   final VoidCallback onTap;
 
   const _SendButton({
+    super.key,
     required this.isSending,
     required this.onTap,
     this.isDisabled = false,
@@ -14,8 +15,8 @@ class _SendButton extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return SizedBox(
-      width: 36,
-      height: 36,
+      width: _composerTrailingSlotSize,
+      height: _composerTrailingSlotSize,
       child: IconButton(
         onPressed: (isSending || isDisabled)
             ? null
@@ -28,6 +29,7 @@ class _SendButton extends StatelessWidget {
           shape: const CircleBorder(),
         ),
         padding: EdgeInsets.zero,
+        tooltip: 'Send message',
         icon: isSending
             ? BuzzLoadingIndicator(
                 size: 18,

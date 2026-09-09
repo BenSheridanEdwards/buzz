@@ -131,6 +131,8 @@ jobs:
         run: swift build -c release --package-path mobile/ios/BuzzPushKit
       - name: Test
         run: swift test --package-path mobile/ios/BuzzPushKit
+      - name: Voice note packaging checks
+        run: just mobile-ios-checks
       - name: Build complete unsigned iOS release
         run: cd mobile && flutter build ios --release --no-codesign --no-pub
 

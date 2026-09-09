@@ -851,3 +851,19 @@ class ChannelsNotifier extends AsyncNotifier<List<Channel>> {
 final channelsProvider = AsyncNotifierProvider<ChannelsNotifier, List<Channel>>(
   ChannelsNotifier.new,
 );
+
+/// Whether the channel with this id is a DM, for the surfaces that treat a
+/// direct conversation differently (voice-note transcripts unfold there).
+/// One lookup shared by the timeline and the thread view, so neither can
+/// drift from the other.
+final isDmChannelProvider = Provider.family<bool, String>(
+  (ref, channelId) => ref.watch(
+    channelsProvider.select(
+      (channels) =>
+          channels.value?.any(
+            (channel) => channel.id == channelId && channel.isDm,
+          ) ??
+          false,
+    ),
+  ),
+);

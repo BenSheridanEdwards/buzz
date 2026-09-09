@@ -7,26 +7,45 @@ import { acquireEscapeSurface } from "@/shared/hooks/escapeSurfaces";
  * was already handled (`defaultPrevented`) — so nested controls
  * (autocomplete, edit mode) that claim Escape on the element always win.
  *
- * While enabled, the surface is registered with `escapeSurfaces` so
- * app-level Escape shortcuts (mark channel read) know to yield instead
- * of racing this listener on registration order.
+ * The surface is registered with `escapeSurfaces` while enabled, so
+ * app-level Escape shortcuts (mark channel read) know to yield, and so that
+ * only the **topmost** surface acts: a thread panel registers before the
+ * recorder its composer later opens, and a panel opened over a live
+ * recording registers after it. Whichever came last owns the key.
  *
  * Pass `enabled: false` to skip registering the listener entirely.
  */
-export function useEscapeKey(onEscape: () => void, enabled: boolean = true) {
+export function useEscapeKey(
+  onEscape: () => void,
+  enabled: boolean = true,
+  options: {
+    /**
+     * Listen in the capture phase. A surface that covers document-level
+     * layers (Radix's dismissable layers listen on `document` in capture)
+     * claims the key before them; window capture runs first.
+     */
+    capture?: boolean;
+    /** Decline the key for events a nested control still owns. */
+    shouldIgnore?: (event: KeyboardEvent) => boolean;
+  } = {},
+) {
+  const { capture = false } = options;
+  const shouldIgnoreRef = React.useRef(options.shouldIgnore);
+  shouldIgnoreRef.current = options.shouldIgnore;
   React.useEffect(() => {
     if (!enabled) return;
-    const releaseSurface = acquireEscapeSurface();
+    const surface = acquireEscapeSurface();
     function handleKeyDown(event: KeyboardEvent) {
-      if (event.key === "Escape" && !event.defaultPrevented) {
-        event.preventDefault();
-        onEscape();
-      }
+      if (event.key !== "Escape" || event.defaultPrevented) return;
+      if (!surface.isTopmost()) return;
+      if (shouldIgnoreRef.current?.(event)) return;
+      event.preventDefault();
+      onEscape();
     }
-    window.addEventListener("keydown", handleKeyDown);
+    window.addEventListener("keydown", handleKeyDown, { capture });
     return () => {
-      window.removeEventListener("keydown", handleKeyDown);
-      releaseSurface();
+      window.removeEventListener("keydown", handleKeyDown, { capture });
+      surface.release();
     };
-  }, [enabled, onEscape]);
+  }, [capture, enabled, onEscape]);
 }

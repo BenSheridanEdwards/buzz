@@ -4,7 +4,21 @@ import type { ParsedMessageLink } from "@/features/messages/lib/messageLink";
 import type { ParsedEntityLink } from "@/shared/lib/entityLink";
 import type { Channel } from "@/shared/api/types";
 import type { CustomEmoji } from "@/shared/lib/remarkCustomEmoji";
+import type { VoiceNoteConversationContext } from "@/features/messages/lib/audioAttachment";
 import type { VideoReviewContext } from "../VideoPlayer";
+
+/** Card context for a received voice note: who sent it and where. */
+export type VoiceNoteCardContext = {
+  conversation: VoiceNoteConversationContext;
+  /**
+   * Renders the attachment's transcript (its imeta `alt`) through the message
+   * Markdown pipeline so emoji, mentions and emphasis match the body. Must be
+   * referentially stable: it travels through the Markdown runtime context.
+   */
+  renderTranscript?: (transcript: string) => React.ReactNode;
+  /** Display name of the message author, shown as the card title. */
+  sender?: string;
+};
 
 export type ImetaEntry = {
   dim?: string;
@@ -55,6 +69,8 @@ export type MarkdownRuntime = {
   resolveChannelReferences?: boolean;
   /** Display name of the message author sharing an agent snapshot. */
   snapshotSharedBy?: string;
+  /** Sender, transcript and conversation type for received voice notes. */
+  voiceNoteCard?: VoiceNoteCardContext;
   /**
    * Called by AgentSnapshotCard after a successful verified in-memory fetch.
    * The implementation should navigate to /agents and trigger the existing
@@ -103,6 +119,8 @@ export type MarkdownProps = {
   searchQuery?: string;
   /** Display name shown in shared-agent card metadata. */
   snapshotSharedBy?: string;
+  /** Sender, transcript and conversation type for received voice notes. */
+  voiceNoteCard?: VoiceNoteCardContext;
   videoReviewContext?: VideoReviewContext;
   /**
    * When set and the nudge payload's agent_pubkey matches, renders the

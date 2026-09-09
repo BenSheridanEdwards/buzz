@@ -466,8 +466,14 @@ class ComposeBar extends HookConsumerWidget {
       }
       final submittedDraftRevision = draftRevision.value;
       // Resolved before any await: see
-      // `_reportSendCancelledByCommunitySwitch`.
+      // `_reportSendCancelledByCommunitySwitch`. The container outlives this
+      // widget, so a relay audio rejection arriving after the composer
+      // unmounts can still drop the stale NIP-11 verdict.
       final messenger = ScaffoldMessenger.maybeOf(context);
+      final providerContainer = ProviderScope.containerOf(
+        context,
+        listen: false,
+      );
 
       // Extract pubkeys for mentions present in the final text.
       final selectedMentions = <MentionCandidate>[
@@ -545,6 +551,18 @@ class ComposeBar extends HookConsumerWidget {
         final queueGeneration = uploadGeneration.value;
         final cancellation = UploadCancellationToken();
         final uploadService = ref.read(mediaUploadServiceProvider);
+        // Kick off the relay's NIP-11 audio verdict (cached per relay) before
+        // the first await so the provider is read while this ref is live.
+        final relayAudioProvider =
+            queuedAttachments.any(
+              (attachment) =>
+                  attachment.kind == _PendingAttachmentKind.voiceNote,
+            )
+            ? relayAudioSupportProvider(ref.read(relayConfigProvider).baseUrl)
+            : null;
+        final relayAudioSupport = relayAudioProvider == null
+            ? null
+            : ref.read(relayAudioProvider.future);
         activeUploadCancellation.value = cancellation;
         final delivery = onSend;
         unawaited(() async {
@@ -556,6 +574,10 @@ class ComposeBar extends HookConsumerWidget {
               final descriptor = await _uploadPendingAttachment(
                 uploadService,
                 attachment,
+                relayAudioSupport: relayAudioSupport,
+                onRelayAudioRejected: relayAudioProvider == null
+                    ? null
+                    : () => providerContainer.invalidate(relayAudioProvider),
                 onProgress: (progress) {
                   if (context.mounted) {
                     uploadProgress.value =
@@ -806,7 +828,6 @@ class ComposeBar extends HookConsumerWidget {
                   kind: _PendingAttachmentKind.video,
                 );
               }),
-              onVoiceNote: voiceNote.start,
               onFiles: () => chooseAttachment(() {
                 final service = ref.read(mediaUploadServiceProvider);
                 return pickThenQueue(
@@ -891,7 +912,6 @@ class ComposeBar extends HookConsumerWidget {
             kind: _PendingAttachmentKind.video,
           );
         }),
-        onVoiceNote: voiceNote.start,
         onFiles: () => chooseAttachment(() {
           final service = ref.read(mediaUploadServiceProvider);
           return pickThenQueue(
@@ -917,6 +937,18 @@ class ComposeBar extends HookConsumerWidget {
 
     // Suggestions and attachments live in the overlay.
     final hasPendingUploads = uploadingCount.value > 0;
+    final voiceNoteRecorderExpanded = ref.watch(
+      voiceNoteRecorderPhaseProvider.select(
+        (state) => switch (state.phase) {
+          VoiceNoteRecorderPhase.locked ||
+          VoiceNoteRecorderPhase.paused ||
+          VoiceNoteRecorderPhase.reviewing => true,
+          VoiceNoteRecorderPhase.idle ||
+          VoiceNoteRecorderPhase.holding ||
+          VoiceNoteRecorderPhase.finishing => false,
+        },
+      ),
+    );
     return _ComposerDockFrame(
       expansionAnimation: composerExpansionController,
       forceFullWidth: _voiceNoteFullWidth(voiceNote, attachments.value),
@@ -942,51 +974,57 @@ class ComposeBar extends HookConsumerWidget {
             onDismissAttachmentSurface: () {
               attachmentSurface.value = _AttachmentSurface.closed;
             },
-            child: _ComposeBarLayout(
-              voiceNoteRecorder: voiceNote.recorder,
-              attachments: attachments.value,
-              onRemoveAttachment: removeAttachment,
-              uploadError: uploadError.value,
-              isExpanded: isComposerExpanded.value,
-              controller: controller,
-              focusNode: focusNode,
-              contextMenuBuilder: buildContextMenu,
-              onContentInserted: uploadPastedImage,
-              onSend: () => unawaited(send()),
-              resolvedHint: resolvedHint,
-              attachmentSurface: attachmentSurface.value,
-              onAttachmentTap: handleAttachmentTap,
-              onExpand: expandComposer,
-              expansionAnimation: composerExpansionController,
-              formattingOpen: showFormatting.value,
-              onCloseFormatting: () => showFormatting.value = false,
-              motionDuration: motionDuration,
-              resizeDuration: resizeDuration,
-              onFormat: applyFormat,
-              onMention: () {
-                attachmentSurface.value = _AttachmentSurface.closed;
-                triggerMention();
-              },
-              onChannel: () {
-                attachmentSurface.value = _AttachmentSurface.closed;
-                triggerChannel();
-              },
-              onEmoji: () {
-                attachmentSurface.value = _AttachmentSurface.closed;
-                isEmojiPickerOpen.value = true;
-                _showComposerEmojiPicker(context, insertEmoji, () {
-                  if (!context.mounted) return;
-                  isEmojiPickerOpen.value = false;
-                  focusNode.requestFocus();
-                });
-              },
-              onOpenFormatting: () {
-                attachmentSurface.value = _AttachmentSurface.closed;
-                showFormatting.value = true;
-              },
-              hasPendingUploads: hasPendingUploads,
-              canSend: composerText.trim().isNotEmpty || hasAttachments,
-              isSending: isSending.value,
+            child: _VoiceNoteGestureTracker(
+              child: _ComposeBarLayout(
+                voiceNoteRecorder: voiceNote.recorder,
+                voiceNoteRecorderExpanded: voiceNoteRecorderExpanded,
+                onMicPointerDown: (pointer, origin) =>
+                    voiceNote.beginHold(pointer: pointer, origin: origin),
+                onMicActivate: voiceNote.beginHold,
+                attachments: attachments.value,
+                onRemoveAttachment: removeAttachment,
+                uploadError: uploadError.value,
+                isExpanded: isComposerExpanded.value,
+                controller: controller,
+                focusNode: focusNode,
+                contextMenuBuilder: buildContextMenu,
+                onContentInserted: uploadPastedImage,
+                onSend: () => unawaited(send()),
+                resolvedHint: resolvedHint,
+                attachmentSurface: attachmentSurface.value,
+                onAttachmentTap: handleAttachmentTap,
+                onExpand: expandComposer,
+                expansionAnimation: composerExpansionController,
+                formattingOpen: showFormatting.value,
+                onCloseFormatting: () => showFormatting.value = false,
+                motionDuration: motionDuration,
+                resizeDuration: resizeDuration,
+                onFormat: applyFormat,
+                onMention: () {
+                  attachmentSurface.value = _AttachmentSurface.closed;
+                  triggerMention();
+                },
+                onChannel: () {
+                  attachmentSurface.value = _AttachmentSurface.closed;
+                  triggerChannel();
+                },
+                onEmoji: () {
+                  attachmentSurface.value = _AttachmentSurface.closed;
+                  isEmojiPickerOpen.value = true;
+                  _showComposerEmojiPicker(context, insertEmoji, () {
+                    if (!context.mounted) return;
+                    isEmojiPickerOpen.value = false;
+                    focusNode.requestFocus();
+                  });
+                },
+                onOpenFormatting: () {
+                  attachmentSurface.value = _AttachmentSurface.closed;
+                  showFormatting.value = true;
+                },
+                hasPendingUploads: hasPendingUploads,
+                canSend: composerText.trim().isNotEmpty || hasAttachments,
+                isSending: isSending.value,
+              ),
             ),
           ),
         ],

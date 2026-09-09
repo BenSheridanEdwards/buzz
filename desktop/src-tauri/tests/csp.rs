@@ -6,6 +6,11 @@
 //! non-obvious sources the frontend actually needs, so a future tightening
 //! fails here instead of in a signed build.
 //!
+//! `tests/e2e/voice-note-waveform-csp.spec.ts` closes the other half for the
+//! one directive that already shipped broken: it replays this file's
+//! `connect-src` onto the preview server and drives the real voice-note card,
+//! so the policy is proven against the component and not only asserted here.
+//!
 //! Kept as an integration test so the policy can be checked without the app
 //! crate having to declare a test-only module.
 
@@ -189,6 +194,49 @@ fn connect_src_allows_ipc_and_cleartext_relays() {
             "connect-src must allow {source}"
         );
     }
+}
+
+/// The voice-note card: it wraps IPC-fetched media bytes in an object URL for
+/// `<audio>`, then reads that URL back to decode samples for the waveform.
+const AUDIO_ATTACHMENT: &str =
+    include_str!("../../src/features/messages/ui/AudioMessageAttachment.tsx");
+
+/// The body of `decodeSamples`, the function that turns a playback URL into
+/// waveform samples. Sliced out so the assertion below is about that function's
+/// transport rather than any incidental `fetch` elsewhere in the file.
+fn decode_samples_body() -> String {
+    let after = AUDIO_ATTACHMENT
+        .split_once("async function decodeSamples(")
+        .expect("AudioMessageAttachment.tsx declares decodeSamples")
+        .1;
+    after
+        .split_once("\n}\n")
+        .expect("decodeSamples is terminated")
+        .0
+        .to_owned()
+}
+
+#[test]
+fn connect_src_allows_the_object_urls_the_waveform_reads_back() {
+    // Playback and the waveform read the same object URL through different
+    // directives: `<audio src>` is `media-src` (which already allows `blob:`),
+    // while `decodeSamples` uses `fetch`, which is `connect-src`. Without
+    // `blob:` here WebKit refuses only the second one, so every voice note
+    // plays fine and every card renders a flat dotted line.
+    assert!(
+        AUDIO_ATTACHMENT.contains("URL.createObjectURL"),
+        "the voice-note card must still hand playback an object URL"
+    );
+    assert!(
+        decode_samples_body().contains("fetch("),
+        "decodeSamples must still read its source URL over fetch"
+    );
+
+    let allowed = sources("connect-src");
+    assert!(
+        allowed.contains(&"blob:".to_owned()),
+        "connect-src must allow blob: so the waveform can read its object URL"
+    );
 }
 
 #[test]

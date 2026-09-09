@@ -39,6 +39,8 @@ fn minio_config(bucket: String) -> MediaConfig {
         max_gif_bytes: 10 * 1024 * 1024,
         max_video_bytes: 524_288_000,
         max_file_bytes: 104_857_600,
+        max_audio_bytes: 26_214_400,
+        audio_uploads_enabled: false,
         public_base_url: "http://localhost:3000/media".to_string(),
         upload_records_enabled: false,
         upload_ip_header: None,

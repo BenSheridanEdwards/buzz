@@ -458,3 +458,116 @@ async fn test_upload_real_image() {
 
     println!("✅ Real image upload round-trip passed");
 }
+
+/// Real audio round trip against a relay that advertises the `buzz-audio`
+/// NIP-11 extension. On a relay without it, the same upload must still be
+/// refused as it always was, so this test documents both sides of the switch.
+#[tokio::test]
+#[ignore]
+async fn test_upload_audio_round_trip() {
+    const CLEAN_MP3: &[u8] = include_bytes!("../../buzz-media/tests/fixtures/audio/sine-clean.mp3");
+    const TAGGED_MP3: &[u8] =
+        include_bytes!("../../buzz-media/tests/fixtures/audio/sine-tagged.mp3");
+
+    let client = http_client();
+    let keys = Keys::generate();
+
+    let info: serde_json::Value = client
+        .get(format!("{}/", relay_http_url()))
+        .header("Accept", "application/nostr+json")
+        .send()
+        .await
+        .expect("NIP-11 GET failed")
+        .json()
+        .await
+        .expect("NIP-11 JSON");
+    let audio_enabled = info["supported_extensions"]
+        .as_array()
+        .is_some_and(|exts| exts.iter().any(|e| e.as_str() == Some("buzz-audio")));
+    println!("relay advertises buzz-audio: {audio_enabled}");
+
+    let sha256 = hex::encode(Sha256::digest(CLEAN_MP3));
+    let auth = sign_blossom_auth(&keys, &sha256);
+    let resp = client
+        .put(format!("{}/upload", relay_http_url()))
+        .header("Authorization", blossom_auth_header(&auth))
+        .header("Content-Type", "audio/mpeg")
+        .header("X-SHA-256", &sha256)
+        .body(CLEAN_MP3.to_vec())
+        .send()
+        .await
+        .expect("upload PUT failed");
+    let status = resp.status();
+    let body_text = resp.text().await.unwrap_or_default();
+    println!("PUT /upload (clean mp3) → {status}: {body_text}");
+
+    if !audio_enabled {
+        assert_eq!(
+            status, 415,
+            "audio must stay rejected when the extension is off"
+        );
+        return;
+    }
+    assert_eq!(status, 200, "clean mp3 should upload on a buzz-audio relay");
+    let descriptor: serde_json::Value = serde_json::from_str(&body_text).expect("BlobDescriptor");
+    assert_eq!(descriptor["sha256"].as_str().unwrap(), sha256);
+    assert_eq!(descriptor["type"].as_str().unwrap(), "audio/mpeg");
+    let duration = descriptor["duration"]
+        .as_f64()
+        .expect("audio descriptor carries duration");
+    assert!((duration - 1.2).abs() < 0.2, "duration {duration}");
+    let url = descriptor["url"].as_str().unwrap();
+    assert!(url.ends_with(".mp3"), "url {url}");
+
+    let get_resp = client
+        .get(url)
+        .header(
+            "Authorization",
+            blossom_auth_header(&sign_blossom_get_auth(&keys, &sha256)),
+        )
+        .send()
+        .await
+        .expect("GET failed");
+    assert_eq!(get_resp.status(), 200);
+    assert_eq!(
+        get_resp
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok()),
+        Some("audio/mpeg")
+    );
+    assert!(
+        get_resp
+            .headers()
+            .get("content-disposition")
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|d| d.starts_with("inline")),
+        "audio must be served inline"
+    );
+    let returned = get_resp.bytes().await.unwrap();
+    assert_eq!(
+        returned.as_ref(),
+        CLEAN_MP3,
+        "GET must return original bytes"
+    );
+
+    // A tagged file is metadata the client should have stripped: 422.
+    let tagged_sha = hex::encode(Sha256::digest(TAGGED_MP3));
+    let tagged_auth = sign_blossom_auth(&keys, &tagged_sha);
+    let tagged = client
+        .put(format!("{}/upload", relay_http_url()))
+        .header("Authorization", blossom_auth_header(&tagged_auth))
+        .header("Content-Type", "audio/mpeg")
+        .header("X-SHA-256", &tagged_sha)
+        .body(TAGGED_MP3.to_vec())
+        .send()
+        .await
+        .expect("upload PUT failed");
+    assert_eq!(
+        tagged.status(),
+        422,
+        "ID3-tagged mp3 must be rejected as metadata"
+    );
+
+    println!("✅ Audio upload round-trip passed");
+}

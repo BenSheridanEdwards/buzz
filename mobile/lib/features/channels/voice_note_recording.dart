@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:io';
 import 'dart:math' as math;
 
+import 'package:clock/clock.dart';
 import 'package:flutter/material.dart';
 import 'package:hooks_riverpod/hooks_riverpod.dart';
 import 'package:http/http.dart' as http;
@@ -18,19 +19,33 @@ const voiceNoteMaxDuration = Duration(minutes: 5);
 /// Maximum time allowed for an authenticated voice-note download.
 const voiceNoteDownloadTimeout = Duration(seconds: 30);
 
+/// Longest the recorder waits for the native stop before it gives up and
+/// reports a failure, so a stalled finish never strands the composer.
+const voiceNoteStopTimeout = Duration(seconds: 8);
+
+/// Composer error line shown when a release did not capture a usable note.
+const voiceNoteHoldToRecordHint =
+    'Hold to record. Voice notes need at least one second.';
+
 /// Maximum number of bytes accepted for a downloaded voice note.
 const voiceNoteMaxDownloadBytes = 32 * 1024 * 1024;
 
 /// Playback rates offered by the voice-note player, in selection order.
 const voiceNotePlaybackRates = <double>[1, 1.5, 2, 0.5];
 
+/// Playback rates cycled by the mobile voice-note card (desktop keeps 0.5x).
+const voiceNoteMobilePlaybackRates = <double>[1, 1.5, 2];
+
 /// Route observer used to cancel recording when its composer is covered.
 final voiceNoteRouteObserver = RouteObserver<ModalRoute<void>>();
 
-/// Returns the playback rate following [current] in the supported rate cycle.
-double nextVoiceNotePlaybackRate(double current) {
-  final index = voiceNotePlaybackRates.indexOf(current);
-  return voiceNotePlaybackRates[(index + 1) % voiceNotePlaybackRates.length];
+/// Returns the playback rate following [current] in the [rates] cycle.
+double nextVoiceNotePlaybackRate(
+  double current, {
+  List<double> rates = voiceNotePlaybackRates,
+}) {
+  final index = rates.indexOf(current);
+  return rates[(index + 1) % rates.length];
 }
 
 /// Formats a supported voice-note playback rate for display.
@@ -57,6 +72,12 @@ abstract interface class VoiceNoteRecorder {
 
   Future<void> start();
 
+  /// Suspends capture; paused time is excluded from the recording duration.
+  Future<void> pause();
+
+  /// Resumes capture after [pause].
+  Future<void> resume();
+
   Future<VoiceNoteRecording> stop();
 
   Future<void> cancel();
@@ -76,6 +97,10 @@ abstract interface class VoiceNoteRecorderBackend {
   Future<void> start(RecordConfig config, {required String path});
 
   Stream<Amplitude> onAmplitudeChanged(Duration interval);
+
+  Future<void> pause();
+
+  Future<void> resume();
 
   Future<String?> stop();
 
@@ -99,6 +124,12 @@ class _DeviceVoiceNoteRecorderBackend implements VoiceNoteRecorderBackend {
       _recorder.onAmplitudeChanged(interval);
 
   @override
+  Future<void> pause() => _recorder.pause();
+
+  @override
+  Future<void> resume() => _recorder.resume();
+
+  @override
   Future<String?> stop() => _recorder.stop();
 
   @override
@@ -113,17 +144,22 @@ class DeviceVoiceNoteRecorder implements VoiceNoteRecorder {
   DeviceVoiceNoteRecorder({
     VoiceNoteRecorderBackend? backend,
     Future<Directory> Function()? temporaryDirectory,
+    Duration stopTimeout = voiceNoteStopTimeout,
   }) : _recorder = backend ?? _DeviceVoiceNoteRecorderBackend(),
-       _temporaryDirectory = temporaryDirectory ?? getTemporaryDirectory;
+       _temporaryDirectory = temporaryDirectory ?? getTemporaryDirectory,
+       _stopTimeout = stopTimeout;
 
   final VoiceNoteRecorderBackend _recorder;
   final Future<Directory> Function() _temporaryDirectory;
+  final Duration _stopTimeout;
   final StreamController<double> _levels = StreamController.broadcast();
   final List<double> _samples = [];
   StreamSubscription<Amplitude>? _amplitudeSubscription;
   Future<void>? _startup;
   Future<void>? _terminalOperation;
   DateTime? _startedAt;
+  DateTime? _pausedAt;
+  Duration _pausedTotal = Duration.zero;
   String? _path;
   int _lifecycleGeneration = 0;
   bool _nativeStarted = false;
@@ -165,7 +201,7 @@ class DeviceVoiceNoteRecorder implements VoiceNoteRecorder {
     _ensureStartupActive(generation);
     final path =
         '${directory.path}${Platform.pathSeparator}'
-        'voice-note-${DateTime.now().millisecondsSinceEpoch}.m4a';
+        'voice-note-${clock.now().millisecondsSinceEpoch}.m4a';
     await _recorder.start(
       const RecordConfig(
         encoder: AudioEncoder.aacLc,
@@ -181,7 +217,7 @@ class DeviceVoiceNoteRecorder implements VoiceNoteRecorder {
     _nativeStarted = true;
     _ensureStartupActive(generation);
     _path = path;
-    _startedAt = DateTime.now();
+    _startedAt = clock.now();
     _ensureStartupActive(generation);
     _amplitudeSubscription = _recorder
         .onAmplitudeChanged(const Duration(milliseconds: 80))
@@ -192,9 +228,30 @@ class DeviceVoiceNoteRecorder implements VoiceNoteRecorder {
                           .toDouble() *
                       4)
                   .clamp(0.04, 1.0);
+          if (_pausedAt != null) return;
           _samples.add(normalized);
           if (!_levels.isClosed) _levels.add(normalized);
         });
+  }
+
+  @override
+  Future<void> pause() async {
+    if (_finished || !_nativeStarted || _nativeEnded || _pausedAt != null) {
+      return;
+    }
+    _pausedAt = clock.now();
+    await _recorder.pause();
+  }
+
+  @override
+  Future<void> resume() async {
+    final pausedAt = _pausedAt;
+    if (_finished || !_nativeStarted || _nativeEnded || pausedAt == null) {
+      return;
+    }
+    _pausedTotal += clock.now().difference(pausedAt);
+    _pausedAt = null;
+    await _recorder.resume();
   }
 
   @override
@@ -216,20 +273,49 @@ class DeviceVoiceNoteRecorder implements VoiceNoteRecorder {
 
   Future<VoiceNoteRecording> _stop() async {
     await _amplitudeSubscription?.cancel();
-    final recordedPath = await _recorder.stop() ?? _path;
+    // A stalled native stop would otherwise leave the composer finishing
+    // forever; the timeout surfaces as a failure and disposal still cancels.
+    // The stalled stop can still land later and write the file, so the
+    // abandoned path is deleted rather than left in the temp directory.
+    final String? recordedPath;
+    try {
+      recordedPath = await _recorder.stop().timeout(_stopTimeout) ?? _path;
+    } catch (_) {
+      await _deleteAbandonedFile();
+      rethrow;
+    }
     _nativeEnded = true;
     if (recordedPath == null || recordedPath.isEmpty) {
       throw StateError('Buzz could not finish the voice note.');
     }
     final startedAt = _startedAt;
+    final pausedAt = _pausedAt;
+    final now = clock.now();
+    final pausedTotal =
+        _pausedTotal +
+        (pausedAt == null ? Duration.zero : now.difference(pausedAt));
     final duration = startedAt == null
         ? Duration.zero
-        : DateTime.now().difference(startedAt);
+        : now.difference(startedAt) - pausedTotal;
     return VoiceNoteRecording(
       file: XFile(recordedPath, mimeType: 'audio/mp4'),
       duration: duration,
       waveform: List.unmodifiable(_samples),
     );
+  }
+
+  /// Removes the capture file the composer will never be handed, for the
+  /// paths where the native recorder never confirmed the end of the take
+  /// (a timed-out stop that finishes writing on its own afterwards).
+  Future<void> _deleteAbandonedFile() async {
+    final path = _path;
+    if (path == null) return;
+    try {
+      final file = File(path);
+      if (await file.exists()) await file.delete();
+    } catch (_) {
+      // Best-effort cleanup must not mask the failure being reported.
+    }
   }
 
   @override
@@ -264,6 +350,9 @@ class DeviceVoiceNoteRecorder implements VoiceNoteRecorder {
     if (_disposed) return;
     _disposed = true;
     _lifecycleGeneration += 1;
+    // A take that ended without the native recorder confirming it (a stop
+    // that timed out) leaves a file nobody owns.
+    final abandonedCapture = _finished && !_nativeEnded;
     final terminalOperation =
         _terminalOperation ?? (!_finished ? cancel() : null);
     if (terminalOperation != null) {
@@ -283,6 +372,7 @@ class DeviceVoiceNoteRecorder implements VoiceNoteRecorder {
       await _recorder.cancel();
       _nativeEnded = true;
     }
+    if (abandonedCapture) await _deleteAbandonedFile();
     await _recorder.dispose();
     await _levels.close();
   }
@@ -298,6 +388,7 @@ class VoiceNotePlaybackState {
     this.isLoading = false,
     this.canCancelLoading = false,
     this.hasError = false,
+    this.canSeek = false,
   });
 
   final Duration position;
@@ -307,6 +398,11 @@ class VoiceNotePlaybackState {
   final bool canCancelLoading;
   final bool hasError;
 
+  /// Whether the player holds a loaded source that honours [seek]. Remote
+  /// notes load lazily, so a scrub before the first play would be ignored by
+  /// the backend and desynchronise the waveform.
+  final bool canSeek;
+
   VoiceNotePlaybackState copyWith({
     Duration? position,
     Duration? duration,
@@ -314,6 +410,7 @@ class VoiceNotePlaybackState {
     bool? isLoading,
     bool? canCancelLoading,
     bool? hasError,
+    bool? canSeek,
   }) => VoiceNotePlaybackState(
     position: position ?? this.position,
     duration: duration ?? this.duration,
@@ -321,6 +418,7 @@ class VoiceNotePlaybackState {
     isLoading: isLoading ?? this.isLoading,
     canCancelLoading: canCancelLoading ?? this.canCancelLoading,
     hasError: hasError ?? this.hasError,
+    canSeek: canSeek ?? this.canSeek,
   );
 }
 
@@ -885,7 +983,7 @@ class DeviceVoiceNotePlayerController extends VoiceNotePlayerController {
 
   void _update(VoiceNotePlaybackState next) {
     if (_disposed) return;
-    _state = next;
+    _state = next.copyWith(canSeek: _hasPlayableSource);
     notifyListeners();
   }
 

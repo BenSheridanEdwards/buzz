@@ -86,6 +86,8 @@ pub enum MediaError {
     /// MP4 metadata could not be parsed.
     #[error("invalid video data")]
     InvalidVideo,
+    #[error("audio stream is malformed")]
+    InvalidAudio,
     /// I/O error during streaming upload.
     #[error("io error: {0}")]
     Io(String),
@@ -158,6 +160,7 @@ impl IntoResponse for MediaError {
             | Self::ResolutionTooHigh
             | Self::MoovNotAtFront
             | Self::InvalidVideo
+            | Self::InvalidAudio
             | Self::InvalidImage
             | Self::MetadataForbidden => (StatusCode::UNPROCESSABLE_ENTITY, self.to_string()),
             Self::Io(_) | Self::StorageError(_) | Self::Internal => {
@@ -208,6 +211,7 @@ mod tests {
         for error in [
             MediaError::InvalidImage,
             MediaError::InvalidVideo,
+            MediaError::InvalidAudio,
             MediaError::MetadataForbidden,
             MediaError::MoovNotAtFront,
             MediaError::DurationTooLong,
