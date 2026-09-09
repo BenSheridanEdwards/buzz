@@ -3496,7 +3496,12 @@ pub async fn run_prompt_task(
             if matches!(stop_reason, StopReason::Cancelled | StopReason::Refusal) {
                 let _ = agent.acp.take_turn_media();
             } else {
+                // Read before `publish_reply_media` takes the capture.
+                let reply_text = agent.acp.peek_turn_text().trim().to_string();
                 publish_reply_media(&ctx, &mut agent, batch.as_ref(), &turn_id, turn_dir_guard);
+                if !reply_text.is_empty() {
+                    publish_text_reply_fallback(&ctx, batch.as_ref(), reply_text);
+                }
             }
 
             let core_stop = acp_stop_to_core(&stop_reason);
@@ -5470,6 +5475,20 @@ pub(crate) async fn post_failure_notice(
     thread_tags: &ThreadTags,
     content: &str,
 ) {
+    post_text_message(rest, channel_id, thread_tags, content, "failure notice").await;
+}
+
+/// Sign and submit one kind-9 text message anchored by `thread_tags`.
+///
+/// `what` names the caller in log lines so a failed publish can be traced back
+/// to the path that wanted it.
+pub(crate) async fn post_text_message(
+    rest: &crate::relay::RestClient,
+    channel_id: Uuid,
+    thread_tags: &ThreadTags,
+    content: &str,
+    what: &str,
+) {
     let thread_ref = thread_tags.root_event_id.as_deref().and_then(|root| {
         let root_id = nostr::EventId::from_hex(root).ok()?;
         let parent_id = thread_tags
@@ -5493,22 +5512,120 @@ pub(crate) async fn post_failure_notice(
     ) {
         Ok(b) => b,
         Err(e) => {
-            tracing::warn!(channel = %channel_id, "failure notice: build failed: {e}");
+            tracing::warn!(channel = %channel_id, "{what}: build failed: {e}");
             return;
         }
     };
     let event = match builder.sign_with_keys(&rest.keys) {
         Ok(e) => e,
         Err(e) => {
-            tracing::warn!(channel = %channel_id, "failure notice: sign failed: {e}");
+            tracing::warn!(channel = %channel_id, "{what}: sign failed: {e}");
             return;
         }
     };
     match tokio::time::timeout(Duration::from_secs(5), rest.submit_event(&event)).await {
         Ok(Ok(_)) => {}
-        Ok(Err(e)) => tracing::warn!(channel = %channel_id, "failure notice failed: {e}"),
-        Err(_) => tracing::warn!(channel = %channel_id, "failure notice timed out"),
+        Ok(Err(e)) => tracing::warn!(channel = %channel_id, "{what} failed: {e}"),
+        Err(_) => tracing::warn!(channel = %channel_id, "{what} timed out"),
     }
+}
+
+/// How long to wait for an engine-published reply to land on the relay before
+/// deciding the turn produced no message. A reply sent through the `buzz` CLI
+/// is submitted by a child process, so it can still be in flight when the
+/// prompt returns; querying immediately would race it and double-post.
+const TEXT_REPLY_SETTLE: Duration = Duration::from_millis(1500);
+
+/// Whether this agent published a message in `channel_id` at or after `since`.
+///
+/// Used to tell "the engine already answered for itself" from "the engine
+/// answered into the void". Any error is reported as `true` so an unreachable
+/// relay makes the fallback stay quiet rather than risk a duplicate.
+async fn agent_published_message_since(
+    rest: &crate::relay::RestClient,
+    channel_id: Uuid,
+    since: nostr::Timestamp,
+) -> bool {
+    use nostr::{Alphabet, SingleLetterTag};
+
+    let h_tag = SingleLetterTag::lowercase(Alphabet::H);
+    let ch_str = channel_id.to_string();
+    let filter = nostr::Filter::new()
+        .kinds([
+            nostr::Kind::Custom(buzz_core::kind::KIND_STREAM_MESSAGE as u16),
+            nostr::Kind::Custom(buzz_core::kind::KIND_STREAM_MESSAGE_V2 as u16),
+        ])
+        .author(rest.keys.public_key())
+        .custom_tags(h_tag, [ch_str.as_str()])
+        .since(since)
+        .limit(1);
+    match tokio::time::timeout(Duration::from_secs(5), rest.query(&[filter])).await {
+        Ok(Ok(value)) => query_says_published(&value),
+        Ok(Err(e)) => {
+            tracing::warn!(channel = %channel_id, "text reply fallback: query failed: {e}");
+            true
+        }
+        Err(_) => {
+            tracing::warn!(channel = %channel_id, "text reply fallback: query timed out");
+            true
+        }
+    }
+}
+
+/// Read a message-query response as "the agent already published".
+///
+/// An empty array is the only answer that releases the fallback to post. A
+/// response that is not an array is unrecognised, and an unrecognised answer
+/// must never be read as "nothing was published" — that would duplicate a
+/// reply the engine already sent.
+fn query_says_published(value: &serde_json::Value) -> bool {
+    value.as_array().is_none_or(|events| !events.is_empty())
+}
+
+/// Publish the engine's reply text when the turn ended without the engine
+/// publishing anything itself.
+///
+/// Engines that drive the `buzz` CLI post their own messages and are left
+/// alone. An ACP engine that simply answers (the Hermes runtime does) would
+/// otherwise complete a turn, log `end_turn`, and leave the human with
+/// silence; its answer is published here, anchored exactly like a media reply.
+fn publish_text_reply_fallback(
+    ctx: &Arc<PromptContext>,
+    batch: Option<&FlushBatch>,
+    text: String,
+) -> Option<tokio::task::JoinHandle<()>> {
+    let batch = batch?;
+    let trigger = batch.events.last()?.event.clone();
+    let channel_id = batch.channel_id;
+    let ctx = Arc::clone(ctx);
+    Some(tokio::spawn(async move {
+        tokio::time::sleep(TEXT_REPLY_SETTLE).await;
+        if agent_published_message_since(&ctx.rest_client, channel_id, trigger.created_at).await {
+            return;
+        }
+        // Anchor exactly like a media reply: the harness owns the reply
+        // destination and a threaded reply is the intended shape.
+        let target = crate::media_publish::ReplyTarget::for_trigger(channel_id, &trigger);
+        let thread_tags = crate::queue::ThreadTags {
+            root_event_id: Some(target.root_event_id.to_hex()),
+            parent_event_id: Some(trigger.id.to_hex()),
+            mentioned_pubkeys: Vec::new(),
+        };
+        tracing::info!(
+            target: "buzz_acp::pool::prompt",
+            channel = %channel_id,
+            bytes = text.len(),
+            "engine published no message this turn; publishing its reply text"
+        );
+        post_text_message(
+            &ctx.rest_client,
+            channel_id,
+            &thread_tags,
+            &text,
+            "text reply fallback",
+        )
+        .await;
+    }))
 }
 
 /// Best-effort: remove a reaction via a signed kind:5 (NIP-09) deletion event.
@@ -12370,5 +12487,40 @@ done"#
             cap["configOptions"].is_null(),
             "an optionless switch caches the target's (empty) options, never the pre-switch model-a options with a patched effort"
         );
+    }
+}
+
+#[cfg(test)]
+mod text_reply_fallback_tests {
+    use super::*;
+
+    #[test]
+    fn empty_result_releases_the_fallback() {
+        // The engine published nothing this turn, so its answer would be lost
+        // unless the fallback posts it.
+        assert!(!query_says_published(&serde_json::json!([])));
+    }
+
+    #[test]
+    fn any_message_suppresses_the_fallback() {
+        // The engine drove the CLI itself; posting again would duplicate it.
+        assert!(query_says_published(
+            &serde_json::json!([{"id": "abc", "kind": 9}])
+        ));
+    }
+
+    #[test]
+    fn unrecognised_response_suppresses_the_fallback() {
+        // Never read a shape we do not understand as "nothing was published".
+        for value in [
+            serde_json::json!({"events": []}),
+            serde_json::json!(null),
+            serde_json::json!("oops"),
+        ] {
+            assert!(
+                query_says_published(&value),
+                "unrecognised response {value} must not release the fallback"
+            );
+        }
     }
 }
