@@ -26,7 +26,8 @@ pub const OPENCLAW_MAX_PARALLELISM: u32 = 5;
 /// `None` when the harness has no cap.
 ///
 /// Keyed on [`super::discovery::normalize_command_identity`] so path prefixes,
-/// the `.exe` suffix on Windows, and other cosmetic differences are ignored.
+/// the Windows launcher suffixes (`.exe` and npm's `.cmd`/`.bat` shims), and
+/// other cosmetic differences are ignored.
 pub fn harness_max_parallelism(command: &str) -> Option<u32> {
     match super::discovery::normalize_command_identity(command).as_str() {
         "openclaw" => Some(OPENCLAW_MAX_PARALLELISM),
@@ -40,9 +41,9 @@ pub fn harness_max_parallelism(command: &str) -> Option<u32> {
 /// The app-wide default is [`super::DEFAULT_AGENT_PARALLELISM`]; a preset can
 /// carry its own (`PresetHarness::default_parallelism`), e.g. Hermes, where
 /// every worker is a full Hermes process loading the profile's MCP servers.
-/// Accepts a runtime id ("hermes") or a command ("hermes-acp", path-prefixed
-/// or `.exe`-suffixed) and reads static data only, so it is safe inside
-/// discovery and at the mint sites alike.
+/// Accepts a runtime id ("hermes") or a command ("hermes-acp", path-prefixed,
+/// `.exe`-suffixed, or an npm `.cmd`/`.bat` shim) and reads static data only,
+/// so it is safe inside discovery and at the mint sites alike.
 pub fn harness_default_parallelism(harness: &str) -> u32 {
     super::discovery::preset_default_parallelism(harness)
         .unwrap_or(super::DEFAULT_AGENT_PARALLELISM)
@@ -210,6 +211,10 @@ mod tests {
             super::harness_max_parallelism(r"C:\Tools\openclaw.exe"),
             Some(cap)
         );
+        // npm shim spellings key the cap table too, or a Windows npm install
+        // would run the OpenClaw gateway uncapped.
+        assert_eq!(super::harness_max_parallelism("openclaw.cmd"), Some(cap));
+        assert_eq!(super::harness_max_parallelism("openclaw.bat"), Some(cap));
         assert_eq!(super::harness_max_parallelism("goose"), None);
         assert_eq!(super::harness_max_parallelism("buzz-agent"), None);
         assert_eq!(super::harness_max_parallelism(""), None);
@@ -235,6 +240,9 @@ mod tests {
             "/opt/hermes/bin/hermes-acp",
             "hermes-acp.exe",
             r"C:\Tools\Hermes\HERMES-ACP.EXE",
+            "hermes-acp.cmd",
+            "hermes-acp.bat",
+            r"C:\Users\me\AppData\Roaming\npm\hermes-acp.cmd",
         ] {
             assert_eq!(
                 super::harness_default_parallelism(hermes),
@@ -259,6 +267,102 @@ mod tests {
             );
         }
         assert_ne!(app_default, 1, "the Hermes default must be observable");
+    }
+
+    /// Every Windows launcher spelling of the Hermes command is the same
+    /// identity to the desktop as it is to the harness.
+    ///
+    /// `buzz_acp::config::normalize_agent_command_identity` strips `.exe`,
+    /// `.cmd` and `.bat`, so buzz-acp treats an npm shim as Hermes and applies
+    /// `HERMES_ACP_SKIP_CONFIGURED_MCP`. While
+    /// [`super::discovery::normalize_command_identity`] stripped only `.exe`,
+    /// the desktop did not recognise the same command: a user-typed custom
+    /// harness or `agent_command_override` pointing at
+    /// `…\npm\hermes-acp.cmd` minted the app default and started ten full
+    /// Hermes processes, self-consistently (the catalog entry advertised 10
+    /// too) and therefore silently. This pins the spellings on both sides of
+    /// that gap.
+    #[test]
+    fn hermes_launcher_spellings_share_one_identity_with_the_harness() {
+        use crate::managed_agents::discovery::normalize_command_identity;
+        let app_default = crate::managed_agents::DEFAULT_AGENT_PARALLELISM;
+
+        for spelling in [
+            "hermes-acp",
+            "hermes-acp.exe",
+            "hermes-acp.cmd",
+            "hermes-acp.bat",
+            "/opt/hermes/bin/hermes-acp",
+            r"C:\Users\me\AppData\Roaming\npm\hermes-acp.cmd",
+            r"C:\Tools\Hermes\HERMES-ACP.EXE",
+        ] {
+            assert_eq!(
+                normalize_command_identity(spelling),
+                "hermes-acp",
+                "identity for {spelling:?}"
+            );
+            // The number the catalog entry advertises (agent_discovery emits
+            // `harness_default_parallelism`) and the number the create site
+            // mints must be the same 1.
+            assert_eq!(
+                super::harness_default_parallelism(spelling),
+                1,
+                "catalog default for {spelling:?}"
+            );
+            assert_eq!(
+                super::mint_parallelism(spelling, None),
+                1,
+                "minted parallelism for {spelling:?}"
+            );
+        }
+
+        // A wrapper script is not a launcher shim: nothing short of executing
+        // it could say what it wraps, so it keeps the app default.
+        for opaque in [
+            "hermes-acp.sh",
+            "/usr/local/bin/hermes-wrapper.sh",
+            "/usr/local/bin/my-hermes",
+        ] {
+            assert_eq!(
+                super::mint_parallelism(opaque, None),
+                app_default,
+                "minted parallelism for {opaque:?}"
+            );
+        }
+    }
+
+    /// The registry key space agrees with the command key space on the shim
+    /// spelling too: a custom harness whose command is the npm shim mints 1
+    /// from its id at the two snapshot importers, not just from its command at
+    /// create.
+    #[test]
+    fn mint_parallelism_resolves_a_shim_spelled_custom_harness() {
+        use crate::managed_agents::custom_harnesses::{
+            registry_test_lock, update_loaded_harness_registry, HarnessDefinition,
+        };
+        let _lock = registry_test_lock();
+        update_loaded_harness_registry(vec![HarnessDefinition {
+            id: "npm-hermes".to_string(),
+            label: "Hermes via npm".to_string(),
+            command: r"C:\Users\me\AppData\Roaming\npm\hermes-acp.cmd".to_string(),
+            args: vec![],
+            env: std::collections::BTreeMap::new(),
+            install_instructions_url: String::new(),
+            install_hint: String::new(),
+        }]);
+
+        assert_eq!(
+            super::mint_parallelism("npm-hermes", None),
+            1,
+            "a custom harness id wrapping the npm shim must mint 1"
+        );
+        assert_eq!(
+            super::mint_parallelism(r"C:\Users\me\AppData\Roaming\npm\hermes-acp.cmd", None),
+            1,
+            "and so must the command it wraps"
+        );
+
+        update_loaded_harness_registry(vec![]);
     }
 
     /// A custom harness wrapping the Hermes command mints 1 from *either* key

@@ -282,8 +282,8 @@ pub(super) fn preset_command_for_id(id: &str) -> Option<&'static str> {
 }
 
 /// Find a static preset by runtime id or by command identity (bare name,
-/// path-prefixed, `.exe`/`.cmd` suffixed), or `None` when the input is not a
-/// preset harness.
+/// path-prefixed, `.exe`/`.cmd`/`.bat` suffixed), or `None` when the input is
+/// not a preset harness.
 fn find_preset(harness: &str) -> Option<&'static PresetHarness> {
     let normalized = super::normalize_command_identity(harness);
     if normalized.is_empty() {
@@ -681,6 +681,11 @@ mod tests {
             "/opt/hermes/bin/hermes-acp",
             "hermes-acp.exe",
             r"C:\Users\me\AppData\Roaming\npm\HERMES-ACP.EXE",
+            // npm's Windows shims name the same runtime, and buzz-acp's
+            // normalizer already treats them as Hermes.
+            "hermes-acp.cmd",
+            "hermes-acp.bat",
+            r"C:\Users\me\AppData\Roaming\npm\hermes-acp.cmd",
         ] {
             assert_eq!(
                 super::preset_default_parallelism(hermes),

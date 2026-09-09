@@ -111,9 +111,23 @@ fn executable_basename(command: &str) -> String {
     }
 }
 
+/// Reduce a harness command to the identity every harness-keyed table is keyed
+/// on: basename, lowercased, `_`/space folded to `-`, launcher suffix removed.
+///
+/// The stripped suffixes are `.exe`, `.cmd` and `.bat`. Windows resolves a
+/// command through an `.exe` binary or through npm's `.cmd`/`.bat` shims, and
+/// all three name the same runtime — a harness whose documented Windows install
+/// is npm is reached as `hermes-acp.cmd`, never as a bare `hermes-acp`.
+///
+/// This deliberately mirrors `buzz_acp::config::normalize_agent_command_identity`.
+/// The two must agree: the harness applies the Hermes environment branch on its
+/// identity while the desktop sizes the worker pool on this one, so a spelling
+/// only one of them recognises mints a full pool of Hermes processes while the
+/// harness treats the same command as Hermes. Keep the suffix lists in step.
 pub(crate) fn normalize_command_identity(command: &str) -> String {
     let normalized = command.trim().replace('\\', "/");
-    let basename = normalized.rsplit('/').next().unwrap_or(normalized.as_str());
+    let trimmed = normalized.trim_end_matches('/');
+    let basename = trimmed.rsplit('/').next().unwrap_or(trimmed);
     let lower = basename
         .chars()
         .map(|character| match character {
@@ -121,20 +135,20 @@ pub(crate) fn normalize_command_identity(command: &str) -> String {
             _ => character.to_ascii_lowercase(),
         })
         .collect::<String>();
-    let lower = lower.strip_suffix(".exe").unwrap_or(&lower).to_string();
 
-    if let Some(suffix) = std::env::consts::EXE_SUFFIX.strip_prefix('.') {
-        return lower
-            .strip_suffix(&format!(".{suffix}"))
-            .unwrap_or(&lower)
-            .to_string();
+    if let Some(stem) = [".exe", ".cmd", ".bat"]
+        .iter()
+        .find_map(|extension| lower.strip_suffix(extension))
+    {
+        return stem.to_string();
     }
 
-    if !std::env::consts::EXE_SUFFIX.is_empty() {
-        return lower
-            .strip_suffix(std::env::consts::EXE_SUFFIX)
-            .unwrap_or(&lower)
-            .to_string();
+    // Non-Windows targets whose executables carry a suffix of their own (wasm).
+    let platform_suffix = std::env::consts::EXE_SUFFIX.to_ascii_lowercase();
+    if !platform_suffix.is_empty() {
+        if let Some(stem) = lower.strip_suffix(&platform_suffix) {
+            return stem.to_string();
+        }
     }
 
     lower
@@ -198,6 +212,15 @@ pub(crate) fn mcp_sidecar_with(
 /// it is installed, which is the behaviour this field was changed for), and a
 /// remembered one that later disappears is evicted rather than handed to a
 /// spawn as a dead path.
+///
+/// That asymmetry is deliberate and it bounds what the memo saves. Once a
+/// sidecar resolves, a summary build costs a `HashMap` hit plus one
+/// `is_executable_file` stat. Where the sidecar is genuinely absent there is no
+/// negative memo to hit — and `resolve_command_cached` does not remember misses
+/// either, since `resolve_buzz_managed_command` and `resolve_workspace_command`
+/// both run ahead of the cache lookup — so every summary build still pays the
+/// full search-dir walk for that record. This is not a cache for the absent
+/// case; correctness (the badge firing on install day) is what it buys there.
 fn sidecar_path_memo() -> &'static std::sync::Mutex<std::collections::HashMap<&'static str, PathBuf>>
 {
     use std::collections::HashMap;
