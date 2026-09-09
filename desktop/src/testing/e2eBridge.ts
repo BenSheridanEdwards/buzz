@@ -13552,6 +13552,9 @@ export function maybeInstallE2eTauriMocks() {
               agent.owner_pubkey === MOCK_IDENTITY_PUBKEY),
         );
       }
+      case "list_hermes_profiles":
+        // The mock machine has no ~/.hermes; the picker shows its empty state.
+        return [];
       case "list_personas":
         return handleListPersonas();
       case "create_persona":

@@ -6,6 +6,7 @@ import {
   type PersonaCatalogPublication,
 } from "@/features/agents/lib/personaCatalogRelay";
 import { invalidatePersonaEditCaches } from "@/features/agents/lib/personaEditCaches";
+import { personaInputWithResolvedAvatar } from "@/features/agents/ui/managedAgentAvatar";
 import { relayClient } from "@/shared/api/relayClient";
 import { useFocusedRefetchInterval } from "@/shared/lib/useDocumentVisible";
 import {
@@ -122,7 +123,8 @@ export function useSetPersonaCatalogSharedMutation(communityId: string | null) {
 export function useUpdatePersonaAndPublishMutation(communityId: string | null) {
   const queryClient = useQueryClient();
   return useMutation({
-    mutationFn: (input: UpdatePersonaInput) => updatePersonaAndPublish(input),
+    mutationFn: async (input: UpdatePersonaInput) =>
+      updatePersonaAndPublish(await personaInputWithResolvedAvatar(input)),
     onSettled: async (_data, _error, variables) => {
       await Promise.all([
         invalidatePersonaEditCaches(queryClient, variables.id),

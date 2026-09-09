@@ -71,7 +71,10 @@ import { OwnerOnlyAccessField } from "./OwnerOnlyAccessField";
 import type { EnvVarsValue } from "./EnvVarsEditor";
 import { useRequiredCredentialState } from "./useRequiredCredentialState";
 import { RunOnSummarySection } from "./RunOnSummarySection";
-import { PersonaDropdownField } from "./PersonaDropdownField";
+import { EditAgentRuntimeField } from "./EditAgentRuntimeField";
+import { useHermesProfilePicker } from "./HermesProfileField";
+import { isHermesHarness } from "./hermesProfileSelection";
+import { useHermesHarnessWatch } from "./useHermesHarnessWatch";
 import {
   MODEL_DISCOVERY_LOADING_VALUE,
   usePersonaModelDiscovery,
@@ -89,7 +92,6 @@ import { useProviderApiKeyFieldState } from "./providerApiKeyFieldState";
 import { resolveModelFieldStatusMessage } from "./agentConfigControls";
 import { AdvancedRequiredBadge } from "./AdvancedRequiredBadge";
 import { showAgentProfileSyncWarning } from "./agentProfileSyncWarning";
-import { AddCustomHarnessDialog } from "./AddCustomHarnessDialog";
 import {
   ADD_CUSTOM_HARNESS_OPTION,
   runtimeDropdownAction,
@@ -322,6 +324,73 @@ export function AgentInstanceEditDialog({
   const prospectiveRuntime = runtimes.find(
     (r) => r.id === prospectiveRuntimeId,
   );
+  const harnessSelection = {
+    runtimeId: prospectiveRuntimeId,
+    command: prospectiveRuntime?.command ?? agentCommand,
+  };
+  const isHermesSelected = isHermesHarness(
+    harnessSelection.runtimeId,
+    harnessSelection.command,
+  );
+  const hermesPicker = useHermesProfilePicker({
+    defaultParallelism: String(agent.parallelism),
+    // Avatar and description are definition-level identity here; the
+    // instance prompt is only editable when no definition owns it.
+    draft: {
+      displayName: name,
+      description: "",
+      avatarUrl: "",
+      systemPrompt: linkedPersona != null ? "" : systemPrompt,
+      envVars,
+      parallelism,
+    },
+    enabled: open && isHermesSelected,
+    // Instance env vars are an override layer over the definition's; the
+    // picker must show what the process will actually see, not just the
+    // overrides, or every agent created from a profile-backed definition
+    // reports "No profile".
+    inheritedEnvVars: inheritedEnvVars,
+    onApply: (next) => {
+      setName(next.displayName);
+      if (linkedPersona == null) setSystemPrompt(next.systemPrompt);
+      setEnvVars(next.envVars);
+      setParallelism(next.parallelism);
+    },
+  });
+
+  // Every route out of Hermes drops the pin, not just the harness dropdown: a
+  // hand-typed custom command that stops being a Hermes binary hides the field
+  // while `HERMES_HOME` would otherwise stay in the env. Watching the harness
+  // itself keeps one owner for all of them, and reuses the same transform the
+  // definition dialog applies.
+  //
+  // `harnessSelection` is derived from the runtime catalog and the persona
+  // list, so it moves on its own while those queries load. The watch only
+  // compares selections once both have stopped loading; see
+  // `useHermesHarnessWatch`.
+  const harnessInputsSettled =
+    !runtimesQuery.isLoading && !personasQuery.isLoading;
+  useHermesHarnessWatch({
+    defaults: { parallelism: String(agent.parallelism) },
+    draft: {
+      displayName: name,
+      description: "",
+      avatarUrl: "",
+      systemPrompt,
+      envVars,
+      parallelism,
+    },
+    enabled: open,
+    harness: harnessSelection,
+    onChange: (next) => {
+      setEnvVars(next.envVars);
+      setParallelism(next.parallelism);
+      if (linkedPersona == null) {
+        setSystemPrompt(next.systemPrompt);
+      }
+    },
+    settled: harnessInputsSettled,
+  });
   const runtimeCatalogStatus = runtimesQuery.isLoading
     ? ("loading" as const)
     : runtimesQuery.isError
@@ -551,6 +620,8 @@ export function AgentInstanceEditDialog({
       setAgentArgs(newArgs);
     }
 
+    // The profile pin is dropped by the "left Hermes" effect above, which also
+    // covers the custom-command path this handler cannot see.
     applySelection(
       selectionOnRuntimeChange(selection, {
         previousRuntime: previousRuntimeId,
@@ -1010,38 +1081,33 @@ export function AgentInstanceEditDialog({
             />
             <RunOnSummarySection backend={agent.backend} />
 
-            {/* Provider (runtime) */}
-            <div className="space-y-1.5">
-              <label
-                className="text-sm font-medium text-foreground"
-                htmlFor="edit-agent-runtime"
-              >
-                Provider
-              </label>
-              <PersonaDropdownField
-                disabled={isSaving}
-                id="edit-agent-runtime"
-                onValueChange={handleRuntimeDropdownChange}
-                options={runtimeDropdownOptions}
-                placeholder="Choose a provider"
-                value={runtimeDropdownValue}
-              />
-              {selectedRuntime ? (
-                <p className="text-xs text-muted-foreground">
-                  Detected at{" "}
-                  <span className="font-medium">
-                    {selectedRuntime.binaryPath ??
-                      selectedRuntime.command ??
-                      selectedRuntime.id}
-                  </span>
-                </p>
-              ) : null}
-              <AddCustomHarnessDialog
-                onOpenChange={setIsAddHarnessOpen}
-                onSaved={selectSavedHarness}
-                open={isAddHarnessOpen}
-              />
-            </div>
+            <EditAgentRuntimeField
+              disabled={isSaving}
+              // The picker shows the effective env (definition layer plus this
+              // instance's overrides), never the override layer alone.
+              envVars={hermesPicker.effectiveEnvVars}
+              hermes={
+                isHermesSelected
+                  ? {
+                      inherited: {
+                        isInherited: hermesPicker.isInherited,
+                        onEditDefinition: onEditLinkedPersona,
+                        path: hermesPicker.inheritedPath,
+                      },
+                      onProfileChange: hermesPicker.handleProfileChange,
+                      profiles: hermesPicker.profiles,
+                      status: hermesPicker.status,
+                    }
+                  : null
+              }
+              isAddHarnessOpen={isAddHarnessOpen}
+              onAddHarnessOpenChange={setIsAddHarnessOpen}
+              onHarnessSaved={selectSavedHarness}
+              onValueChange={handleRuntimeDropdownChange}
+              options={runtimeDropdownOptions}
+              selectedRuntime={selectedRuntime}
+              value={runtimeDropdownValue}
+            />
             {selectedRuntimeId === "custom" && !inheritHarness ? (
               <div className="space-y-1.5">
                 <label
