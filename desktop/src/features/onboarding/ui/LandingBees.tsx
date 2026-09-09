@@ -12,7 +12,11 @@ type Bee = {
 };
 
 const WHITE = "#FFFFFF";
-const YELLOW = "#E9E94F";
+// FLEET TEST BUILD ONLY. This was Buzz brand yellow (#E9E94F), the last of the
+// landing screen's yellow that is not driven by a theme token: the scatter sets
+// each bee's colour inline. FLEET cyan keeps the same two-tone field and the
+// same contrast against the navy ground. Restore #E9E94F for stock Buzz.
+const YELLOW = "#3DD6F0";
 
 // Fixed scatter so the field doesn't shimmer between renders.
 const BEES: Bee[] = [
@@ -141,7 +145,9 @@ export function LandingBees() {
       aria-hidden
       className="pointer-events-none absolute inset-0 overflow-hidden"
     >
-      <span className="absolute left-6 top-12 block w-11 text-[#231E1E]">
+      {/* FLEET TEST BUILD ONLY: the corner mark's ink was near-black (#231E1E),
+          which disappears on the FLEET navy ground. Restore for stock Buzz. */}
+      <span className="absolute left-6 top-12 block w-11 text-[#3DD6F0]">
         <BuzzMark className="h-auto w-full" />
       </span>
       {BEES.map((bee, i) => (

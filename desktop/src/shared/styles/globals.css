@@ -18,6 +18,10 @@
 @import "./globals/image-lightbox.css";
 @import "./globals/video-review.css";
 @import "./globals/progress.css";
+/* FLEET TEST BUILD ONLY. Re-points Buzz's brand tokens at the FLEET palette
+   and adds the permanent TEST marker. Must stay last so its unlayered rules
+   sit after everything they override. Remove this line to restore stock Buzz. */
+@import "./globals/fleet-test-build.css";
 
 @config "../../../tailwind.config.js";
 

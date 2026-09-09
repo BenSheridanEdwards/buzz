@@ -96,6 +96,15 @@ export function SidebarProfileCard({
         <span className="-translate-y-px leading-normal">🐝</span>
       </span>
       <span className="truncate">{communityLabel}</span>
+      {/* FLEET TEST BUILD ONLY. Marks the signed-in chrome beside the workspace
+          name, so a sidebar screenshot alone identifies the app. Remove with
+          globals/fleet-test-build.css to restore stock Buzz. */}
+      <span
+        className="shrink-0 rounded-sm bg-[#e23fa0] px-1 text-badge font-bold uppercase leading-normal tracking-[0.16em] text-white"
+        data-testid="fleet-test-build-marker"
+      >
+        Test
+      </span>
     </span>
   );
 

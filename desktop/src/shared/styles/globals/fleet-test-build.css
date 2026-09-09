@@ -1,0 +1,208 @@
+/*
+ * FLEET TEST BUILD ONLY. Not for production.
+ *
+ * Buzz's brand yellow is not spread across components: it lives in two token
+ * blocks, and this sheet re-points those same tokens at the FLEET palette so a
+ * test window can never be mistaken for the production app.
+ *
+ *   globals/theme.css      --buzz-gradient-* and the hosted-community tokens
+ *                          (the in-app chrome: sidebar, rail, top chrome)
+ *   globals/components.css .buzz-onboarding-neutral-theme
+ *                          (the first-launch surfaces, whose flat chartreuse
+ *                          field is what dominates the window before sign-in)
+ *
+ * This file is the only colour change in the build. Delete it and its @import
+ * from globals.css and the stock Buzz palette comes straight back.
+ *
+ * FLEET palette
+ *   ground     #0A1E28  hsl(200 60% 10%)   very dark navy
+ *   accent     #3DD6F0  hsl(189 86% 59%)   cyan
+ *   highlight  #E23FA0  hsl(324 74% 57%)   magenta, used sparingly
+ *
+ * Every rule below is deliberately UNLAYERED. The blocks it replaces live in
+ * `@layer base`, and an unlayered declaration beats any layered one whatever
+ * the import order, so nothing here needs `!important` or a specificity war.
+ */
+
+:root {
+  --fleet-ground: #0a1e28;
+  --fleet-ground-deep: #04090d;
+  --fleet-accent: #3dd6f0;
+  --fleet-highlight: #e23fa0;
+}
+
+/*
+ * 1. In-app chrome.
+ *
+ * The Buzz theme paints one gradient across the sidebar, community rail, top
+ * chrome and Settings; these four tokens are its only colour source. Light
+ * keeps a pale cyan wash rather than the navy so the dark Catppuccin Latte
+ * text on top of it stays legible; dark drops all the way to the FLEET ground.
+ */
+:root {
+  --buzz-gradient-light-top: #bfe9f4;
+  --buzz-gradient-light-bottom: #dde9ef;
+  --buzz-gradient-dark-top: #0a1e28;
+  --buzz-gradient-dark-bottom: #04090d;
+  /* Dark-mode content surface, so the reading area sits on navy too. */
+  --buzz-content-dark: 200 45% 11%;
+
+  /* Hosted-community onboarding keeps its light surface in both app themes,
+     so these stay light: pale cyan in place of the pale yellow. */
+  --buzz-hosted-community-divider-border: 61 214 240;
+  --buzz-hosted-community-action-bg: 214 240 246;
+  --buzz-hosted-community-action-bg-hover: 190 230 240;
+
+  /* Primary action colour app-wide. Light uses a deeper cyan so white label
+     text clears contrast; dark uses the bright accent with a navy label. */
+  --primary: 191 90% 33%;
+  --primary-foreground: 0 0% 100%;
+  --ring: 191 90% 33%;
+  --sidebar-primary: 191 90% 33%;
+  --sidebar-primary-foreground: 0 0% 100%;
+  --sidebar-ring: 191 90% 33%;
+}
+
+.dark {
+  --primary: 189 86% 59%;
+  --primary-foreground: 200 60% 10%;
+  --ring: 189 86% 59%;
+  --sidebar-primary: 189 86% 59%;
+  --sidebar-primary-foreground: 200 60% 10%;
+  --sidebar-ring: 189 86% 59%;
+}
+
+/*
+ * 2. First-launch / onboarding surfaces.
+ *
+ * Stock Buzz renders these as near-black ink on a flat chartreuse field. The
+ * FLEET build inverts that: light ink on the navy ground. The semantic tokens
+ * are all redefined together so the flip stays consistent - flipping only the
+ * ground would leave dark-on-dark text.
+ *
+ * The security subview is excluded: it is already a dark blue treatment of its
+ * own and needs no help telling itself apart.
+ */
+.buzz-onboarding-neutral-theme:not(.buzz-onboarding-security-theme) {
+  color-scheme: dark;
+
+  /* Ground of the landing field, and (by design in OnboardingChrome) the
+     label colour of the landing CTA, which now sits on a cyan pill. */
+  --buzz-welcome-chartreuse: #0a1e28;
+  --buzz-onboarding-shell-bottom: #06141b;
+  --buzz-onboarding-cta-label: #0a1e28;
+  /* Was olive ink for the private key; cyan reads on the dark key frame. */
+  --buzz-onboarding-backup-ink: #3dd6f0;
+
+  --background: 200 60% 10%;
+  --foreground: 0 0% 96%;
+  --card: 200 45% 14%;
+  --card-foreground: 0 0% 96%;
+  --popover: 200 45% 12%;
+  --popover-foreground: 0 0% 96%;
+  --primary: 189 86% 59%;
+  --primary-foreground: 200 60% 10%;
+  --secondary: 200 32% 20%;
+  --secondary-foreground: 0 0% 96%;
+  --muted: 200 32% 20%;
+  --muted-foreground: 195 24% 74%;
+  --accent: 200 32% 24%;
+  --accent-foreground: 0 0% 96%;
+  --border: 200 28% 28%;
+  --input: 200 28% 28%;
+  --ring: 189 86% 59%;
+
+  --buzz-onboarding-emoji-picker-background: 16, 34, 44;
+  --buzz-onboarding-emoji-picker-color: 245, 245, 245;
+  --buzz-onboarding-emoji-picker-input: 10, 30, 40;
+  --buzz-onboarding-avatar-dialog-bg: 16 34 44;
+  --buzz-onboarding-avatar-accent-bg: 20 52 66;
+  --buzz-onboarding-avatar-accent-fg: 61 214 240;
+  --buzz-onboarding-avatar-action-bg: 61 214 240;
+  --buzz-onboarding-avatar-action-fg: 10 30 40;
+  --buzz-onboarding-avatar-control-fg: 61 214 240;
+  --buzz-onboarding-avatar-dialog-shadow: 0 0 0;
+}
+
+/*
+ * The onboarding shell's dot grid is painted in black at 8% opacity, which
+ * vanishes on the navy ground. Same lattice, light dots instead. The gradient
+ * stops are re-listed because background-image is a single declaration.
+ */
+.buzz-onboarding-neutral-theme.buzz-startup-shell:not(
+  .buzz-onboarding-security-theme
+) {
+  background-image:
+    radial-gradient(circle, rgb(255 255 255 / 0.1) 1px, transparent 1px),
+    linear-gradient(
+      to bottom,
+      var(--buzz-welcome-chartreuse),
+      var(--buzz-onboarding-shell-bottom)
+    );
+  background-size:
+    24px 24px,
+    auto;
+}
+
+.buzz-onboarding-neutral-theme.buzz-startup-shell.buzz-onboarding-welcome:not(
+  .buzz-onboarding-security-theme
+) {
+  background-color: var(--buzz-welcome-chartreuse);
+  background-image: radial-gradient(
+    circle,
+    rgb(255 255 255 / 0.1) 1px,
+    transparent 1px
+  );
+  background-size: 24px 24px;
+}
+
+/*
+ * The landing wordmark is a black raster image, invisible on the navy field.
+ * `brightness(0) invert(1)` repaints it white while keeping its soft alpha
+ * edges, so the layout and the fuzzy treatment are untouched.
+ */
+.buzz-onboarding-welcome img[src*="buzz-wordmark"] {
+  filter: brightness(0) invert(1);
+}
+
+/* Full-screen Buzz logo splash, the one other flat chartreuse field. */
+.buzz-logo--background {
+  background-color: var(--fleet-ground);
+  background-image: radial-gradient(
+    circle,
+    rgb(255 255 255 / 0.14) 1.2px,
+    transparent 1.3px
+  );
+}
+
+/* The one sparing use of the magenta highlight inside the app surface. */
+::selection {
+  background-color: var(--fleet-highlight);
+  color: #ffffff;
+}
+
+/*
+ * 3. Permanent TEST marker.
+ *
+ * Pinned to the top of the window chrome so a screenshot of any screen -
+ * onboarding included, where there is no sidebar yet - says which app it is.
+ * `pointer-events: none` keeps it clear of the titlebar drag region, and the
+ * font size rides the app's virtual type rem rather than a raw px literal.
+ */
+body::after {
+  content: "TEST";
+  position: fixed;
+  top: 0.375rem;
+  left: 50%;
+  z-index: 2147483000;
+  transform: translateX(-50%);
+  pointer-events: none;
+  padding: 0.125rem 0.5rem;
+  border-radius: 999px;
+  background-color: var(--fleet-highlight);
+  color: #ffffff;
+  font-size: calc(var(--buzz-type-rem, 1rem) * 0.625);
+  font-weight: 700;
+  line-height: 1.4;
+  letter-spacing: 0.16em;
+}
