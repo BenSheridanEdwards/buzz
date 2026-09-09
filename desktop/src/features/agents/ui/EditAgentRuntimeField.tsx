@@ -8,6 +8,18 @@ import {
 } from "./HermesProfileField";
 import { PersonaDropdownField } from "./PersonaDropdownField";
 
+/** Everything the Hermes profile picker needs, as this field consumes it. */
+export type EditAgentHermesFieldProps = {
+  inherited: {
+    isInherited: boolean;
+    onEditDefinition?: () => void;
+    path: string;
+  };
+  onProfileChange: (profile: HermesProfile | null) => void;
+  profiles: readonly HermesProfile[];
+  status: HermesProfilesStatus;
+};
+
 /**
  * Runtime (harness) picker for the instance edit dialog, with the inline
  * "Add custom harness" dialog and, for Hermes, the profile picker beneath it.
@@ -27,16 +39,7 @@ export function EditAgentRuntimeField({
   disabled: boolean;
   envVars: Record<string, string>;
   /** Present only while the prospective harness is Hermes. */
-  hermes: {
-    inherited: {
-      isInherited: boolean;
-      onEditDefinition?: () => void;
-      path: string;
-    };
-    onProfileChange: (profile: HermesProfile | null) => void;
-    profiles: readonly HermesProfile[];
-    status: HermesProfilesStatus;
-  } | null;
+  hermes: EditAgentHermesFieldProps | null;
   isAddHarnessOpen: boolean;
   onAddHarnessOpenChange: (open: boolean) => void;
   onHarnessSaved: (id: string) => void;
