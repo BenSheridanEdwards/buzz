@@ -19,6 +19,7 @@ import 'package:buzz/features/channels/compose_bar.dart';
 import 'package:buzz/features/channels/channels_provider.dart';
 import 'package:buzz/features/channels/photo_library.dart';
 import 'package:buzz/features/channels/voice_note_play_pause_icon.dart';
+import 'package:buzz/features/channels/voice_note_recorder_phase.dart';
 import 'package:buzz/features/channels/voice_note_recording.dart';
 import 'package:buzz/features/channels/voice_note_waveform.dart';
 import 'package:buzz/shared/custom_emoji/custom_emoji.dart';
@@ -469,6 +470,7 @@ class _FakeVoiceNoteRecorder implements VoiceNoteRecorder {
     sync: true,
   );
   bool started = false;
+  bool stopped = false;
   bool cancelled = false;
   bool disposed = false;
 
@@ -484,11 +486,20 @@ class _FakeVoiceNoteRecorder implements VoiceNoteRecorder {
   }
 
   @override
-  Future<VoiceNoteRecording> stop() async => VoiceNoteRecording(
-    file: XFile(path, mimeType: 'audio/mp4'),
-    duration: const Duration(seconds: 3),
-    waveform: const [0.2, 0.7, 0.4, 0.9],
-  );
+  Future<void> pause() async {}
+
+  @override
+  Future<void> resume() async {}
+
+  @override
+  Future<VoiceNoteRecording> stop() async {
+    stopped = true;
+    return VoiceNoteRecording(
+      file: XFile(path, mimeType: 'audio/mp4'),
+      duration: const Duration(seconds: 3),
+      waveform: const [0.2, 0.7, 0.4, 0.9],
+    );
+  }
 
   @override
   Future<void> cancel() async {
@@ -721,7 +732,11 @@ void main() {
 
       expect(find.byType(TextField), findsNothing);
       expect(find.byTooltip('Add attachment').hitTestable(), findsOneWidget);
-      expect(find.byIcon(LucideIcons.arrowUp).hitTestable(), findsOneWidget);
+      expect(
+        find.byKey(const ValueKey('composer-mic')).hitTestable(),
+        findsOneWidget,
+      );
+      expect(find.byIcon(LucideIcons.arrowUp), findsNothing);
       expect(find.byKey(const ValueKey('composer-footer-gradient')), findsOne);
       final composerBackdrop = find.descendant(
         of: find.byKey(const ValueKey('composer-footer-gradient')),
@@ -1907,84 +1922,6 @@ void main() {
       }
     });
 
-    testWidgets(
-      'native Voice note waits for the keyboard while the popover dismisses',
-      (tester) async {
-        final previousPlatform = debugDefaultTargetPlatformOverride;
-        debugDefaultTargetPlatformOverride = TargetPlatform.iOS;
-        tester.view.viewInsets = const FakeViewPadding(bottom: 300);
-        final recorder = _FakeVoiceNoteRecorder();
-        _setMockNativeAttachmentPopoverHandler((call) async {
-          return switch (call.method) {
-            'isSupported' || 'present' => true,
-            'dismiss' => null,
-            _ => null,
-          };
-        });
-
-        try {
-          await tester.pumpWidget(
-            _buildComposeBar(
-              uploadService: _testUploadService(nostr.Keys.generate().nsec),
-              voiceNoteRecorderFactory: () => recorder,
-              onSend:
-                  (
-                    content,
-                    mentionPubkeys, {
-                    mediaTags = const <List<String>>[],
-                  }) async {},
-            ),
-          );
-
-          await _expandComposer(tester);
-          await tester.tap(find.byTooltip('Add attachment').hitTestable());
-          await tester.pumpAndSettle();
-          await _sendNativeAttachmentPopoverCall(tester, 'recordVoiceNote');
-          await tester.pump();
-
-          expect(
-            find.byKey(const ValueKey('voice-note-recorder')),
-            findsNothing,
-          );
-          expect(recorder.started, isFalse);
-          final initialPosition = tester.widget<Transform>(
-            find.byKey(const ValueKey('composer-position-transition')),
-          );
-          expect(initialPosition.transform.getTranslation().y, 0);
-
-          await tester.pump(const Duration(milliseconds: 100));
-
-          final closingKeyboardPosition = tester.widget<Transform>(
-            find.byKey(const ValueKey('composer-position-transition')),
-          );
-          expect(
-            closingKeyboardPosition.transform.getTranslation().y,
-            greaterThan(0),
-          );
-          expect(
-            closingKeyboardPosition.transform.getTranslation().y,
-            lessThan(Grid.twelve + Grid.quarter),
-          );
-          expect(recorder.started, isFalse);
-
-          tester.view.viewInsets = FakeViewPadding.zero;
-          await tester.pumpAndSettle();
-
-          expect(
-            find.byKey(const ValueKey('voice-note-recorder')),
-            findsOneWidget,
-          );
-          expect(recorder.started, isTrue);
-        } finally {
-          await _sendNativeAttachmentPopoverCall(tester, 'dismissed');
-          await tester.pumpWidget(const SizedBox.shrink());
-          tester.view.reset();
-          _setMockNativeAttachmentPopoverHandler(null);
-          debugDefaultTargetPlatformOverride = previousPlatform;
-        }
-      },
-    );
-
     testWidgets('leaving a focused composer dismisses the native keyboard', (
       tester,
     ) async {
@@ -2710,13 +2647,7 @@ void main() {
       final menu = find.byKey(const ValueKey('attachment-menu'));
       final surface = find.byKey(const ValueKey('attachment-surface-popover'));
       final rows = [
-        for (final label in [
-          'camera',
-          'photos',
-          'video',
-          'voice note',
-          'files',
-        ])
+        for (final label in ['camera', 'photos', 'video', 'files'])
           find.byKey(ValueKey('attachment-menu-item-$label')),
       ];
       final menuRect = tester.getRect(menu);
@@ -2730,41 +2661,23 @@ void main() {
         material.shadowColor,
         appPopoverShadowColor(tester.element(surface)),
       );
-      expect(menuRect.size, const Size(216, 324));
+      expect(menuRect.size, const Size(216, 264));
       for (final row in rows) {
         expect(tester.getSize(row).height, 52);
         expect(tester.getRect(row).left - menuRect.left, Grid.xs);
         expect(menuRect.right - tester.getRect(row).right, Grid.xs);
       }
-      for (final label in [
-        'Camera',
-        'Photos',
-        'Video',
-        'Voice note',
-        'Files',
-      ]) {
+      for (final label in ['Camera', 'Photos', 'Video', 'Files']) {
         final text = tester.widget<Text>(find.text(label));
         expect(text.style?.fontSize, 20);
         expect(text.style?.fontFamily, 'Inter');
       }
       final icons = [
-        for (final label in [
-          'camera',
-          'photos',
-          'video',
-          'voice note',
-          'files',
-        ])
+        for (final label in ['camera', 'photos', 'video', 'files'])
           find.byKey(ValueKey('attachment-menu-icon-$label')),
       ];
       final labels = [
-        for (final label in [
-          'camera',
-          'photos',
-          'video',
-          'voice note',
-          'files',
-        ])
+        for (final label in ['camera', 'photos', 'video', 'files'])
           find.byKey(ValueKey('attachment-menu-label-$label')),
       ];
       for (final icon in icons) {
@@ -2859,13 +2772,7 @@ void main() {
 
         final menu = find.byKey(const ValueKey('attachment-menu'));
         final rows = [
-          for (final label in [
-            'camera',
-            'photos',
-            'video',
-            'voice note',
-            'files',
-          ])
+          for (final label in ['camera', 'photos', 'video', 'files'])
             find.byKey(ValueKey('attachment-menu-item-$label')),
         ];
         final scrollView = tester.widget<ListView>(
@@ -4634,11 +4541,11 @@ void main() {
         ),
       );
 
-      await _expandComposer(tester);
-      await tester.enterText(find.byType(TextField), 'Keep this draft');
-      await _openAttachmentMenu(tester);
-      expect(find.text('Voice note'), findsOneWidget);
-      await tester.tap(find.text('Voice note'));
+      final gesture = await tester.startGesture(
+        tester.getCenter(
+          find.byKey(const ValueKey('composer-mic')).hitTestable(),
+        ),
+      );
       await tester.pump();
       await tester.pump(const Duration(milliseconds: 100));
 
@@ -4653,16 +4560,18 @@ void main() {
           (transitioningDecoration.borderRadius! as BorderRadius).topLeft.x;
       expect(transitioningRadius, greaterThan(Radii.dialog));
       expect(transitioningRadius, lessThan(Radii.full));
+      await tester.pump(voiceNoteTapHoldThreshold);
       await tester.pumpAndSettle();
 
       expect(recorder.started, isTrue);
       expect(find.byKey(const ValueKey('voice-note-recorder')), findsOneWidget);
       expect(
-        find.byKey(const ValueKey('voice-note-recorder-close')),
+        find.byKey(const ValueKey('voice-note-recorder-held-mic')),
         findsOneWidget,
       );
+      expect(find.text('Slide to cancel'), findsOneWidget);
       expect(
-        find.byKey(const ValueKey('voice-note-recorder-stop')),
+        find.byKey(const ValueKey('voice-note-lock-chip')),
         findsOneWidget,
       );
       expect(find.byKey(const ValueKey('voice-note-waveform')), findsOneWidget);
@@ -4681,13 +4590,6 @@ void main() {
         recordingOuterGutter.padding,
         const EdgeInsets.symmetric(horizontal: 16),
       );
-      final recordingPosition = tester.widget<Transform>(
-        find.byKey(const ValueKey('composer-position-transition')),
-      );
-      expect(
-        recordingPosition.transform.getTranslation().y,
-        Grid.twelve + Grid.quarter,
-      );
       final composerDecoration =
           tester
                   .widget<Container>(
@@ -4699,7 +4601,9 @@ void main() {
         find.byKey(const ValueKey('composer-surface')),
       );
       expect(
-        tester.widget(find.byKey(const ValueKey('voice-note-recorder'))),
+        tester.widget(
+          find.byKey(const ValueKey('voice-note-recorder-hold-row')),
+        ),
         isA<Row>(),
       );
       expect(
@@ -4723,17 +4627,12 @@ void main() {
         find.byType(VoiceNoteWaveform),
       );
       expect(waveform.samples.last, 0.99);
-      final updatedRecordingPosition = tester.widget<Transform>(
-        find.byKey(const ValueKey('composer-position-transition')),
-      );
-      expect(
-        updatedRecordingPosition.transform.getTranslation().y,
-        recordingPosition.transform.getTranslation().y,
-      );
 
-      await tester.tap(find.byKey(const ValueKey('voice-note-recorder-stop')));
+      await gesture.up();
       await tester.pumpAndSettle();
 
+      expect(recorder.stopped, isTrue);
+      expect(find.byKey(const ValueKey('voice-note-recorder')), findsNothing);
       expect(
         find.byKey(const ValueKey('composer-voice-note-remove')),
         findsOneWidget,
@@ -4816,6 +4715,12 @@ void main() {
             .width,
         recordingWidth,
       );
+
+      // The pending note swaps the mic for Send; text can still be added.
+      expect(find.byKey(const ValueKey('composer-mic')), findsNothing);
+      await _expandComposer(tester);
+      await tester.enterText(find.byType(TextField), 'Keep this draft');
+      await tester.pumpAndSettle();
       final sendButton = find
           .ancestor(
             of: find.byIcon(LucideIcons.arrowUp),
@@ -5052,9 +4957,7 @@ void main() {
           onSend: (_, _, {mediaTags = const <List<String>>[]}) async {},
         ),
       );
-      await _openAttachmentMenu(tester);
-      await tester.tap(find.text('Voice note'));
-      await tester.pumpAndSettle();
+      await _tapMic(tester);
       expect(find.byKey(const ValueKey('voice-note-recorder')), findsOneWidget);
 
       final container = ProviderScope.containerOf(
@@ -5075,9 +4978,13 @@ void main() {
       await tester.pumpAndSettle();
       expect(recorder.started, isFalse);
       expect(recorder.disposed, isTrue);
+      expect(
+        container.read(voiceNoteRecorderPhaseProvider).phase,
+        VoiceNoteRecorderPhase.idle,
+      );
     });
 
-    testWidgets('disables Stop while voice-note startup is pending', (
+    testWidgets('disables Send while voice-note startup is pending', (
       tester,
     ) async {
       final recorder = _DelayedVoiceNoteRecorder();
@@ -5089,32 +4996,25 @@ void main() {
         ),
       );
 
-      await _openAttachmentMenu(tester);
-      await tester.tap(find.text('Voice note'));
-      await tester.pumpAndSettle();
+      await _tapMic(tester);
 
-      final stop = tester.widget<IconButton>(
-        find.descendant(
-          of: find.byKey(const ValueKey('voice-note-recorder-stop')),
-          matching: find.byType(IconButton),
-        ),
-      );
-      expect(stop.onPressed, isNull);
-      await tester.tap(find.byKey(const ValueKey('voice-note-recorder-stop')));
+      final send = find.byKey(const ValueKey('voice-note-recorder-send'));
+      expect(send, findsOneWidget);
+      await tester.tap(send);
+      await tester.pumpAndSettle();
       expect(recorder.stopCalled, isFalse);
+      expect(find.byKey(const ValueKey('voice-note-recorder')), findsOneWidget);
 
       recorder.startup.complete();
       await tester.pumpAndSettle();
+      await tester.tap(send);
+      await tester.pumpAndSettle();
+      expect(recorder.stopCalled, isTrue);
       expect(
-        tester
-            .widget<IconButton>(
-              find.descendant(
-                of: find.byKey(const ValueKey('voice-note-recorder-stop')),
-                matching: find.byType(IconButton),
-              ),
-            )
-            .onPressed,
-        isNotNull,
+        find.byKey(
+          const ValueKey('voice-note-attachment:/tmp/voice-note-test.m4a'),
+        ),
+        findsOneWidget,
       );
     });
 
@@ -5131,9 +5031,7 @@ void main() {
             onSend: (_, _, {mediaTags = const <List<String>>[]}) async {},
           ),
         );
-        await _openAttachmentMenu(tester);
-        await tester.tap(find.text('Voice note'));
-        await tester.pumpAndSettle();
+        await _tapMic(tester);
 
         lifecycle.setLifecycle(AppLifecycleState.inactive);
         lifecycle.setLifecycle(AppLifecycleState.resumed);
@@ -5160,9 +5058,7 @@ void main() {
           onSend: (_, _, {mediaTags = const <List<String>>[]}) async {},
         ),
       );
-      await _openAttachmentMenu(tester);
-      await tester.tap(find.text('Voice note'));
-      await tester.pumpAndSettle();
+      await _tapMic(tester);
 
       lifecycle.setLifecycle(AppLifecycleState.hidden);
       await tester.pump();
@@ -5184,9 +5080,7 @@ void main() {
             onSend: (_, _, {mediaTags = const <List<String>>[]}) async {},
           ),
         );
-        await _openAttachmentMenu(tester);
-        await tester.tap(find.text('Voice note'));
-        await tester.pumpAndSettle();
+        await _tapMic(tester);
 
         lifecycle.setLifecycle(AppLifecycleState.paused);
 
@@ -5215,9 +5109,7 @@ void main() {
               onSend: (_, _, {mediaTags = const <List<String>>[]}) async {},
             ),
           );
-          await _openAttachmentMenu(tester);
-          await tester.tap(find.text('Voice note'));
-          await tester.pumpAndSettle();
+          await _tapMic(tester);
 
           lifecycle.setLifecycle(lifecycleState);
 
@@ -5228,11 +5120,15 @@ void main() {
             find.byKey(const ValueKey('voice-note-recorder')),
             findsNothing,
           );
+          expect(
+            find.byKey(const ValueKey('composer-mic')).hitTestable(),
+            findsOneWidget,
+          );
         },
       );
     }
 
-    testWidgets('voice note rejects an existing attachment like desktop', (
+    testWidgets('voice note yields the slot to Send once a file is attached', (
       tester,
     ) async {
       final recorder = _FakeVoiceNoteRecorder();
@@ -5245,18 +5141,21 @@ void main() {
           onSend: (_, _, {mediaTags = const <List<String>>[]}) async {},
         ),
       );
-      await _openAttachmentMenu(tester);
-      await tester.tap(find.text('Files'));
-      await tester.pumpAndSettle();
-      await _openAttachmentMenu(tester);
-      await tester.tap(find.text('Voice note'));
-      await tester.pumpAndSettle();
-
       expect(
-        find.text('A voice note must be the only attachment.'),
+        find.byKey(const ValueKey('composer-mic')).hitTestable(),
         findsOneWidget,
       );
+      await _openAttachmentMenu(tester);
+      expect(find.text('Voice note'), findsNothing);
+      await tester.tap(find.text('Files'));
+      await tester.pumpAndSettle();
+
       expect(find.text('extra.txt'), findsOneWidget);
+      expect(find.byKey(const ValueKey('composer-mic')), findsNothing);
+      expect(
+        find.byKey(const ValueKey('composer-send')).hitTestable(),
+        findsOneWidget,
+      );
       expect(recorder.started, isFalse);
       expect(find.byKey(const ValueKey('voice-note-recorder')), findsNothing);
     });
@@ -5274,10 +5173,8 @@ void main() {
           onSend: (_, _, {mediaTags = const <List<String>>[]}) async {},
         ),
       );
-      await _openAttachmentMenu(tester);
-      await tester.tap(find.text('Voice note'));
-      await tester.pumpAndSettle();
-      await tester.tap(find.byKey(const ValueKey('voice-note-recorder-stop')));
+      await _tapMic(tester);
+      await tester.tap(find.byKey(const ValueKey('voice-note-recorder-send')));
       await tester.pumpAndSettle();
 
       await _openAttachmentMenu(tester);
@@ -5315,11 +5212,9 @@ void main() {
           ),
         );
 
-        await _openAttachmentMenu(tester);
-        await tester.tap(find.text('Voice note'));
-        await tester.pumpAndSettle();
+        await _tapMic(tester);
         await tester.tap(
-          find.byKey(const ValueKey('voice-note-recorder-stop')),
+          find.byKey(const ValueKey('voice-note-recorder-send')),
         );
         await tester.pumpAndSettle();
         final sendButton = find
@@ -5335,9 +5230,7 @@ void main() {
           '/tmp/first-voice-note.m4a',
         );
 
-        await _openAttachmentMenu(tester);
-        await tester.tap(find.text('Voice note'));
-        await tester.pumpAndSettle();
+        await _tapMic(tester);
         expect(
           find.byKey(const ValueKey('voice-note-recorder')),
           findsOneWidget,
@@ -5359,7 +5252,7 @@ void main() {
           findsNothing,
         );
         await tester.tap(
-          find.byKey(const ValueKey('voice-note-recorder-stop')),
+          find.byKey(const ValueKey('voice-note-recorder-send')),
         );
         await tester.pumpAndSettle();
         expect(
@@ -5382,9 +5275,7 @@ void main() {
           onSend: (_, _, {mediaTags = const <List<String>>[]}) async {},
         ),
       );
-      await _openAttachmentMenu(tester);
-      await tester.tap(find.text('Voice note'));
-      await tester.pumpAndSettle();
+      await _tapMic(tester);
 
       final context = tester.element(
         find.byKey(const ValueKey('voice-note-recorder')),
@@ -5412,10 +5303,10 @@ void main() {
         ),
       );
 
-      await _openAttachmentMenu(tester);
-      await tester.tap(find.text('Voice note'));
-      await tester.pumpAndSettle();
-      await tester.tap(find.byKey(const ValueKey('voice-note-recorder-close')));
+      await _tapMic(tester);
+      await tester.tap(
+        find.byKey(const ValueKey('voice-note-recorder-cancel')),
+      );
       await tester.pump();
 
       final contentMorph = find.byKey(const ValueKey('composer-content-morph'));
@@ -5457,6 +5348,10 @@ void main() {
       expect(find.byKey(const ValueKey('voice-note-recorder')), findsNothing);
       expect(find.byTooltip('Add attachment').hitTestable(), findsOneWidget);
       expect(
+        find.byKey(const ValueKey('composer-mic')).hitTestable(),
+        findsOneWidget,
+      );
+      expect(
         find.byKey(const ValueKey('composer-voice-note-remove')),
         findsNothing,
       );
@@ -5477,17 +5372,15 @@ void main() {
         ),
       );
 
-      await _openAttachmentMenu(tester);
-      await tester.tap(find.text('Voice note'));
-      await tester.pumpAndSettle();
-      await tester.tap(find.byKey(const ValueKey('voice-note-recorder-stop')));
+      await _tapMic(tester);
+      await tester.tap(find.byKey(const ValueKey('voice-note-recorder-send')));
       await tester.pumpAndSettle();
       await tester.tap(
         find.byKey(const ValueKey('composer-voice-note-remove')),
       );
       await tester.pumpAndSettle();
 
-      await tester.tap(find.text('Message\u2026'));
+      await tester.tap(find.text('Message…'));
       await tester.pump();
       await tester.pump();
 
@@ -5736,6 +5629,17 @@ AgentDirectoryEntry _testAgent(String pubkey) {
 Future<void> _expandComposer(WidgetTester tester) async {
   if (find.byType(TextField).evaluate().isNotEmpty) return;
   await tester.tap(find.text('Message\u2026'));
+  await tester.pumpAndSettle();
+}
+
+/// Taps the mic so the recorder starts hands free.
+Future<void> _tapMic(WidgetTester tester) async {
+  await tester.pumpAndSettle();
+  final gesture = await tester.startGesture(
+    tester.getCenter(find.byKey(const ValueKey('composer-mic')).hitTestable()),
+  );
+  await tester.pump(const Duration(milliseconds: 20));
+  await gesture.up();
   await tester.pumpAndSettle();
 }
 

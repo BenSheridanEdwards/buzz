@@ -2,6 +2,9 @@ part of '../compose_bar.dart';
 
 class _ComposeBarLayout extends HookWidget {
   final Widget? voiceNoteRecorder;
+  final bool voiceNoteRecorderExpanded;
+  final void Function(int pointer, Offset origin) onMicPointerDown;
+  final VoidCallback onMicActivate;
   final List<_PendingAttachment> attachments;
   final ValueChanged<int> onRemoveAttachment;
   final String? uploadError;
@@ -31,6 +34,9 @@ class _ComposeBarLayout extends HookWidget {
 
   const _ComposeBarLayout({
     required this.voiceNoteRecorder,
+    required this.voiceNoteRecorderExpanded,
+    required this.onMicPointerDown,
+    required this.onMicActivate,
     required this.attachments,
     required this.onRemoveAttachment,
     required this.uploadError,
@@ -170,11 +176,7 @@ class _ComposeBarLayout extends HookWidget {
                 ),
               ),
               const SizedBox(width: Grid.xxs),
-              _SendButton(
-                isDisabled: !canSend || hasPendingUploads,
-                isSending: isSending,
-                onTap: onSend,
-              ),
+              _buildTrailingSlot(),
             ],
           ),
         _ExpandedComposerActionsMotion(
@@ -228,11 +230,7 @@ class _ComposeBarLayout extends HookWidget {
                                   onTap: onOpenFormatting,
                                 ),
                                 const Spacer(),
-                                _SendButton(
-                                  isDisabled: !canSend || hasPendingUploads,
-                                  isSending: isSending,
-                                  onTap: onSend,
-                                ),
+                                _buildTrailingSlot(),
                               ],
                             ),
                     ),
@@ -281,7 +279,9 @@ class _ComposeBarLayout extends HookWidget {
         final composerRadius = Radii.dialog + Grid.quarter * (1 - progress);
         final radius = BorderRadius.lerp(
           BorderRadius.circular(composerRadius),
-          BorderRadius.circular(Radii.full),
+          BorderRadius.circular(
+            voiceNoteRecorderExpanded ? Radii.container : Radii.full,
+          ),
           Curves.easeInOutCubic.transform(recordingTransition.value),
         )!;
         final usesIosConcentricSurface =
@@ -321,6 +321,15 @@ class _ComposeBarLayout extends HookWidget {
       },
     );
   }
+
+  Widget _buildTrailingSlot() => _ComposerTrailingSlot(
+    showMic: !canSend && !isSending,
+    isSending: isSending,
+    isSendDisabled: !canSend || hasPendingUploads,
+    onSend: onSend,
+    onMicPointerDown: onMicPointerDown,
+    onMicActivate: onMicActivate,
+  );
 
   Widget _buildTextField(BuildContext context) {
     return TextField(

@@ -134,6 +134,17 @@ class MessageContent extends HookConsumerWidget {
   /// gutter while keeping its first image and count aligned with the body.
   final double mediaCarouselTrailingOverflow;
 
+  /// Display name of the message author, shown inline in the voice-note
+  /// time row while it plays.
+  final String? voiceNoteSenderName;
+
+  /// Whether a voice-note transcript unfolds when playback starts (true in
+  /// DMs) for a message without a remembered choice.
+  final bool voiceNoteTranscriptOpenByDefault;
+
+  /// Id of the message, keying the remembered transcript choice.
+  final String? voiceNoteMessageId;
+
   const MessageContent({
     super.key,
     required this.content,
@@ -151,6 +162,9 @@ class MessageContent extends HookConsumerWidget {
     this.scaleEmojiOnly = false,
     this.mediaCarouselLeadingOverflow = 0,
     this.mediaCarouselTrailingOverflow = 0,
+    this.voiceNoteSenderName,
+    this.voiceNoteTranscriptOpenByDefault = false,
+    this.voiceNoteMessageId,
   });
 
   @override
@@ -333,6 +347,10 @@ class MessageContent extends HookConsumerWidget {
           duration: Duration(
             milliseconds: ((imeta?.duration ?? 0) * 1000).round(),
           ),
+          senderName: voiceNoteSenderName,
+          transcript: imeta?.alt,
+          transcriptOpenByDefault: voiceNoteTranscriptOpenByDefault,
+          messageId: voiceNoteMessageId,
         ),
       );
     }

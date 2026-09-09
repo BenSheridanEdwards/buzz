@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:io';
 
+import 'package:clock/clock.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_hooks/flutter_hooks.dart';
@@ -9,8 +10,25 @@ import 'package:lucide_icons_flutter/lucide_icons.dart';
 
 import '../../shared/relay/app_lifecycle_provider.dart';
 import '../../shared/theme/theme.dart';
+import '../../shared/voice_notes/voice_note_preferences.dart';
+import '../../shared/widgets/buzz_loading_indicator.dart';
+import 'voice_note_attachment.dart';
+import 'voice_note_recorder_phase.dart';
 import 'voice_note_recording.dart';
 import 'voice_note_waveform.dart';
+
+part 'voice_note_composer_recorder/cancel_hint.dart';
+part 'voice_note_composer_recorder/controls.dart';
+part 'voice_note_composer_recorder/hold.dart';
+part 'voice_note_composer_recorder/lock_chip.dart';
+part 'voice_note_composer_recorder/locked.dart';
+part 'voice_note_composer_recorder/review.dart';
+
+/// Interval between screen-reader announcements of the elapsed time.
+const voiceNoteTimerAnnounceInterval = Duration(seconds: 10);
+
+/// Time left before the cap at which the timer warns.
+const voiceNoteCapWarning = Duration(seconds: 10);
 
 class _VoiceNoteRouteAware extends RouteAware {
   _VoiceNoteRouteAware(this.onCovered);
@@ -21,32 +39,73 @@ class _VoiceNoteRouteAware extends RouteAware {
   void didPushNext() => onCovered();
 }
 
-/// Composer control that records, previews levels, and finalizes a voice note.
+/// Composer control that records a voice note through the hold, lock, and
+/// review phases owned by [voiceNoteRecorderPhaseProvider].
+///
+/// Every exit path ends in one of the callbacks: [onRecorded] with a finished
+/// note, [onCancel] with nothing to keep, or [onError] with text for the
+/// composer's error line. The parent clears its recording flags and resets
+/// the phase in each case, so a gesture in flight can never leave the
+/// composer stuck.
 class VoiceNoteComposerRecorder extends HookConsumerWidget {
   const VoiceNoteComposerRecorder({
     super.key,
     required this.onCancel,
     required this.onRecorded,
+    required this.onError,
   });
 
   final VoidCallback onCancel;
   final ValueChanged<VoiceNoteRecording> onRecorded;
+  final ValueChanged<String> onError;
 
   @override
   Widget build(BuildContext context, WidgetRef ref) {
-    final recorder = useMemoized(ref.read(voiceNoteRecorderFactoryProvider));
+    final liveState = ref.watch(voiceNoteRecorderPhaseProvider);
+    final phaseNotifier = ref.read(voiceNoteRecorderPhaseProvider.notifier);
+    final reviewBeforeSending = ref.watch(voiceNoteReviewSettingProvider);
+    // The generation this element was mounted for, frozen for its lifetime.
+    // The composer swaps the recorder in and out through a 140 ms fade, so an
+    // element from a finished take is still mounted, and still watching the
+    // phase, while the next take begins. Freezing the generation keeps that
+    // outgoing element from adopting the new take: it never builds a second
+    // recorder, it stops reacting to the phase, and it only ever releases the
+    // generation it owned (rule 2).
+    final generation = useRef(liveState.generation).value;
+    final isOwner = liveState.generation == generation;
+    final ownedState = useRef(liveState);
+    if (isOwner) ownedState.value = liveState;
+    final phaseState = ownedState.value;
+    final recorder = useMemoized(ref.read(voiceNoteRecorderFactoryProvider), [
+      generation,
+    ]);
     final samples = useState<List<double>>(const []);
     final sampleSequence = useState(0);
     final elapsed = useState(Duration.zero);
-    final error = useState<String?>(null);
+    final announcedElapsed = useState(Duration.zero);
     final isStarted = useState(false);
-    final isStopping = useState(false);
-    final startedAt = useRef<DateTime?>(null);
+    final isStopping = useRef(false);
+    final startup = useRef<Future<void>?>(null);
+    final segmentStartedAt = useRef<DateTime?>(null);
+    final accumulated = useRef(Duration.zero);
+    final reviewRecording = useState<VoiceNoteRecording?>(null);
+    final lockChipLink = useMemoized(LayerLink.new);
+    final lockChipController = useMemoized(OverlayPortalController.new);
+
+    // Only capture is abandoned when the app leaves or a route covers the
+    // composer. A finish in flight completes on its own, and a note under
+    // review stays until the user decides (rule 6).
+    void cancelIfCapturing() {
+      if (!context.mounted) return;
+      final current = ref.read(voiceNoteRecorderPhaseProvider);
+      if (current.generation != generation || !current.isRecording) return;
+      unawaited(recorder.cancel());
+      onCancel();
+    }
+
     final routeAware = useMemoized(
-      () => _VoiceNoteRouteAware(() {
-        if (context.mounted) onCancel();
-      }),
-      [onCancel],
+      () => _VoiceNoteRouteAware(cancelIfCapturing),
+      [recorder, onCancel],
     );
 
     useEffect(() {
@@ -58,8 +117,7 @@ class VoiceNoteComposerRecorder extends HookConsumerWidget {
             next != AppLifecycleState.detached) {
           return;
         }
-        unawaited(recorder.cancel());
-        if (context.mounted) onCancel();
+        cancelIfCapturing();
       });
       return subscription.close;
     }, [recorder, onCancel]);
@@ -70,27 +128,162 @@ class VoiceNoteComposerRecorder extends HookConsumerWidget {
       return () => voiceNoteRouteObserver.unsubscribe(routeAware);
     }, [routeAware, route]);
 
+    // Unmounting is a removal path too: a note still under review is
+    // deleted, and a phase this recorder still owns (the page was popped
+    // mid-recording) is released so the next composer's mic is not stuck.
+    useEffect(
+      () => () {
+        final pending = reviewRecording.value;
+        if (pending != null) {
+          unawaited(deleteDroppedVoiceNoteRecording(pending.file.path));
+        }
+        scheduleMicrotask(() => phaseNotifier.release(generation));
+      },
+      const [],
+    );
+
+    Future<void> discardReview() async {
+      final recording = reviewRecording.value;
+      reviewRecording.value = null;
+      if (recording != null) {
+        await deleteDroppedVoiceNoteRecording(recording.file.path);
+      }
+    }
+
+    /// Whether the finish this element began is still the one the phase
+    /// machine expects. Anything that reset the phase in the meantime (a
+    /// cancel, a channel switch, a fresh take) owns the composer now, so a
+    /// late stop result must be dropped, not published (rule 2).
+    bool stillFinishing() {
+      if (!context.mounted) return false;
+      final current = ref.read(voiceNoteRecorderPhaseProvider);
+      return current.phase == VoiceNoteRecorderPhase.finishing &&
+          current.generation == generation;
+    }
+
+    /// Whether this take is too short to keep. The audio can be shorter than
+    /// the press: `hasPermission`, the temp directory, and the native start
+    /// all run first. Telling someone who held the mic for well over a second
+    /// that a voice note needs at least one second is a lie, so a press that
+    /// long is kept even when the capture came up short.
+    bool isTooShort(Duration captured, DateTime? beganAt) {
+      if (captured >= voiceNoteMinDuration) return false;
+      final pressedFor = beganAt == null
+          ? Duration.zero
+          : clock.now().difference(beganAt);
+      return pressedFor < voiceNoteMinDuration;
+    }
+
     Future<void> finish() async {
-      if (!isStarted.value || isStopping.value || error.value != null) return;
+      if (isStopping.value) return;
       isStopping.value = true;
+      final beganAt = ref.read(voiceNoteRecorderPhaseProvider).beganAt;
       unawaited(HapticFeedback.mediumImpact());
+      if (!isStarted.value) {
+        // Released before capture began: wait for the start to settle. A
+        // failed start has already reported itself through onError.
+        try {
+          await startup.value;
+        } catch (_) {
+          return;
+        }
+        if (!stillFinishing() || !isStarted.value) return;
+      }
       try {
         final recording = await recorder.stop();
-        if (context.mounted) {
-          onRecorded(recording);
+        // Deletions are best effort and never gate the composer's recovery.
+        if (!stillFinishing()) {
+          unawaited(deleteDroppedVoiceNoteRecording(recording.file.path));
+          return;
+        }
+        if (isTooShort(recording.duration, beganAt)) {
+          unawaited(deleteDroppedVoiceNoteRecording(recording.file.path));
+          onError(voiceNoteHoldToRecordHint);
+          return;
+        }
+        if (reviewBeforeSending) {
+          reviewRecording.value = recording;
+          phaseNotifier.review();
         } else {
-          await deleteDroppedVoiceNoteRecording(recording.file.path);
+          onRecorded(recording);
         }
       } catch (_) {
-        if (context.mounted) {
-          error.value = 'Buzz could not finish the voice note.';
-          isStopping.value = false;
+        if (stillFinishing()) {
+          onError('Buzz could not finish the voice note.');
         }
       }
     }
 
+    void sendReviewed() {
+      final recording = reviewRecording.value;
+      if (recording == null) return;
+      reviewRecording.value = null;
+      unawaited(HapticFeedback.mediumImpact());
+      onRecorded(recording);
+    }
+
+    void cancelRecording() {
+      if (ref.read(voiceNoteRecorderPhaseProvider).phase ==
+          VoiceNoteRecorderPhase.finishing) {
+        // The stop is already in flight; its result decides, not a late
+        // cancel that would race it.
+        return;
+      }
+      unawaited(discardReview());
+      onCancel();
+    }
+
+    ref.listen<VoiceNoteRecorderState>(voiceNoteRecorderPhaseProvider, (
+      previous,
+      next,
+    ) {
+      // A take this element does not own belongs to the element that
+      // replaced it; reacting here would start or stop its recorder.
+      if (next.generation != generation) return;
+      final from = previous?.phase;
+      switch (next.phase) {
+        case VoiceNoteRecorderPhase.idle:
+          if (next.cancelledByGesture &&
+              from == VoiceNoteRecorderPhase.holding) {
+            unawaited(HapticFeedback.mediumImpact());
+          }
+        case VoiceNoteRecorderPhase.finishing:
+          unawaited(finish());
+        case VoiceNoteRecorderPhase.paused:
+          if (from == VoiceNoteRecorderPhase.locked) {
+            final segmentStart = segmentStartedAt.value;
+            if (segmentStart != null) {
+              accumulated.value += clock.now().difference(segmentStart);
+              segmentStartedAt.value = null;
+            }
+            unawaited(HapticFeedback.selectionClick());
+            unawaited(recorder.pause());
+          }
+        case VoiceNoteRecorderPhase.locked:
+          if (from == VoiceNoteRecorderPhase.paused) {
+            if (isStarted.value) segmentStartedAt.value = clock.now();
+            unawaited(HapticFeedback.selectionClick());
+            unawaited(recorder.resume());
+          } else if (from == VoiceNoteRecorderPhase.holding) {
+            unawaited(HapticFeedback.mediumImpact());
+          } else if (from == VoiceNoteRecorderPhase.reviewing) {
+            unawaited(discardReview());
+          }
+        case VoiceNoteRecorderPhase.holding:
+        case VoiceNoteRecorderPhase.reviewing:
+          break;
+      }
+    });
+
     useEffect(() {
       var active = true;
+      samples.value = const [];
+      elapsed.value = Duration.zero;
+      announcedElapsed.value = Duration.zero;
+      accumulated.value = Duration.zero;
+      segmentStartedAt.value = null;
+      isStarted.value = false;
+      isStopping.value = false;
       final levelSubscription = recorder.levels.listen((level) {
         if (!active) return;
         final nextSamples = [...samples.value, level];
@@ -100,24 +293,36 @@ class VoiceNoteComposerRecorder extends HookConsumerWidget {
         sampleSequence.value += 1;
       });
       final timer = Timer.periodic(const Duration(milliseconds: 200), (_) {
-        final started = startedAt.value;
-        if (!active || started == null) return;
-        elapsed.value = DateTime.now().difference(started);
-        if (elapsed.value >= voiceNoteMaxDuration) unawaited(finish());
+        final segmentStart = segmentStartedAt.value;
+        if (!active || segmentStart == null) return;
+        elapsed.value =
+            accumulated.value + clock.now().difference(segmentStart);
+        // Screen readers hear the timer on a coarse grid, not five times a
+        // second; the grid lands on the cap warning by construction.
+        final intervals =
+            elapsed.value.inSeconds ~/ voiceNoteTimerAnnounceInterval.inSeconds;
+        final announced = voiceNoteTimerAnnounceInterval * intervals;
+        if (announced != announcedElapsed.value) {
+          announcedElapsed.value = announced;
+        }
+        if (elapsed.value >= voiceNoteMaxDuration) phaseNotifier.finish();
       });
+      final starting = recorder.start();
+      startup.value = starting;
       unawaited(() async {
         try {
-          await recorder.start();
-          if (active) {
-            startedAt.value = DateTime.now();
-            isStarted.value = true;
+          await starting;
+          if (!active) return;
+          isStarted.value = true;
+          final phase = ref.read(voiceNoteRecorderPhaseProvider).phase;
+          if (phase != VoiceNoteRecorderPhase.paused) {
+            segmentStartedAt.value = clock.now();
           }
         } on StateError catch (recordingError) {
-          if (active) error.value = recordingError.message;
+          if (active) onError(recordingError.message);
         } catch (_) {
           if (active) {
-            error.value =
-                'Buzz could not start recording. Check microphone access.';
+            onError('Buzz could not start recording. Check microphone access.');
           }
         }
       }());
@@ -132,95 +337,133 @@ class VoiceNoteComposerRecorder extends HookConsumerWidget {
       };
     }, [recorder]);
 
+    final phase = phaseState.phase;
+    useEffect(() {
+      // The portal controller must not change during build; settle it once
+      // this frame has been laid out.
+      final shouldShow = isOwner && phase == VoiceNoteRecorderPhase.holding;
+      var active = true;
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (!active || !context.mounted) return;
+        if (shouldShow && !lockChipController.isShowing) {
+          lockChipController.show();
+        } else if (!shouldShow && lockChipController.isShowing) {
+          lockChipController.hide();
+        }
+      });
+      return () => active = false;
+    }, [phase, isOwner]);
+
+    KeyEventResult handleKey(FocusNode node, KeyEvent event) {
+      if (event is! KeyDownEvent || !isOwner) return KeyEventResult.ignored;
+      if (event.logicalKey == LogicalKeyboardKey.escape) {
+        if (phase == VoiceNoteRecorderPhase.finishing) {
+          return KeyEventResult.ignored;
+        }
+        cancelRecording();
+        return KeyEventResult.handled;
+      }
+      final isEnter =
+          event.logicalKey == LogicalKeyboardKey.enter ||
+          event.logicalKey == LogicalKeyboardKey.numpadEnter;
+      if (!isEnter) return KeyEventResult.ignored;
+      switch (phase) {
+        case VoiceNoteRecorderPhase.holding when !phaseState.hasPointer:
+        case VoiceNoteRecorderPhase.locked:
+        case VoiceNoteRecorderPhase.paused:
+          phaseNotifier.finish();
+          return KeyEventResult.handled;
+        case VoiceNoteRecorderPhase.reviewing:
+          sendReviewed();
+          return KeyEventResult.handled;
+        case VoiceNoteRecorderPhase.holding:
+        case VoiceNoteRecorderPhase.idle:
+        case VoiceNoteRecorderPhase.finishing:
+          return KeyEventResult.ignored;
+      }
+    }
+
     final reducedMotion = MediaQuery.disableAnimationsOf(context);
-    return Row(
+    final timer = _RecorderTimer(
+      elapsed: elapsed.value,
+      announced: announcedElapsed.value,
+    );
+    final Widget content = switch (phase) {
+      VoiceNoteRecorderPhase.holding ||
+      VoiceNoteRecorderPhase.finishing ||
+      VoiceNoteRecorderPhase.idle => _HoldRecorderRow(
+        key: const ValueKey('voice-note-recorder-hold'),
+        state: phaseState,
+        elapsed: elapsed.value,
+        samples: samples.value,
+        sampleSequence: sampleSequence.value,
+        isStarted: isStarted.value,
+        isFinishing: phase == VoiceNoteRecorderPhase.finishing,
+        lockChipLink: lockChipLink,
+        timer: timer,
+        onSend: phaseNotifier.finish,
+        onCancel: cancelRecording,
+      ),
+      VoiceNoteRecorderPhase.locked ||
+      VoiceNoteRecorderPhase.paused => _LockedRecorderPanel(
+        key: const ValueKey('voice-note-recorder-locked'),
+        isPaused: phase == VoiceNoteRecorderPhase.paused,
+        elapsed: elapsed.value,
+        samples: samples.value,
+        sampleSequence: sampleSequence.value,
+        canSend: isStarted.value,
+        timer: timer,
+        onDiscard: cancelRecording,
+        onPause: phaseNotifier.pause,
+        onResume: phaseNotifier.resume,
+        onSend: phaseNotifier.finish,
+      ),
+      VoiceNoteRecorderPhase.reviewing => _ReviewPanel(
+        key: const ValueKey('voice-note-recorder-review'),
+        recording: reviewRecording.value,
+        onDiscard: cancelRecording,
+        onRecordAgain: phaseNotifier.recordAgain,
+        onSend: sendReviewed,
+      ),
+    };
+
+    return Focus(
       key: const ValueKey('voice-note-recorder'),
-      children: [
-        _RecorderButton(
-          key: const ValueKey('voice-note-recorder-close'),
-          tooltip: 'Discard voice note',
-          icon: LucideIcons.x,
-          foreground: context.colors.onSurfaceVariant,
-          background: context.colors.surface,
-          onPressed: isStopping.value ? null : onCancel,
-        ),
-        const SizedBox(width: Grid.half),
-        if (error.value case final message?)
-          Expanded(
-            child: Text(
-              message,
-              key: const ValueKey('voice-note-recorder-error'),
-              maxLines: 2,
-              overflow: TextOverflow.ellipsis,
-              style: context.textTheme.bodySmall?.copyWith(
-                color: context.colors.error,
+      autofocus: true,
+      onKeyEvent: handleKey,
+      child: OverlayPortal(
+        controller: lockChipController,
+        // The held mic and the lock chip float above the pill so the 64 px
+        // mic and its halo are not clipped by the composer surface.
+        overlayChildBuilder: (context) => Stack(
+          children: [
+            if (phase == VoiceNoteRecorderPhase.holding &&
+                phaseState.hasPointer)
+              _HeldMicFollower(
+                link: lockChipLink,
+                cancelProgress: phaseState.cancelProgress,
               ),
+            _LockChipFollower(
+              link: lockChipLink,
+              progress: phaseState.lockProgress,
+              onLock: phaseNotifier.lock,
             ),
-          )
-        else ...[
-          Text(
-            '${formatVoiceNoteDuration(elapsed.value)} / '
-            '${formatVoiceNoteDuration(voiceNoteMaxDuration)}',
-            key: const ValueKey('voice-note-recorder-duration'),
-            style: context.textTheme.labelSmall?.copyWith(
-              color: context.colors.onSurfaceVariant,
-              fontFeatures: const [FontFeature.tabularFigures()],
-            ),
-          ),
-          const SizedBox(width: Grid.half),
-          Expanded(
-            child: LayoutBuilder(
-              builder: (context, constraints) {
-                final barCount = ((constraints.maxWidth + 2) / 5).floor().clamp(
-                  1,
-                  1024,
-                );
-                final recentSamples = samples.value.length <= barCount
-                    ? samples.value
-                    : samples.value.sublist(samples.value.length - barCount);
-                final waveform = [
-                  ...List<double>.filled(barCount - recentSamples.length, 0),
-                  ...recentSamples,
-                ];
-                return ClipRect(
-                  child: TweenAnimationBuilder<double>(
-                    key: ValueKey(sampleSequence.value),
-                    tween: Tween(begin: reducedMotion ? 0 : 5, end: 0),
-                    duration: reducedMotion
-                        ? Duration.zero
-                        : const Duration(milliseconds: 90),
-                    curve: Curves.linear,
-                    builder: (context, offset, child) => Transform.translate(
-                      offset: Offset(offset, 0),
-                      child: child,
-                    ),
-                    child: VoiceNoteWaveform(
-                      samples: waveform,
-                      progress: 1,
-                      fadeEdges: true,
-                      height: 24,
-                      minimumBarHeight: 3,
-                      maximumBarHeight: 20,
-                      colorOpacity: 0.75,
-                    ),
-                  ),
-                );
-              },
-            ),
-          ),
-        ],
-        const SizedBox(width: Grid.half),
-        _RecorderButton(
-          key: const ValueKey('voice-note-recorder-stop'),
-          tooltip: 'Stop recording',
-          icon: LucideIcons.square,
-          foreground: Colors.white,
-          background: context.colors.error,
-          onPressed: error.value == null && isStarted.value && !isStopping.value
-              ? finish
-              : null,
+          ],
         ),
-      ],
+        child: AnimatedSize(
+          duration: reducedMotion
+              ? Duration.zero
+              : const Duration(milliseconds: 140),
+          curve: Curves.easeOutCubic,
+          alignment: Alignment.bottomCenter,
+          // An element from a finished take keeps its last frame while it
+          // fades, but it leaves the semantics tree at once: the live take
+          // owns those labels, and a screen reader must not find two of
+          // each (rule 7). Its controls are already unreachable by touch,
+          // the live take being painted over them.
+          child: ExcludeSemantics(excluding: !isOwner, child: content),
+        ),
+      ),
     );
   }
 }
@@ -233,45 +476,4 @@ Future<void> deleteDroppedVoiceNoteRecording(String path) async {
   } catch (_) {
     // Best-effort cleanup must not escape an already unmounted recorder.
   }
-}
-
-class _RecorderButton extends StatelessWidget {
-  const _RecorderButton({
-    super.key,
-    required this.tooltip,
-    required this.icon,
-    required this.foreground,
-    required this.background,
-    required this.onPressed,
-  });
-
-  final String tooltip;
-  final IconData icon;
-  final Color foreground;
-  final Color background;
-  final VoidCallback? onPressed;
-
-  @override
-  Widget build(BuildContext context) => SizedBox.square(
-    dimension: 36,
-    child: IconButton(
-      tooltip: tooltip,
-      onPressed: onPressed == null
-          ? null
-          : () {
-              unawaited(HapticFeedback.selectionClick());
-              onPressed!();
-            },
-      style: IconButton.styleFrom(
-        foregroundColor: foreground,
-        backgroundColor: background,
-        disabledBackgroundColor: background.withValues(alpha: 0.5),
-        shape: const CircleBorder(),
-        side: BorderSide(color: Colors.black.withValues(alpha: 0.04), width: 1),
-      ),
-      padding: EdgeInsets.zero,
-      visualDensity: VisualDensity.compact,
-      icon: Icon(icon, size: 18),
-    ),
-  );
 }

@@ -13,7 +13,6 @@ class _IOSAttachmentPopoverCallbacks {
   final Future<void> Function(List<XFile> photos) onChoosePhotos;
   final VoidCallback onAllPhotos;
   final VoidCallback onVideo;
-  final VoidCallback onVoiceNote;
   final VoidCallback onFiles;
 
   const _IOSAttachmentPopoverCallbacks({
@@ -21,7 +20,6 @@ class _IOSAttachmentPopoverCallbacks {
     required this.onChoosePhotos,
     required this.onAllPhotos,
     required this.onVideo,
-    required this.onVoiceNote,
     required this.onFiles,
   });
 }
@@ -46,7 +44,6 @@ class _IOSAttachmentPopoverCoordinator {
     required Future<void> Function(List<XFile> photos) onChoosePhotos,
     required VoidCallback onAllPhotos,
     required VoidCallback onVideo,
-    required VoidCallback onVoiceNote,
     required VoidCallback onFiles,
   }) async {
     if (defaultTargetPlatform != TargetPlatform.iOS) return false;
@@ -64,7 +61,6 @@ class _IOSAttachmentPopoverCoordinator {
       onChoosePhotos: onChoosePhotos,
       onAllPhotos: onAllPhotos,
       onVideo: onVideo,
-      onVoiceNote: onVoiceNote,
       onFiles: onFiles,
     );
     _ensureHandler();
@@ -159,8 +155,6 @@ class _IOSAttachmentPopoverCoordinator {
         callbacks?.onAllPhotos();
       case 'pickVideo':
         callbacks?.onVideo();
-      case 'recordVoiceNote':
-        callbacks?.onVoiceNote();
       case 'pickFiles':
         callbacks?.onFiles();
       case 'dismissed':
@@ -190,7 +184,6 @@ class _IOSAttachmentPopoverController {
     required Future<void> Function(List<XFile> photos) onChoosePhotos,
     required VoidCallback onAllPhotos,
     required VoidCallback onVideo,
-    required VoidCallback onVoiceNote,
     required VoidCallback onFiles,
   }) => _iosAttachmentPopoverCoordinator.present(
     owner: this,
@@ -199,7 +192,6 @@ class _IOSAttachmentPopoverController {
     onChoosePhotos: onChoosePhotos,
     onAllPhotos: onAllPhotos,
     onVideo: onVideo,
-    onVoiceNote: onVoiceNote,
     onFiles: onFiles,
   );
 
