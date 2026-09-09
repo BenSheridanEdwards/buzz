@@ -5,6 +5,10 @@ import {
   parseRateLimitHint,
 } from "@/shared/api/relayRateLimitGate";
 import {
+  fromRawRelayMembership,
+  type RawRelayMembership,
+} from "@/shared/api/relayMembershipTypes";
+import {
   fromRawInstallRuntimeResult,
   type RawInstallRuntimeResult,
 } from "@/shared/api/installTypes";
@@ -156,6 +160,8 @@ export type RawManagedAgent = {
   // Pre-feature fixtures may omit these; mapped to "owner-only"/[] in fromRawManagedAgent.
   respond_to?: ManagedAgent["respondTo"];
   respond_to_allowlist?: string[];
+  // Omitted by Rust on open relays and before the first check.
+  relay_membership?: RawRelayMembership | null;
 };
 
 type RawCreateManagedAgentResponse = {
@@ -675,6 +681,7 @@ export function fromRawManagedAgent(agent: RawManagedAgent): ManagedAgent {
     backendAgentId: agent.backend_agent_id,
     respondTo: agent.respond_to ?? "owner-only",
     respondToAllowlist: agent.respond_to_allowlist ?? [],
+    relayMembership: fromRawRelayMembership(agent.relay_membership),
   };
 }
 

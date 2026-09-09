@@ -798,25 +798,51 @@ pub async fn confirm_team_snapshot_import(
 
     // ── Phase 4 & 5: profile sync + memory restore (async, outside lock) ────
     let relay_ws = relay_ws_url_with_override(&state);
+
+    // Phase 4: profile syncs, concurrently.
+    //
+    // One kind:0 sync costs a `/query` for the existing handle plus up to
+    // three well-known lookups at 15s each. Run serially inside the member
+    // loop below, a ten-member import against a stalled relay was bounded by
+    // the SUM of those. Each sync is still individually bounded, so
+    // concurrently the whole phase is bounded by the slowest member instead.
+    // Best-effort per member: an error is reported on that member's row and
+    // never fails the import.
+    let profile_sync_errors: Vec<Option<String>> = futures_util::future::join_all(
+        minted
+            .iter()
+            .map(|m| {
+                let relay_url = effective_agent_relay_url(&m.record.relay_url, &relay_ws);
+                let profile_about = crate::managed_agents::effective_agent_description(
+                    m.definition.description.as_deref(),
+                );
+                let state = &state;
+                async move {
+                    sync_managed_agent_profile(
+                        state,
+                        &relay_url,
+                        &m.agent_keys,
+                        &m.display_name,
+                        m.effective_avatar.as_deref(),
+                        profile_about.as_deref(),
+                        m.auth_tag.as_deref(),
+                    )
+                    .await
+                    .err()
+                }
+            })
+            .collect::<Vec<_>>(),
+    )
+    .await;
+
     let mut member_results: Vec<TeamSnapshotImportMemberResult> = Vec::with_capacity(minted.len());
 
-    for (m, snap_member) in minted.iter().zip(snapshot.members.iter()) {
+    for ((m, snap_member), profile_sync_error) in minted
+        .iter()
+        .zip(snapshot.members.iter())
+        .zip(profile_sync_errors)
+    {
         let relay_url = effective_agent_relay_url(&m.record.relay_url, &relay_ws);
-
-        // Phase 4: profile sync (best-effort).
-        let profile_about =
-            crate::managed_agents::effective_agent_description(m.definition.description.as_deref());
-        let profile_sync_error = sync_managed_agent_profile(
-            &state,
-            &relay_url,
-            &m.agent_keys,
-            &m.display_name,
-            m.effective_avatar.as_deref(),
-            profile_about.as_deref(),
-            m.auth_tag.as_deref(),
-        )
-        .await
-        .err();
 
         // Phase 5: memory restore (best-effort).
         let memory_total = snap_member.memory.entries.len();

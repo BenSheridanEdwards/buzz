@@ -1276,6 +1276,7 @@ fn summary_mcp_command(
         &[],
         &[],
         &Default::default(),
+        &Default::default(),
         resolve_sidecar,
     )
     .expect("summary should build")

@@ -586,6 +586,10 @@ pub struct ManagedAgentSummary {
     pub log_path: String,
     pub respond_to: RespondTo,
     pub respond_to_allowlist: Vec<String>,
+    /// Last known relay-membership check for this agent on the active
+    /// workspace relay. `None` when the relay is open or no check ran yet.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relay_membership: Option<super::ManagedAgentRelayMembership>,
 }
 
 #[derive(Debug, Serialize)]

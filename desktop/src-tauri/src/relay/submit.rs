@@ -8,6 +8,25 @@ pub struct SubmitEventResponse {
     pub message: String,
 }
 
+/// How the relay answered a submit, for callers that must tell a refusal
+/// apart from a transport failure (a refusal is the relay's definitive
+/// answer; a transport failure says nothing and must be retried).
+#[derive(Debug)]
+pub enum SubmitVerdict {
+    /// Stored / processed.
+    Accepted(SubmitEventResponse),
+    /// The relay answered with a structured client-side refusal: HTTP 4xx
+    /// with a JSON body, or HTTP 200 with `accepted: false`. `error` is the
+    /// caller-facing message [`submit_signed_event_at_with_keys`] returns for
+    /// the same response; `refusal` is the relay's own reason, parsed from
+    /// the body rather than recovered from the rendered string, so a caller
+    /// can classify it (see `managed_agents::relay_membership`).
+    Refused {
+        error: String,
+        refusal: RelayRefusal,
+    },
+}
+
 /// POST an already-signed event to an explicit relay with an explicit owner.
 ///
 /// Deferred/scoped publication uses this form so a workspace or identity
@@ -19,6 +38,22 @@ pub async fn submit_signed_event_at_with_keys(
     api_base_url: &str,
     keys: &nostr::Keys,
 ) -> Result<SubmitEventResponse, String> {
+    match submit_signed_event_verdict_at_with_keys(event, state, api_base_url, keys).await? {
+        SubmitVerdict::Accepted(response) => Ok(response),
+        SubmitVerdict::Refused { error, .. } => Err(error),
+    }
+}
+
+/// [`submit_signed_event_at_with_keys`] that keeps a structured refusal as an
+/// `Ok` verdict. Rate limiting (429), server errors, proxy interceptions and
+/// transport failures stay `Err`, exactly as before, so a caller can never
+/// mistake an outage for a refusal.
+pub async fn submit_signed_event_verdict_at_with_keys(
+    event: &nostr::Event,
+    state: &AppState,
+    api_base_url: &str,
+    keys: &nostr::Keys,
+) -> Result<SubmitVerdict, String> {
     if event.pubkey != keys.public_key() {
         return Err("signed event does not match the publishing identity".to_string());
     }
@@ -38,16 +73,42 @@ pub async fn submit_signed_event_at_with_keys(
         .await
         .map_err(|e| classify_request_error(&e))?;
 
-    if !response.status().is_success() {
-        return Err(relay_error_message(response).await);
+    let status = response.status();
+    if !status.is_success() {
+        // `relay_error_details` populates `refusal` only for a 4xx (never a
+        // 429) whose body parsed as the relay's own JSON reason. Everything
+        // else (outage, quota, intercepted page, unparseable body) stays an
+        // `Err` no caller can mistake for the relay's answer.
+        let details = relay_error_details(response).await;
+        if let Some(refusal) = details.refusal {
+            return Ok(SubmitVerdict::Refused {
+                error: details.error,
+                refusal,
+            });
+        }
+        return Err(details.error);
     }
 
     let result: SubmitEventResponse = parse_json_response(response).await?;
     if !result.accepted {
-        return Err(format!("relay rejected event: {}", result.message));
+        // The SECOND refusal door, and the one Buzz's own relay actually
+        // uses: `api/bridge.rs` answers `POST /events` with HTTP 200 and
+        // `{event_id, accepted, message}`, so an ordinary non-rejection
+        // refusal never reaches `relay_error_details` and never touched the
+        // bound that lives there. `RelayRefusal::new` applies it here too,
+        // and it is the only constructor, so this cannot drift again.
+        //
+        // The relay's `message` is a human sentence, not a machine code, so
+        // it goes in the `detail` half. `code_is` compares the machine-code
+        // half exactly; a sentence in it would be a category error.
+        let refusal = RelayRefusal::new(None, Some(result.message.clone()));
+        return Ok(SubmitVerdict::Refused {
+            error: format!("relay rejected event: {}", refusal.message()),
+            refusal,
+        });
     }
 
-    Ok(result)
+    Ok(SubmitVerdict::Accepted(result))
 }
 
 /// Sign with an explicit identity and POST the event to an explicit relay.

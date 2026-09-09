@@ -189,13 +189,13 @@ pub(crate) fn mark_profile_reconciled(
 /// keeps deferred reconciliation from following a community switch it was
 /// never authorized for while honoring a deliberate per-agent pin wherever
 /// it points.
-pub(crate) async fn reconcile_agent_profile(
+pub(crate) async fn reconcile_agent_profile<R: tauri::Runtime>(
     state: &AppState,
-    app: &AppHandle,
+    app: &AppHandle<R>,
     agent_pubkey: &str,
     data: &ProfileReconcileData,
 ) -> Result<ProfileReconcileOutcome, String> {
-    use crate::relay::{query_agent_profile, sync_managed_agent_profile};
+    use crate::relay::sync_managed_agent_profile_with_nip05;
 
     // Resolved ONCE and used for both the read and the write-back. A pinned
     // `target_relay_url` wins unconditionally — see `resolve_reconcile_relay`.
@@ -212,8 +212,48 @@ pub(crate) async fn reconcile_agent_profile(
         return Ok(ProfileReconcileOutcome::SkippedDisabled);
     }
 
+    // Closed relay: the agent must be a member BEFORE its kind:0 goes out,
+    // or the relay refuses it. This is also the retry seam for agents created
+    // before registration existed, for a creation whose registration was
+    // refused (the operator may have added the agent since), and for an
+    // `Unknown` check. A verified `Member` pair is skipped so the UI start
+    // path (which preflights before spawning) does not pay for it twice.
+    ensure_relay_membership_before_publish(state, app, agent_pubkey, &relay_url).await;
+
     // Query the relay for the agent's existing kind:0 profile.
-    let existing = query_agent_profile(state, &relay_url, agent_pubkey).await?;
+    //
+    // ADVISORY, never a gate, for the same reason as in
+    // `relay::sync_managed_agent_profile`: this read authenticates as the
+    // WORKSPACE identity while the kind:0 it precedes is signed by the AGENT.
+    // On a relay closed to the desktop the operator admits the agent, not the
+    // desktop, so this `/query` is refused every time while the agent's own
+    // `/events` publish would succeed. Propagating it made the reconcile the
+    // one publisher a legacy agent has AND the one thing that could never
+    // run, so an agent created before registration existed got no profile at
+    // all, permanently, with no other path to one.
+    //
+    // Degrading to "no existing profile" is the honest reading of a read that
+    // did not happen, and it is idempotent: `profile_needs_sync` returns true
+    // and the publish below republishes the profile the desktop already knows
+    // it wants.
+    //
+    // The handle is the exception, and it is why the read is asked twice.
+    // `resolve_managed_agent_nip05` keeps the handle the agent already
+    // carries when its own confirmation cannot be completed, and this read is
+    // the only place it learns that handle, so when the well-known fails
+    // too, which on one host is the same fault, degrading to `None` published
+    // a kind:0 with no `nip05` and CLEARED the handle. Asking again as the
+    // AGENT (`read_agent_profile_advisory`) gives it a source the closed
+    // relay does admit. Keys parsed leniently here: a record whose nsec will
+    // not parse still reaches the hard parse below, with the same error.
+    let existing = crate::relay::read_agent_profile_advisory(
+        state,
+        &relay_url,
+        Keys::parse(&data.private_key_nsec).ok().as_ref(),
+        agent_pubkey,
+        data.auth_tag.as_deref(),
+    )
+    .await;
 
     // Resolve the expected avatar — backfilling for legacy records that have no
     // stored avatar_url yet.
@@ -260,11 +300,37 @@ pub(crate) async fn reconcile_agent_profile(
         Some(expected_avatar)
     };
 
+    // The handle this agent should carry on this relay: whatever the relay
+    // already attributes to it when that is still derived from the current
+    // name (stable across reconciles), else the first free candidate. A
+    // lookup that cannot be completed neither strips the handle nor abandons
+    // the publish: it keeps the handle the agent already carries and the
+    // profile still goes out (see `resolve_managed_agent_nip05`).
+    //
+    // When NEITHER read could be completed, the last handle this process saw
+    // the relay attribute to this agent stands in. A refused read has a
+    // second identity to ask; a read that runs past `QUERY_REQUEST_TIMEOUT`
+    // has none, and a relay slow enough to lose both reads still accepts the
+    // publish below, which then clears the handle.
+    let existing_handle = existing
+        .as_ref()
+        .and_then(|info| info.nip05.clone())
+        .or_else(|| crate::relay::last_known_agent_nip05(state, &relay_url, agent_pubkey));
+    let expected_nip05 = crate::relay::nip05::resolve_managed_agent_nip05(
+        state,
+        &relay_url,
+        agent_pubkey,
+        &data.name,
+        existing_handle.as_deref(),
+    )
+    .await?;
+
     if !profile_needs_sync(
         existing.as_ref(),
         &data.name,
         expected_avatar.as_deref(),
         data.about.as_deref(),
+        expected_nip05.as_deref(),
     ) {
         return Ok(ProfileReconcileOutcome::Reconciled);
     }
@@ -279,17 +345,52 @@ pub(crate) async fn reconcile_agent_profile(
         return Ok(ProfileReconcileOutcome::SkippedDisabled);
     }
 
-    sync_managed_agent_profile(
+    sync_managed_agent_profile_with_nip05(
         state,
         &relay_url,
         &agent_keys,
         &data.name,
         expected_avatar.as_deref(),
         data.about.as_deref(),
+        expected_nip05.as_deref(),
         data.auth_tag.as_deref(),
     )
     .await?;
     Ok(ProfileReconcileOutcome::Reconciled)
+}
+
+/// Run the relay-membership preflight for a pair unless the sidecar already
+/// holds a verified `Member` record for it. Never blocks the reconcile: a
+/// relay/network failure is persisted as `Unknown` by the preflight and
+/// logged; the kind:0 publish that follows fails on its own if the relay is
+/// really down, and the next start or reconcile retries.
+async fn ensure_relay_membership_before_publish<R: tauri::Runtime>(
+    state: &AppState,
+    app: &AppHandle<R>,
+    agent_pubkey: &str,
+    relay_url: &str,
+) {
+    use crate::managed_agents::{
+        load_relay_memberships, managed_agents_base_dir, preflight_managed_agent_relay_membership,
+        should_preflight_membership,
+    };
+
+    // `should_preflight_membership` owns the rule and is table-tested; an
+    // unreadable store falls through to checking, never to assuming.
+    let needs_check = managed_agents_base_dir(app)
+        .map(|base_dir| load_relay_memberships(&base_dir))
+        .map(|store| should_preflight_membership(&store, agent_pubkey, relay_url))
+        .unwrap_or(true);
+    if !needs_check {
+        return;
+    }
+    if let Err(error) =
+        preflight_managed_agent_relay_membership(app, state, agent_pubkey, relay_url).await
+    {
+        eprintln!(
+            "buzz-desktop: relay membership preflight failed for agent {agent_pubkey} on {relay_url}: {error}"
+        );
+    }
 }
 
 /// Decide whether a published profile is missing or stale relative to the
@@ -302,6 +403,7 @@ pub(super) fn profile_needs_sync(
     expected_name: &str,
     expected_avatar: Option<&str>,
     expected_about: Option<&str>,
+    expected_nip05: Option<&str>,
 ) -> bool {
     match existing {
         None => true,
@@ -309,7 +411,10 @@ pub(super) fn profile_needs_sync(
             let name_matches = info.display_name.as_deref() == Some(expected_name);
             let picture_matches = info.picture.as_deref() == expected_avatar;
             let about_matches = info.about.as_deref().unwrap_or("") == expected_about.unwrap_or("");
-            !name_matches || !picture_matches || !about_matches
+            // `query_agent_profile` already normalizes an empty handle to
+            // `None`, so a plain comparison is exact here.
+            let nip05_matches = info.nip05.as_deref() == expected_nip05;
+            !name_matches || !picture_matches || !about_matches || !nip05_matches
         }
     }
 }
@@ -374,3 +479,7 @@ pub(crate) async fn publish_persona_profile(
 // Async so the blocking body (disk reads/writes + process termination) runs off
 // the main UI thread via spawn_blocking. State is re-derived from the owned
 // AppHandle inside the closure (`State<'_, _>` is borrowed, MutexGuard is !Send).
+
+#[cfg(test)]
+#[path = "agents_profile_reconcile_tests.rs"]
+mod reconcile_tests;

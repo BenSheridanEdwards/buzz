@@ -79,6 +79,13 @@ fn make_agent(
 
 const PERSONA_ID: &str = "custom:test-persona";
 
+// The sidecar store keys on a real agent pubkey, so the tests that touch it
+// use 64-hex records rather than the readable placeholders above.
+const HEX_A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+const HEX_B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+const HEX_C: &str = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+const RELAY: &str = "ws://localhost:3000";
+
 /// Deleting a persona with two linked agents (one running) returns both their
 /// pubkeys and leaves unlinked agents out of the cascade set.
 #[test]
@@ -141,20 +148,40 @@ fn cascade_includes_running_agent() {
 }
 
 /// A failing agent-store save in Phase 3 must be retry-safe: the error
-/// propagates before any keyring deletion or tombstone at the call site
-/// (by construction — those side effects appear after the `?` in
-/// `delete_persona`). Persona records and agent records are therefore
-/// untouched on disk, so the command can be retried with no cleanup.
+/// propagates before any derived-state clear, keyring deletion or tombstone
+/// (the first is inside `commit_cascade_agents` itself, after the `?` on
+/// `save`; the rest appear after the `?` at the `delete_persona` call site).
+/// Persona records and agent records are therefore untouched on disk, so the
+/// command can be retried with no cleanup.
 #[test]
 fn failing_save_is_retry_safe() {
-    let mut agents = vec![
-        make_agent("pk-a", Some(PERSONA_ID), None),
-        make_agent("pk-b", Some(PERSONA_ID), None),
-        make_agent("pk-c", Some("custom:other"), None),
-    ];
-    let cascade: HashSet<String> = ["pk-a".to_string(), "pk-b".to_string()].into();
+    use crate::managed_agents::{
+        load_relay_memberships, record_relay_membership, relay_membership_for,
+        ManagedAgentRelayMembership, RelayMembershipState,
+    };
 
-    let result = commit_cascade_agents(&mut agents, &cascade, |_| {
+    let dir = tempfile::tempdir().unwrap_or_else(|error| panic!("temp dir: {error}"));
+    record_relay_membership(
+        dir.path(),
+        HEX_A,
+        RELAY,
+        Some(ManagedAgentRelayMembership {
+            state: RelayMembershipState::NotMember,
+            checked_at: "t".to_string(),
+            detail: None,
+            subject_pubkey: None,
+        }),
+    )
+    .unwrap_or_else(|error| panic!("seed membership: {error}"));
+
+    let mut agents = vec![
+        make_agent(HEX_A, Some(PERSONA_ID), None),
+        make_agent(HEX_B, Some(PERSONA_ID), None),
+        make_agent(HEX_C, Some("custom:other"), None),
+    ];
+    let cascade: HashSet<String> = [HEX_A.to_string(), HEX_B.to_string()].into();
+
+    let result = commit_cascade_agents(dir.path(), &mut agents, &cascade, |_| {
         Err("simulated disk failure".to_string())
     });
 
@@ -162,9 +189,70 @@ fn failing_save_is_retry_safe() {
         result.is_err(),
         "commit must propagate the save error so callers can react"
     );
-    // By construction: commit_cascade_agents returns Err before reaching the
-    // keyring deletions and tombstones at the delete_persona call site.
-    // Retrying delete_persona re-runs the full cascade cleanly from scratch.
+    assert!(
+        relay_membership_for(&load_relay_memberships(dir.path()), HEX_A, RELAY).is_some(),
+        "nothing may be destroyed when the records never left disk: the \
+         derived row must still be there for the retry"
+    );
+}
+
+/// The persona cascade clears each removed agent's relay-membership sidecar
+/// row, and only theirs.
+///
+/// This is the cascade's own seam, not the single delete's: `delete_persona`
+/// removes agent records through `commit_cascade_agents`, and that function
+/// owns the clear. The cascade used to call `forget_managed_agent_derived_state`
+/// from a loop inside the `tauri::AppHandle` body instead, which no test could
+/// reach, so deleting that line failed nothing and it guarded nothing. A row
+/// left behind is keyed by a pubkey with no record, is trusted by the next
+/// reader of `relay-membership.json`, and grows the file without bound.
+#[test]
+fn cascade_commit_clears_the_relay_membership_sidecar_of_every_cascaded_agent() {
+    use crate::managed_agents::{
+        load_relay_memberships, record_relay_membership, relay_membership_for,
+        ManagedAgentRelayMembership, RelayMembershipState,
+    };
+
+    let dir = tempfile::tempdir().unwrap_or_else(|error| panic!("temp dir: {error}"));
+    for pubkey in [HEX_A, HEX_B, HEX_C] {
+        record_relay_membership(
+            dir.path(),
+            pubkey,
+            RELAY,
+            Some(ManagedAgentRelayMembership {
+                state: RelayMembershipState::NotMember,
+                checked_at: "t".to_string(),
+                detail: None,
+                subject_pubkey: None,
+            }),
+        )
+        .unwrap_or_else(|error| panic!("seed membership: {error}"));
+    }
+
+    let mut agents = vec![
+        make_agent(HEX_A, Some(PERSONA_ID), None),
+        make_agent(HEX_B, Some(PERSONA_ID), None),
+        make_agent(HEX_C, Some("custom:other"), None),
+    ];
+    let cascade: HashSet<String> = collect_cascade_pubkeys(&agents, PERSONA_ID)
+        .into_iter()
+        .collect();
+
+    commit_cascade_agents(dir.path(), &mut agents, &cascade, |_| Ok(()))
+        .unwrap_or_else(|error| panic!("cascade commit: {error}"));
+
+    let store = load_relay_memberships(dir.path());
+    for gone in [HEX_A, HEX_B] {
+        assert_eq!(
+            relay_membership_for(&store, gone, RELAY),
+            None,
+            "cascaded agent {gone} must not leave a membership row behind"
+        );
+    }
+    assert!(
+        relay_membership_for(&store, HEX_C, RELAY).is_some(),
+        "an agent outside the cascade must keep its row"
+    );
 }
 
 /// A provider-deployed cascade target (non-local backend with a live
