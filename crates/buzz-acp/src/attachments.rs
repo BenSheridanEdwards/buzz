@@ -670,6 +670,152 @@ fn check_private_dir(dir: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
+/// A directory the harness resolved once and keeps open, so every later file
+/// operation in it is `openat`-relative to a descriptor rather than a fresh
+/// walk from `/`.
+///
+/// This is the module's one file-writing primitive. `O_EXCL | O_NOFOLLOW`
+/// guard the last component of a path only, so a plain `fs::write` at a name
+/// something else can predict, inside a directory something else can write,
+/// is an arbitrary-write primitive: the write follows a symlink planted
+/// there. Both sides of the media path have that shape (the inbound download
+/// writes a name the *sender* chose; the outbound publish writes staged
+/// copies and ffmpeg output), so both go through this.
+///
+/// Renaming or replacing the directory after the descriptor is taken moves
+/// the name, not the descriptor, so a swap redirects nothing. The one thing
+/// this cannot cover is a subprocess, which is handed a path and does its own
+/// open; [`DirHandle::still_at_its_path`] is checked immediately before that
+/// and the result is read back through the descriptor, so a swap costs the
+/// operation rather than moving it.
+#[derive(Debug)]
+pub struct DirHandle {
+    dir: PathBuf,
+    /// The directory, opened once. Every file operation goes through this,
+    /// never through `dir`, which is kept for logs, for subprocesses, and
+    /// for naming.
+    #[cfg(unix)]
+    fd: std::os::fd::OwnedFd,
+}
+
+impl DirHandle {
+    /// Open an existing directory with `O_DIRECTORY | O_NOFOLLOW` and keep
+    /// the descriptor. A symlink at `dir`'s last component is refused rather
+    /// than followed.
+    pub fn open(dir: &Path) -> std::io::Result<Self> {
+        #[cfg(unix)]
+        let fd = open_dir_no_follow(dir)?;
+        #[cfg(not(unix))]
+        if !std::fs::symlink_metadata(dir)?.is_dir() {
+            return Err(std::io::Error::other("it is not a directory"));
+        }
+        Ok(Self {
+            dir: dir.to_path_buf(),
+            #[cfg(unix)]
+            fd,
+        })
+    }
+
+    /// The directory itself, for logs, for naming, and for the one
+    /// subprocess that has to be given a path.
+    pub fn path(&self) -> &Path {
+        &self.dir
+    }
+
+    /// Create a fresh, empty file at `name` in this directory, relative to
+    /// the retained descriptor, with `O_CREAT | O_EXCL | O_NOFOLLOW` and mode
+    /// `0600`. `O_EXCL` refuses anything already at the name, a planted
+    /// symlink included, so this never writes through one and never silently
+    /// overwrites.
+    #[cfg(unix)]
+    pub fn create_at(&self, name: &std::ffi::OsStr) -> std::io::Result<std::fs::File> {
+        use std::os::fd::AsFd as _;
+        let flags = nix::fcntl::OFlag::O_WRONLY
+            | nix::fcntl::OFlag::O_CREAT
+            | nix::fcntl::OFlag::O_EXCL
+            | nix::fcntl::OFlag::O_NOFOLLOW
+            | nix::fcntl::OFlag::O_CLOEXEC;
+        let mode = nix::sys::stat::Mode::from_bits_truncate(0o600);
+        let fd =
+            nix::fcntl::openat(self.fd.as_fd(), name, flags, mode).map_err(std::io::Error::from)?;
+        Ok(std::fs::File::from(fd))
+    }
+
+    #[cfg(not(unix))]
+    pub fn create_at(&self, name: &std::ffi::OsStr) -> std::io::Result<std::fs::File> {
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(self.dir.join(name))
+    }
+
+    /// Reopen a file in this directory for reading, relative to the retained
+    /// descriptor and without following a symlink at the last component.
+    #[cfg(unix)]
+    pub fn open_at(&self, name: &std::ffi::OsStr) -> std::io::Result<std::fs::File> {
+        use std::os::fd::AsFd as _;
+        let flags = nix::fcntl::OFlag::O_RDONLY
+            | nix::fcntl::OFlag::O_NOFOLLOW
+            | nix::fcntl::OFlag::O_CLOEXEC;
+        let fd = nix::fcntl::openat(self.fd.as_fd(), name, flags, nix::sys::stat::Mode::empty())
+            .map_err(std::io::Error::from)?;
+        Ok(std::fs::File::from(fd))
+    }
+
+    #[cfg(not(unix))]
+    pub fn open_at(&self, name: &std::ffi::OsStr) -> std::io::Result<std::fs::File> {
+        std::fs::File::open(self.dir.join(name))
+    }
+
+    /// Remove a file in this directory, relative to the retained descriptor.
+    #[cfg(unix)]
+    pub fn unlink_at(&self, name: &std::ffi::OsStr) -> std::io::Result<()> {
+        use std::os::fd::AsFd as _;
+        nix::unistd::unlinkat(
+            self.fd.as_fd(),
+            name,
+            nix::unistd::UnlinkatFlags::NoRemoveDir,
+        )
+        .map_err(std::io::Error::from)
+    }
+
+    #[cfg(not(unix))]
+    pub fn unlink_at(&self, name: &std::ffi::OsStr) -> std::io::Result<()> {
+        std::fs::remove_file(self.dir.join(name))
+    }
+
+    /// Confirm the path still names the directory the descriptor holds, for
+    /// the moment before a subprocess is given a path to write.
+    ///
+    /// A swap that has already happened is caught here; one that happens
+    /// after this returns costs the operation (the output is read back
+    /// through the descriptor and is not there) rather than moving it.
+    pub fn still_at_its_path(&self) -> std::io::Result<()> {
+        #[cfg(unix)]
+        {
+            use std::os::fd::AsFd as _;
+            let held = nix::sys::stat::fstat(self.fd.as_fd()).map_err(std::io::Error::from)?;
+            let named = nix::sys::stat::lstat(&self.dir).map_err(std::io::Error::from)?;
+            if (held.st_dev, held.st_ino) != (named.st_dev, named.st_ino) {
+                return Err(std::io::Error::other(
+                    "the directory path no longer names the directory it was opened as",
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// The single name component of `path` within this directory. A path
+    /// from anywhere else is a programming error and is refused rather than
+    /// resolved.
+    pub fn name_in<'a>(&self, path: &'a Path) -> std::io::Result<&'a std::ffi::OsStr> {
+        match (path.parent(), path.file_name()) {
+            (Some(parent), Some(name)) if parent == self.dir => Ok(name),
+            _ => Err(std::io::Error::other("it is not a file in this directory")),
+        }
+    }
+}
+
 /// A harness-private directory for one publish, created fresh with an
 /// unguessable name and mode `0700`, and removed when the publish task drops
 /// it.
@@ -703,12 +849,9 @@ fn check_private_dir(dir: &Path) -> std::io::Result<()> {
 /// `media_publish::MediaPublisher`.
 #[derive(Debug)]
 pub struct PublishScratch {
-    dir: PathBuf,
     /// The directory the publish writes into, opened once when it was
-    /// created. Every file operation goes through this, never through
-    /// `dir`, which is kept for logs, for ffmpeg, and for naming.
-    #[cfg(unix)]
-    fd: std::os::fd::OwnedFd,
+    /// created. See [`DirHandle`].
+    dir: DirHandle,
 }
 
 impl PublishScratch {
@@ -728,20 +871,15 @@ impl PublishScratch {
         let mut once = private_dir_builder();
         once.recursive(false);
         once.create(&dir)?;
-        #[cfg(unix)]
-        let fd = open_dir_no_follow(&dir)?;
-        prune_abandoned_scratch(&base, &dir);
-        Ok(Self {
-            dir,
-            #[cfg(unix)]
-            fd,
-        })
+        let dir = DirHandle::open(&dir)?;
+        prune_abandoned_scratch(&base, dir.path());
+        Ok(Self { dir })
     }
 
     /// The directory itself, for logs and for the one subprocess that has to
     /// be given a path.
     pub fn dir(&self) -> &Path {
-        &self.dir
+        self.dir.path()
     }
 
     /// A fresh, empty file in the directory with a random name, created
@@ -749,8 +887,8 @@ impl PublishScratch {
     /// `O_CREAT | O_EXCL | O_NOFOLLOW` and mode `0600`.
     pub fn create_file(&self, ext: &str) -> std::io::Result<(std::fs::File, PathBuf)> {
         let name = self.random_name(ext);
-        let file = self.create_at(&name)?;
-        Ok((file, self.dir.join(&name)))
+        let file = self.dir.create_at(std::ffi::OsStr::new(&name))?;
+        Ok((file, self.dir.path().join(&name)))
     }
 
     /// Reopen a file this publish created, relative to the retained
@@ -765,16 +903,16 @@ impl PublishScratch {
         path: &Path,
         expected_len: Option<u64>,
     ) -> std::io::Result<(std::fs::File, u64)> {
-        let name = self.name_in_scratch(path)?;
-        let file = self.open_at(name)?;
+        let name = self.dir.name_in(path)?;
+        let file = self.dir.open_at(name)?;
         verified_handle(file, expected_len, false)
     }
 
     /// Remove a file this publish created, relative to the retained
     /// descriptor.
     pub fn remove_file(&self, path: &Path) -> std::io::Result<()> {
-        let name = self.name_in_scratch(path)?;
-        self.unlink_at(name)
+        let name = self.dir.name_in(path)?;
+        self.dir.unlink_at(name)
     }
 
     /// A random, unused path in the directory for a subprocess (ffmpeg) to
@@ -782,7 +920,7 @@ impl PublishScratch {
     /// handing the path over and read the result back through
     /// [`Self::open_file`].
     pub fn reserve(&self, ext: &str) -> PathBuf {
-        self.dir.join(self.random_name(ext))
+        self.dir.path().join(self.random_name(ext))
     }
 
     /// Confirm the scratch path still names the directory the descriptor
@@ -792,18 +930,7 @@ impl PublishScratch {
     /// after this returns costs the publish (the output is read back through
     /// the descriptor and is not there) rather than moving it.
     pub fn still_at_its_path(&self) -> std::io::Result<()> {
-        #[cfg(unix)]
-        {
-            use std::os::fd::AsFd as _;
-            let held = nix::sys::stat::fstat(self.fd.as_fd()).map_err(std::io::Error::from)?;
-            let named = nix::sys::stat::lstat(&self.dir).map_err(std::io::Error::from)?;
-            if (held.st_dev, held.st_ino) != (named.st_dev, named.st_ino) {
-                return Err(std::io::Error::other(
-                    "the scratch path no longer names the publish directory it was created as",
-                ));
-            }
-        }
-        Ok(())
+        self.dir.still_at_its_path()
     }
 
     /// A random file name with a sanitised extension.
@@ -815,72 +942,6 @@ impl PublishScratch {
             ext
         };
         format!("{}.{ext}", uuid::Uuid::new_v4().simple())
-    }
-
-    /// The single name component of `path` within this scratch. A path from
-    /// anywhere else is a programming error and is refused rather than
-    /// resolved.
-    fn name_in_scratch<'a>(&self, path: &'a Path) -> std::io::Result<&'a std::ffi::OsStr> {
-        match (path.parent(), path.file_name()) {
-            (Some(parent), Some(name)) if parent == self.dir => Ok(name),
-            _ => Err(std::io::Error::other(
-                "it is not a file in this publish's scratch",
-            )),
-        }
-    }
-
-    #[cfg(unix)]
-    fn create_at(&self, name: &str) -> std::io::Result<std::fs::File> {
-        use std::os::fd::AsFd as _;
-        let flags = nix::fcntl::OFlag::O_WRONLY
-            | nix::fcntl::OFlag::O_CREAT
-            | nix::fcntl::OFlag::O_EXCL
-            | nix::fcntl::OFlag::O_NOFOLLOW
-            | nix::fcntl::OFlag::O_CLOEXEC;
-        let mode = nix::sys::stat::Mode::from_bits_truncate(0o600);
-        let fd =
-            nix::fcntl::openat(self.fd.as_fd(), name, flags, mode).map_err(std::io::Error::from)?;
-        Ok(std::fs::File::from(fd))
-    }
-
-    #[cfg(not(unix))]
-    fn create_at(&self, name: &str) -> std::io::Result<std::fs::File> {
-        std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(self.dir.join(name))
-    }
-
-    #[cfg(unix)]
-    fn open_at(&self, name: &std::ffi::OsStr) -> std::io::Result<std::fs::File> {
-        use std::os::fd::AsFd as _;
-        let flags = nix::fcntl::OFlag::O_RDONLY
-            | nix::fcntl::OFlag::O_NOFOLLOW
-            | nix::fcntl::OFlag::O_CLOEXEC;
-        let fd = nix::fcntl::openat(self.fd.as_fd(), name, flags, nix::sys::stat::Mode::empty())
-            .map_err(std::io::Error::from)?;
-        Ok(std::fs::File::from(fd))
-    }
-
-    #[cfg(not(unix))]
-    fn open_at(&self, name: &std::ffi::OsStr) -> std::io::Result<std::fs::File> {
-        std::fs::File::open(self.dir.join(name))
-    }
-
-    #[cfg(unix)]
-    fn unlink_at(&self, name: &std::ffi::OsStr) -> std::io::Result<()> {
-        use std::os::fd::AsFd as _;
-        nix::unistd::unlinkat(
-            self.fd.as_fd(),
-            name,
-            nix::unistd::UnlinkatFlags::NoRemoveDir,
-        )
-        .map_err(std::io::Error::from)
-    }
-
-    #[cfg(not(unix))]
-    fn unlink_at(&self, name: &std::ffi::OsStr) -> std::io::Result<()> {
-        std::fs::remove_file(self.dir.join(name))
     }
 }
 
@@ -936,11 +997,11 @@ fn prune_abandoned_scratch(base: &Path, keep: &Path) {
 
 impl Drop for PublishScratch {
     fn drop(&mut self) {
-        if let Err(e) = std::fs::remove_dir_all(&self.dir) {
+        if let Err(e) = std::fs::remove_dir_all(self.dir.path()) {
             tracing::debug!(
                 target: "acp::media",
                 "removing publish scratch {} failed: {e}",
-                self.dir.display()
+                self.dir.path().display()
             );
         }
     }
@@ -1032,6 +1093,14 @@ fn verified_handle(
 /// `deadline` bounds the whole phase: an attachment whose turn comes after it
 /// is reported as failed without a request, and a fetch in progress is cut
 /// at it, so the pool slot is held for at most [`INBOUND_DEADLINE`].
+///
+/// `turn_dir` is resolved exactly once, here, and every blob is written
+/// `openat`-relative to the descriptor that resolution produced. The bytes
+/// are a remote sender's, the name is a remote sender's (`imeta filename`,
+/// reduced to a basename and prefixed with the tag's index, so it is fully
+/// predictable), and the directory is writable by the engine, which is the
+/// exact shape [`DirHandle`] exists to refuse. A plain `fs::write` here is
+/// an arbitrary host-file overwrite with sender-chosen bytes.
 pub async fn collect_inbound_attachments(
     rest: &RestClient,
     events: &[&Event],
@@ -1040,6 +1109,20 @@ pub async fn collect_inbound_attachments(
     deadline: tokio::time::Instant,
 ) -> InboundAttachments {
     let mut inbound = InboundAttachments::default();
+    let turn_dir = match DirHandle::open(turn_dir).map(Arc::new) {
+        Ok(handle) => handle,
+        Err(e) => {
+            tracing::error!(
+                target: "acp::media",
+                dir = %turn_dir.display(),
+                "this turn's attachment directory could not be opened: {e}"
+            );
+            return InboundAttachments::unavailable(
+                events,
+                &format!("this turn's attachment directory could not be opened: {e}"),
+            );
+        }
+    };
     let Some(origin) = RelayOrigin::from_base_url(&rest.base_url) else {
         for event in events {
             if event
@@ -1086,7 +1169,7 @@ pub async fn collect_inbound_attachments(
             } else {
                 tokio::time::timeout(
                     remaining,
-                    fetch_attachment(rest, &origin, &attachment, turn_dir, index, ffmpeg),
+                    fetch_attachment(rest, &origin, &attachment, &turn_dir, index, ffmpeg),
                 )
                 .await
                 .unwrap_or_else(|_| {
@@ -1119,11 +1202,55 @@ pub async fn collect_inbound_attachments(
     inbound
 }
 
+/// Store one downloaded blob in the turn directory and return its path.
+///
+/// The create is `openat`-relative to the descriptor
+/// [`collect_inbound_attachments`] took, with `O_CREAT | O_EXCL | O_NOFOLLOW`
+/// and mode `0600`, so the write cannot follow a symlink planted at the name
+/// and cannot silently replace a file that is already there. The reason it
+/// returns names the condition and not the path.
+async fn write_blob(dir: &Arc<DirHandle>, name: &str, data: Vec<u8>) -> Result<PathBuf, String> {
+    let dir = Arc::clone(dir);
+    let name = name.to_string();
+    // Up to MAX_ATTACHMENT_BYTES of it; not work for a runtime thread.
+    tokio::task::spawn_blocking(move || {
+        use std::io::Write as _;
+        let mut file = dir.create_at(std::ffi::OsStr::new(&name))?;
+        file.write_all(&data)?;
+        Ok::<PathBuf, std::io::Error>(dir.path().join(&name))
+    })
+    .await
+    .map_err(|e| format!("could not be stored: {e}"))?
+    .map_err(|e| format!("could not be stored: {e}"))
+}
+
+/// Reopen a file this turn wrote, through the descriptor, and report its
+/// length. Used for the one output a subprocess produced, so its size is
+/// read from the directory we hold rather than from the path ffmpeg was
+/// given.
+async fn read_back_size(dir: &Arc<DirHandle>, name: &str) -> Result<u64, String> {
+    let dir = Arc::clone(dir);
+    let name = name.to_string();
+    tokio::task::spawn_blocking(move || {
+        let file = dir.open_at(std::ffi::OsStr::new(&name))?;
+        let (_, len) = verified_handle(file, None, false)?;
+        Ok::<u64, std::io::Error>(len)
+    })
+    .await
+    .map_err(|e| format!("extracted file unreadable: {e}"))?
+    .map_err(|e| format!("extracted file unreadable: {e}"))
+    .and_then(|size| {
+        (size > 0)
+            .then_some(size)
+            .ok_or_else(|| "extracted file is empty".to_string())
+    })
+}
+
 async fn fetch_attachment(
     rest: &RestClient,
     origin: &RelayOrigin,
     attachment: &ImetaAttachment,
-    turn_dir: &Path,
+    turn_dir: &Arc<DirHandle>,
     index: usize,
     ffmpeg: Option<&Path>,
 ) -> Result<LocalAttachment, String> {
@@ -1134,11 +1261,11 @@ async fn fetch_attachment(
             BlossomError::Refused { status, .. } => format!("relay returned HTTP {status}"),
             other => other.to_string(),
         })?;
-    let filename = format!("{index}-{}", attachment.filename);
-    let path = turn_dir.join(&filename);
-    tokio::fs::write(&path, &data)
-        .await
-        .map_err(|e| format!("could not write {}: {e}", path.display()))?;
+    // Sanitised again here rather than only where the tag was parsed: this is
+    // the line that turns a remote string into a name on the host's
+    // filesystem, and it should not depend on a caller having cleaned it.
+    let filename = safe_attachment_filename(&format!("{index}-{}", attachment.filename));
+    let path = write_blob(turn_dir, &filename, data).await?;
     let mut local = LocalAttachment {
         path: path.clone(),
         filename,
@@ -1153,26 +1280,35 @@ async fn fetch_attachment(
     if is_envelope {
         match ffmpeg {
             Some(ffmpeg) => {
-                let mp3_name = format!(
+                let mp3_name = safe_attachment_filename(&format!(
                     "{}.mp3",
                     path.file_stem()
                         .and_then(|s| s.to_str())
                         .unwrap_or("voice-note")
-                );
-                let mp3_path = turn_dir.join(&mp3_name);
-                let extracted =
-                    match crate::ffmpeg::extract_voice_note_audio(ffmpeg, &path, &mp3_path).await {
-                        Ok(()) => tokio::fs::metadata(&mp3_path)
+                ));
+                let mp3_path = turn_dir.path().join(&mp3_name);
+                // ffmpeg is a subprocess: it is given a path and does its own
+                // open, so the descriptor cannot cover it. Claim the name
+                // through the descriptor first (`O_CREAT | O_EXCL |
+                // O_NOFOLLOW`), so there is no symlink and no existing file
+                // at the path ffmpeg is about to be handed, check the
+                // directory is still the one we opened, and read the result
+                // back through the descriptor. A swap after that costs the
+                // extraction rather than moving it.
+                let extracted = match turn_dir
+                    .create_at(std::ffi::OsStr::new(&mp3_name))
+                    .and_then(|_| turn_dir.still_at_its_path())
+                {
+                    Ok(()) => {
+                        match crate::ffmpeg::extract_voice_note_audio(ffmpeg, &path, &mp3_path)
                             .await
-                            .map(|m| m.len())
-                            .map_err(|e| format!("extracted file unreadable: {e}"))
-                            .and_then(|size| {
-                                (size > 0)
-                                    .then_some(size)
-                                    .ok_or_else(|| "extracted file is empty".to_string())
-                            }),
-                        Err(e) => Err(e),
-                    };
+                        {
+                            Ok(()) => read_back_size(turn_dir, &mp3_name).await,
+                            Err(e) => Err(e),
+                        }
+                    }
+                    Err(e) => Err(format!("could not reserve a file for the extraction: {e}")),
+                };
                 match extracted {
                     Ok(size) => {
                         local.path = mp3_path;
@@ -1651,7 +1787,8 @@ mod tests {
             std::fs::write(&victim, b"victim").unwrap();
             std::os::unix::fs::symlink(&victim, scratch.dir().join("planted.txt")).unwrap();
             let err = scratch
-                .create_at("planted.txt")
+                .dir
+                .create_at(std::ffi::OsStr::new("planted.txt"))
                 .expect_err("a planted symlink is not written through");
             assert!(
                 err.kind() == std::io::ErrorKind::AlreadyExists
@@ -1661,7 +1798,10 @@ mod tests {
             assert_eq!(std::fs::read(&victim).unwrap(), b"victim");
             // And so is a plain existing file.
             std::fs::write(scratch.dir().join("taken.txt"), b"first").unwrap();
-            assert!(scratch.create_at("taken.txt").is_err());
+            assert!(scratch
+                .dir
+                .create_at(std::ffi::OsStr::new("taken.txt"))
+                .is_err());
             scratch.dir().to_path_buf()
         };
         assert!(!dir.exists(), "the scratch goes when the publish does");
@@ -1928,6 +2068,166 @@ mod tests {
         assert_eq!(local.filename, "1-voice-note-9.mp3");
         assert!(local.is_voice_note);
         assert_eq!(local.size, body.len() as u64);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// B2 from the third confirmation pass, and the one finding in that pass
+    /// that is a boundary crossing rather than defence in depth: the bytes
+    /// and the name both come from a remote sender, so the harness must
+    /// never write them through a link.
+    ///
+    /// The name is fully predictable (`<index>-<the sender's own imeta
+    /// filename>`) and the turn directory is writable by the engine, so a
+    /// link planted at that name turns the download into an arbitrary
+    /// host-file overwrite with sender-chosen, hash-verified bytes. The write
+    /// goes through [`DirHandle::create_at`] (`O_CREAT | O_EXCL |
+    /// O_NOFOLLOW`, relative to the descriptor taken when the turn directory
+    /// was opened), so the link is refused rather than followed.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_link_planted_at_an_inbound_name_is_never_written_through() {
+        let body = b"attacker-controlled blob".to_vec();
+        let sha = blossom::sha256_hex(&body);
+        let (base, _head) = one_shot_server("200 OK", body.clone(), Some(body.len())).await;
+        let rest = rest_for(&base);
+        // The sender chooses this name, so it knows exactly what the harness
+        // will call the file.
+        let event = imeta_event_for(&base, &sha, body.len(), "audio/mpeg", "voice-note-9.mp3");
+        let root = std::env::temp_dir().join(format!("buzz-acp-dl-{}", uuid::Uuid::new_v4()));
+        let turn_dir = prepare_turn_dir(&root, "turn-1", &LiveTurnDirs::default()).unwrap();
+        let victim = std::env::temp_dir().join(format!("buzz-acp-victim-{}", uuid::Uuid::new_v4()));
+        std::fs::write(&victim, b"victim").unwrap();
+        std::os::unix::fs::symlink(&victim, turn_dir.join("1-voice-note-9.mp3")).unwrap();
+
+        let inbound =
+            collect_inbound_attachments(&rest, &[&event], &turn_dir, None, far_deadline()).await;
+
+        match &inbound.outcomes[0] {
+            AttachmentOutcome::Failed { reason, .. } => {
+                // The reason names the condition, never the host path.
+                assert!(
+                    !reason.contains(&victim.display().to_string())
+                        && !reason.contains(&turn_dir.display().to_string()),
+                    "{reason}"
+                );
+            }
+            other => panic!("expected Failed, got {other:?}"),
+        }
+        assert_eq!(
+            std::fs::read(&victim).unwrap(),
+            b"victim",
+            "the file the link pointed at was not overwritten"
+        );
+        assert!(
+            !inbound
+                .stored()
+                .any(|local| local.filename == "1-voice-note-9.mp3"),
+            "nothing was reported as stored"
+        );
+        let _ = std::fs::remove_file(&victim);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// ffmpeg is the one inbound writer the descriptor cannot cover: it is
+    /// handed a path and does its own open. The name it is given is derived
+    /// from the sender's filename, so it is as predictable as the download's,
+    /// and the harness therefore claims it through the descriptor first
+    /// (`O_CREAT | O_EXCL | O_NOFOLLOW`). A link already at that name costs
+    /// the extraction; the note says so and the file the link pointed at is
+    /// untouched.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_link_planted_at_the_extraction_output_is_never_written_through() {
+        let body = b"fake mp4 envelope".to_vec();
+        let sha = blossom::sha256_hex(&body);
+        let (base, _head) = one_shot_server("200 OK", body.clone(), Some(body.len())).await;
+        let rest = rest_for(&base);
+        let event = imeta_event_for(&base, &sha, body.len(), "video/mp4", "voice-note-1.mp4");
+        let root = std::env::temp_dir().join(format!("buzz-acp-dl-{}", uuid::Uuid::new_v4()));
+        let turn_dir = prepare_turn_dir(&root, "turn-1", &LiveTurnDirs::default()).unwrap();
+        let victim = std::env::temp_dir().join(format!("buzz-acp-victim-{}", uuid::Uuid::new_v4()));
+        std::fs::write(&victim, b"victim").unwrap();
+        // The name ffmpeg would be given: `<index>-<sender's stem>.mp3`.
+        std::os::unix::fs::symlink(&victim, turn_dir.join("1-voice-note-1.mp3")).unwrap();
+        // A stand-in for ffmpeg so the test does not need a real one: it
+        // writes to whatever path it is given last, which is exactly the
+        // behaviour the guard has to survive.
+        let fake = root.join("fake-ffmpeg");
+        std::fs::write(
+            &fake,
+            "#!/bin/sh\nfor a in \"$@\"; do last=\"$a\"; done\nprintf 'ID3extracted' > \"$last\"\n",
+        )
+        .unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        let inbound =
+            collect_inbound_attachments(&rest, &[&event], &turn_dir, Some(&fake), far_deadline())
+                .await;
+
+        let AttachmentOutcome::Stored { local, .. } = &inbound.outcomes[0] else {
+            panic!("expected the envelope itself to be stored: {inbound:?}");
+        };
+        assert_eq!(local.filename, "1-voice-note-1.mp4");
+        assert_eq!(local.mime_type, "video/mp4");
+        let note = local.note.as_deref().unwrap_or_default();
+        assert!(note.contains("extraction failed"), "{note}");
+        assert_eq!(
+            std::fs::read(&victim).unwrap(),
+            b"victim",
+            "the file the link pointed at was not overwritten"
+        );
+        let _ = std::fs::remove_file(&victim);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The inbound half resolves the turn directory once, with
+    /// `O_DIRECTORY | O_NOFOLLOW`, so a turn directory that is a link stores
+    /// nothing rather than storing a remote sender's bytes wherever the link
+    /// points. `prepare_turn_dir` cannot do this for us: `create_dir_all`
+    /// walks happily through a link and only the root is checked afterwards.
+    ///
+    /// This is deliberately asymmetric with the outbound half, which still
+    /// treats a link-replaced turn directory as a root (B1 of the third
+    /// confirmation pass, accepted): out there the only party who can plant
+    /// the link is the engine, which has a shell at our uid and does not need
+    /// it. In here the bytes and the name belong to a remote member, so the
+    /// write has to land where we meant it to.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_inbound_turn_directory_that_is_a_link_stores_nothing() {
+        let body = b"attacker-controlled blob".to_vec();
+        let sha = blossom::sha256_hex(&body);
+        let (base, _head) = one_shot_server("200 OK", body.clone(), Some(body.len())).await;
+        let rest = rest_for(&base);
+        let event = imeta_event_for(&base, &sha, body.len(), "audio/mpeg", "voice-note-9.mp3");
+        let root = std::env::temp_dir().join(format!("buzz-acp-dl-{}", uuid::Uuid::new_v4()));
+        let elsewhere =
+            std::env::temp_dir().join(format!("buzz-acp-elsewhere-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        let turn_dir = root.join("turn-1");
+        std::os::unix::fs::symlink(&elsewhere, &turn_dir).unwrap();
+        // The name resolves to a real directory, so every path-shaped check
+        // agrees with it; `prepare_turn_dir` would too.
+        assert!(turn_dir.is_dir());
+
+        let inbound =
+            collect_inbound_attachments(&rest, &[&event], &turn_dir, None, far_deadline()).await;
+
+        match &inbound.outcomes[0] {
+            AttachmentOutcome::Rejected { reason, .. } => {
+                assert!(reason.contains("could not be opened"), "{reason}")
+            }
+            other => panic!("expected Rejected, got {other:?}"),
+        }
+        assert!(
+            std::fs::read_dir(&elsewhere).unwrap().next().is_none(),
+            "nothing was written through the link"
+        );
+        let _ = std::fs::remove_dir_all(&elsewhere);
         let _ = std::fs::remove_dir_all(&root);
     }
 
