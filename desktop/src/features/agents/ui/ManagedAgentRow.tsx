@@ -452,13 +452,13 @@ function RelayMembershipBlock({
         <div className="flex items-start gap-1.5">
           <div className="min-w-0 flex-1">
             <div className="text-2xs font-medium text-muted-foreground">
-              Agent npub
+              {notice.npubLabel}
             </div>
             <div className="break-all font-mono">{notice.npub}</div>
           </div>
           <CopyButton
             iconOnly
-            label="Copy agent npub"
+            label={`Copy ${notice.npubLabel.toLowerCase()}`}
             size="icon-xs"
             value={notice.npub}
             variant="ghost"

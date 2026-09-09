@@ -17,8 +17,14 @@
 
 use crate::app_state::AppState;
 
-/// Longest local part the desktop derives. NIP-05 has no hard cap but short
-/// handles keep `@mentions` and the well-known lookup readable.
+/// Longest SLUG the desktop derives from a display name. NIP-05 has no hard
+/// cap but short handles keep `@mentions` and the well-known lookup readable.
+///
+/// This is not the cap on a local part: [`nip05_candidates`] appends
+/// `-<4 or 8 hex>` after the slug is capped, so a derived local part reaches
+/// 41 characters. Capping the candidate instead would truncate the pubkey
+/// suffix that makes it unique, which is the one thing about it that must
+/// survive.
 const NIP05_LOCAL_MAX_LEN: usize = 32;
 
 /// Fallback local part when the display name slugifies to nothing.
@@ -53,20 +59,60 @@ pub fn nip05_domain(relay_url: &str) -> String {
     host.split(':').next().unwrap_or("").to_ascii_lowercase()
 }
 
+/// Latin letters NFKD does not decompose, and the ASCII they are conventionally
+/// transliterated to. These are ligatures and letters with a stroke or a bar
+/// rather than a combining accent, so NFKD leaves them whole and the slugifier
+/// drops them: without this map `Ægir` becomes `gir`, `Łukasz` becomes
+/// `ukasz`, `Søren` becomes `s-ren` and `Straße` becomes `stra-e`. Applied
+/// before the fold, so a decomposition never has to see them.
+///
+/// Deliberately small: it covers the European names the fold was added for,
+/// not every script. A name outside it still slugifies to the `agent`
+/// fallback, which the pubkey suffix disambiguates.
+const ASCII_TRANSLITERATIONS: &[(char, &str)] = &[
+    ('Æ', "AE"),
+    ('æ', "ae"),
+    ('Ø', "O"),
+    ('ø', "o"),
+    ('Ł', "L"),
+    ('ł', "l"),
+    ('Đ', "D"),
+    ('đ', "d"),
+    ('Ð', "D"),
+    ('ð', "d"),
+    ('ß', "ss"),
+    ('Þ', "TH"),
+    ('þ', "th"),
+    ('Œ', "OE"),
+    ('œ', "oe"),
+];
+
 /// Fold a display name onto its ASCII skeleton before slugification.
 ///
 /// [`crate::util::slugify`] maps every non-ASCII character to the separator,
-/// which loses letters rather than punctuation: `Zoë` becomes `zo`. NFKD
-/// splits a precomposed letter into its base plus a combining mark, so
-/// dropping the combining marks keeps the base letter and `Zoë` becomes
-/// `zoe`. Characters with no ASCII decomposition (`Æ`, `東`) are unchanged
-/// and still slugify to separators, leaving the `agent` fallback for a name
-/// with no ASCII letters at all. The pubkey suffix disambiguates those.
+/// which loses letters rather than punctuation: `Zoë` becomes `zo`. Two steps
+/// fix that. First the undecomposable Latin letters above are transliterated,
+/// because NFKD has nothing to split them into. Then NFKD splits a precomposed
+/// letter into its base plus a combining mark, so dropping the combining marks
+/// keeps the base letter and `Zoë` becomes `zoe`. Characters outside both
+/// (`東`) are unchanged and still slugify to separators, leaving the `agent`
+/// fallback for a name with no ASCII letters at all. The pubkey suffix
+/// disambiguates those.
 fn fold_to_ascii_skeleton(display_name: &str) -> String {
     use unicode_normalization::char::is_combining_mark;
     use unicode_normalization::UnicodeNormalization;
 
-    display_name
+    let transliterated: String = display_name
+        .chars()
+        .map(|character| {
+            ASCII_TRANSLITERATIONS
+                .iter()
+                .find(|(from, _)| *from == character)
+                .map_or_else(|| character.to_string(), |(_, to)| (*to).to_string())
+        })
+        .collect();
+
+    transliterated
         .nfkd()
         .filter(|character| !is_combining_mark(*character))
         .collect()
@@ -161,6 +207,15 @@ pub enum Nip05Lookup {
 
 /// Public `GET /.well-known/nostr.json?name=<local>` on the relay. No auth:
 /// the endpoint is the NIP-05 discovery door itself.
+///
+/// Sent on the no-redirect [`AppState::relay_meta_client`], and any 3xx is an
+/// error rather than an answer. This lookup is the *authority* on who holds a
+/// handle, so a redirect to another origin must not be able to supply it: a
+/// third origin claiming the name would push the agent off a handle it owns,
+/// and one answering an empty `names` map would make the desktop publish a
+/// handle the relay attributes to somebody else, which the relay silently
+/// drops on its UNIQUE index and which is exactly the stranded state this
+/// confirmation exists to prevent.
 pub async fn lookup_nip05_owner(
     state: &AppState,
     http_base_url: &str,
@@ -172,13 +227,19 @@ pub async fn lookup_nip05_owner(
         local
     );
     let response = state
-        .http_client
+        .relay_meta_client
         .get(&url)
         .header("Accept", "application/json")
         .timeout(NIP05_LOOKUP_TIMEOUT)
         .send()
         .await
         .map_err(|error| super::classify_request_error(&error))?;
+    if response.status().is_redirection() {
+        return Err(format!(
+            "NIP-05 lookup for {local} was redirected off the relay ({}), so the relay did not answer it",
+            response.status()
+        ));
+    }
     if response.status() == reqwest::StatusCode::NOT_FOUND {
         return Ok(Nip05Lookup::Unsupported);
     }
@@ -303,11 +364,50 @@ mod tests {
             ("Ünïcödé", "unicode"),
             ("José García", "jose-garcia"),
             ("Renée-Ann", "renee-ann"),
+            ("Björn", "bjorn"),
             ("東京", "agent"),
         ];
         for (name, expected) in cases {
             assert_eq!(nip05_local_part(name), expected, "name={name}");
         }
+    }
+
+    /// The letters NFKD will not decompose. Without the transliteration map
+    /// these lose their first letter or split a name in half, which is worse
+    /// than an accent dropped: `Ægir` became `gir`, `Łukasz` became `ukasz`,
+    /// `Søren` became `s-ren` and `Straße` became `stra-e`.
+    #[test]
+    fn undecomposable_latin_letters_are_transliterated_not_dropped() {
+        let cases = [
+            ("Ægir", "aegir"),
+            ("Łukasz", "lukasz"),
+            ("Søren", "soren"),
+            ("Đoković", "dokovic"),
+            ("Straße", "strasse"),
+            ("Þor", "thor"),
+            ("Œuvre", "oeuvre"),
+        ];
+        for (name, expected) in cases {
+            assert_eq!(nip05_local_part(name), expected, "name={name}");
+        }
+    }
+
+    /// The cap is on the SLUG, not the candidate: the pubkey suffix is
+    /// appended after it and must survive, or the suffixed candidates stop
+    /// being unique and the collision fallback stops working.
+    #[test]
+    fn the_length_cap_applies_to_the_slug_and_never_truncates_the_suffix() {
+        let long = "a".repeat(80);
+        let candidates = nip05_candidates(&long, AGENT);
+        assert_eq!(candidates[0].len(), NIP05_LOCAL_MAX_LEN);
+        assert_eq!(
+            candidates[1],
+            format!("{}-a1f3", "a".repeat(NIP05_LOCAL_MAX_LEN))
+        );
+        assert_eq!(
+            candidates[2],
+            format!("{}-a1f3c0ff", "a".repeat(NIP05_LOCAL_MAX_LEN))
+        );
     }
 
     #[test]
@@ -538,6 +638,55 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(handle, None);
+        }
+
+        /// A cross-origin redirect must not be able to answer the handle
+        /// question. The lookup is the AUTHORITY on who holds a local part,
+        /// so an answer from a third origin is not an answer at all: one
+        /// claiming the name pushes the agent off a handle it owns, and one
+        /// answering an empty `names` map makes the desktop publish a handle
+        /// the relay attributes to somebody else, which the relay drops on
+        /// its UNIQUE index and which strands the agent exactly as the
+        /// contested-handle bug did.
+        #[tokio::test]
+        async fn a_redirected_well_known_is_an_error_not_an_answer() {
+            use axum::{http::StatusCode, response::IntoResponse, routing::get, Router};
+
+            // Origin B would happily answer, and its answer must never count.
+            let (elsewhere, _) = spawn_well_known(Some(vec![("bob", OTHER)])).await;
+            let target = format!(
+                "{}/.well-known/nostr.json",
+                crate::relay::relay_http_base_url(&elsewhere)
+            );
+
+            let app = Router::new().route(
+                "/.well-known/nostr.json",
+                get(move || {
+                    let target = target.clone();
+                    async move {
+                        (StatusCode::FOUND, [(axum::http::header::LOCATION, target)])
+                            .into_response()
+                    }
+                }),
+            );
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind redirecting relay");
+            let addr = listener.local_addr().expect("redirecting relay addr");
+            tokio::spawn(async move {
+                axum::serve(listener, app).await.ok();
+            });
+
+            let state = build_app_state();
+            let result =
+                resolve_managed_agent_nip05(&state, &format!("ws://{addr}"), AGENT, "Bob", None)
+                    .await;
+
+            let error = result.expect_err("a 3xx is not the relay's answer");
+            assert!(
+                error.contains("redirected"),
+                "the error must name the redirect: {error}"
+            );
         }
 
         #[tokio::test]

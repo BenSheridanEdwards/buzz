@@ -227,6 +227,42 @@ fn production_delete_orchestration_restores_bestie_when_agent_save_fails() {
     .unwrap_or_else(|error| panic!("read restored assignment: {error}")));
 }
 
+/// The four cases of `create_managed_agent`'s summary rebuild, which decides
+/// whether the create's own reply carries the `relay_membership` the Phase 3a
+/// preflight just wrote.
+///
+/// The rebuild used to key off the backend rather than off whether Phase 3a
+/// ran, so a provider-backed create whose deploy failed ran the preflight and
+/// then answered with the pre-preflight summary: `relay_membership: None`,
+/// and no "Not a relay member" card until the mutation's `onSettled` refetch
+/// landed. That is the second row below, and it is the row the old predicate
+/// got wrong. The last row is where the two predicates also differ but the
+/// answer does not: the spawn-error branch rebuilt from disk already, and the
+/// only writes between it and here are to the retention DB and the relay,
+/// never to the agent record.
+#[test]
+fn the_summary_is_rebuilt_exactly_when_something_could_have_changed_it() {
+    // (spawns_after_create, spawn_error.is_none(), rebuild)
+    let cases = [
+        // Phase 3a ran (no spawn), deploy succeeded: preflight + backend id.
+        (false, true, true),
+        // Phase 3a ran, deploy failed: the preflight's write is still there.
+        (false, false, true),
+        // Phase 3b spawned and succeeded: the spawn refreshed the record.
+        (true, true, true),
+        // Phase 3b spawned and failed: the error path already rebuilt and
+        // returned that summary, and nothing since could have changed it.
+        (true, false, false),
+    ];
+    for (spawns_after_create, spawn_error_is_none, expected) in cases {
+        assert_eq!(
+            summary_needs_rebuild(spawns_after_create, spawn_error_is_none),
+            expected,
+            "spawns_after_create={spawns_after_create} spawn_error_is_none={spawn_error_is_none}"
+        );
+    }
+}
+
 /// Deleting an agent clears its relay-membership sidecar row, and only its
 /// own: the row is derived state keyed by a pubkey, so leaving it behind
 /// hands the next reader of `relay-membership.json` a membership record for
@@ -252,6 +288,7 @@ fn production_delete_orchestration_clears_the_relay_membership_sidecar() {
                 state: RelayMembershipState::NotMember,
                 checked_at: "t".to_string(),
                 detail: None,
+                subject_pubkey: None,
             }),
         )
         .unwrap_or_else(|error| panic!("seed membership: {error}"));

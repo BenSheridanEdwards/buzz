@@ -15,6 +15,7 @@ export type RawRelayMembership = {
   state: "member" | "not_member" | "unknown";
   checked_at: string;
   detail?: string | null;
+  subject_pubkey?: string | null;
 };
 
 /** Map the Rust sidecar record onto the camelCase client type. */
@@ -26,5 +27,6 @@ export function fromRawRelayMembership(
     state: raw.state,
     checkedAt: raw.checked_at,
     detail: raw.detail ?? null,
+    subjectPubkey: raw.subject_pubkey ?? null,
   };
 }

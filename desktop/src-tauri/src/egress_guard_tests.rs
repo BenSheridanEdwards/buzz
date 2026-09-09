@@ -316,6 +316,10 @@ const EVENTS_INVENTORY: &[(&str, usize, usize)] = &[
     // production kind:9030 registration publishes through the guarded
     // boundary-1 funnel (`submit_event_at_with_keys`).
     ("src/managed_agents/relay_membership.rs", 1, 0),
+    // Stub-relay route in the profile-sync tests (the "closed to the desktop,
+    // open to the agent" relay); the production kind:0 publish goes through
+    // the guarded boundary-2 site in `relay.rs`.
+    ("src/relay/tests.rs", 1, 0),
 ];
 
 // Needles are assembled at runtime so this scan file itself contains no

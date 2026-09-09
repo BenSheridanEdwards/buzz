@@ -23,8 +23,14 @@ export type RelayMembershipNotice = {
   severity: "blocked" | "unverified";
   /** Persisted detail from the check, verbatim. */
   detail: string | null;
-  /** The agent's npub, for the operator; null only for a malformed pubkey. */
+  /** The npub for the operator; null only for a malformed pubkey. */
   npub: string | null;
+  /**
+   * Whose npub it is. The single owner of that label: the block renders this
+   * string and derives the copy button's accessible name from it, so the two
+   * can never disagree about the subject.
+   */
+  npubLabel: string;
   /** Full operator command; null when the relay verified the check as unknown. */
   command: string | null;
 };
@@ -38,20 +44,30 @@ export function relayMembershipNotice(
   membership: ManagedAgentRelayMembership | null | undefined,
 ): RelayMembershipNotice | null {
   if (!membership || membership.state === "member") return null;
+  // The relay answers about the agent on every path but one: when it refused
+  // the workspace identity at the roster read it never saw the agent, and the
+  // backend records whose identity it actually refused. Naming the agent
+  // there, and printing an `add-member` for the agent's hex, sends the user
+  // to an operator with a command that may already have been run and that
+  // could never clear the card.
+  const subjectHex = membership.subjectPubkey ?? agentPubkeyHex;
+  const npubLabel = membership.subjectPubkey ? "Your npub" : "Agent npub";
   if (membership.state === "not_member") {
     return {
       badge: "Not a relay member",
       severity: "blocked",
       detail: membership.detail,
-      npub: safeNpub(agentPubkeyHex),
-      command: relayAddMemberCommand(agentPubkeyHex),
+      npub: safeNpub(subjectHex),
+      npubLabel,
+      command: relayAddMemberCommand(subjectHex),
     };
   }
   return {
     badge: "Relay membership unverified",
     severity: "unverified",
     detail: membership.detail,
-    npub: safeNpub(agentPubkeyHex),
+    npub: safeNpub(subjectHex),
+    npubLabel,
     command: null,
   };
 }

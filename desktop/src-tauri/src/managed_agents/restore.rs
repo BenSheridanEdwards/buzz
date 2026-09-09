@@ -93,12 +93,18 @@ pub fn backfill_persona_snapshots(app: &tauri::AppHandle) -> Result<(), String> 
 /// logged here: a relay that cannot be reached now is retried on the next
 /// start and by the profile reconcile, and the spawn must not be blocked on
 /// it.
+///
+/// `workspace_relay` is passed in rather than read here, so the relay this
+/// registers the agent on is byte-for-byte the one Phase B then spawns it
+/// against. Reading it separately let a community switch land inside this
+/// await and write a kind:9030 into the previous community's roster while the
+/// agent came up on the new one.
 async fn preflight_relay_membership_for_restore(
     app: &tauri::AppHandle,
     state: &AppState,
     agents_to_start: &[super::ManagedAgentRecord],
+    workspace_relay: &str,
 ) {
-    let workspace_relay = crate::relay::relay_ws_url_with_override(state);
     let memberships = super::load_relay_memberships(&match managed_agents_base_dir(app) {
         Ok(base_dir) => base_dir,
         Err(error) => {
@@ -112,7 +118,7 @@ async fn preflight_relay_membership_for_restore(
         .map(|record| {
             (
                 record.pubkey.clone(),
-                crate::relay::effective_agent_relay_url(&record.relay_url, &workspace_relay),
+                crate::relay::effective_agent_relay_url(&record.relay_url, workspace_relay),
             )
         })
         .filter(|(pubkey, relay_url)| {
@@ -339,7 +345,16 @@ pub async fn restore_managed_agents_on_launch(
     // last async stretch before Phase B takes the transition lock and spawns,
     // costs a legacy agent nothing but the check itself, and costs an
     // already-registered agent nothing at all.
-    preflight_relay_membership_for_restore(app, &state, &agents_to_start).await;
+    //
+    // The workspace relay is read ONCE here and handed to both the preflight
+    // and Phase B below. Each Phase B thread used to re-read it, so a
+    // community switch landing inside the preflight await registered the
+    // agent on the old relay and then spawned it against the new one: the
+    // membership preflight adds a durable write (a kind:9030 into the
+    // previous community's roster) to a window the mesh preflight only read
+    // through. One capture makes the two phases agree by construction.
+    let workspace_relay = crate::relay::relay_ws_url_with_override(&state);
+    preflight_relay_membership_for_restore(app, &state, &agents_to_start, &workspace_relay).await;
 
     // Serialize spawning and runtime registration with shutdown cleanup. The
     // shutdown flag is rechecked after taking the lock so shutdown either
@@ -356,16 +371,17 @@ pub async fn restore_managed_agents_on_launch(
     // ── Phase B (transition lock held): resolve commands and spawn in parallel ──
     let spawn_results: Vec<AgentSpawnResult> = std::thread::scope(|scope| {
         let owner_hex_ref = owner_hex.as_deref();
+        // The same capture the membership preflight above registered against,
+        // not a fresh read per thread.
+        let workspace_relay_ref = workspace_relay.as_str();
         let handles: Vec<_> = agents_to_start
             .iter()
             .filter(|_| !shutdown_started.load(Ordering::SeqCst))
             .map(|record| {
                 let handle = scope.spawn(move || {
-                    let workspace_relay =
-                        crate::relay::relay_ws_url_with_override(&app.state::<AppState>());
                     let relay_url = crate::relay::effective_agent_relay_url(
                         &record.relay_url,
-                        &workspace_relay,
+                        workspace_relay_ref,
                     );
                     let outcome =
                         match super::ManagedAgentRuntimeKey::new(record.pubkey.clone(), &relay_url)

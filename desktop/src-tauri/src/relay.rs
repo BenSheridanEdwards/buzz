@@ -660,10 +660,35 @@ pub async fn sync_managed_agent_profile(
     // handle is read back first so reconciles prefer whatever the agent
     // already carries, subject to the relay confirming it still attributes
     // that handle to this agent (see `nip05::resolve_managed_agent_nip05`).
+    //
+    // ADVISORY, never a gate. This read authenticates as the WORKSPACE
+    // identity, while the kind:0 it precedes is signed by the AGENT's own
+    // keys. On a closed relay those are different subjects: the operator
+    // running `buzz-admin add-member --pubkey <agent hex>` admits the agent
+    // and not the desktop, so a plain-member or unlisted user's `/query` is
+    // refused with a 403 while the agent's own `/events` publish would
+    // succeed. Propagating that refusal abandoned the publish and the agent
+    // never got a name, avatar or handle at all, with no reconcile that could
+    // ever fix it because the reconcile does the same read.
+    //
+    // Losing the hint is safe by construction: after the contested-handle
+    // fix, `existing` decides nothing but the probe ORDER
+    // (`nip05_probe_order`), and every candidate including that one is
+    // confirmed against the relay's own attribution before it is returned.
+    // The one cost is churn: an agent holding `bob-a1f3` while `bob` is free
+    // moves to `bob` on a publish whose read failed. A missing profile beats
+    // a stable one.
     let agent_pubkey = agent_keys.public_key().to_hex();
-    let existing = query_agent_profile(state, relay_url, &agent_pubkey)
-        .await?
-        .and_then(|info| info.nip05);
+    let existing = match query_agent_profile(state, relay_url, &agent_pubkey).await {
+        Ok(profile) => profile.and_then(|info| info.nip05),
+        Err(error) => {
+            eprintln!(
+                "buzz-desktop: could not read {agent_pubkey} kind:0 before profile sync, \
+                 publishing without the existing-handle hint: {error}"
+            );
+            None
+        }
+    };
     let nip05 = nip05::resolve_managed_agent_nip05(
         state,
         relay_url,
@@ -811,13 +836,21 @@ struct RelayInformationDocument {
 /// Whether the relay at `http_base_url` advertises NIP-43 (relay membership)
 /// in its NIP-11 document. A closed relay advertises it; an open relay does
 /// not, and no membership work is needed there.
+///
+/// Sent on the no-redirect [`AppState::relay_meta_client`], and any 3xx is an
+/// error rather than an answer. "This relay is open" is a claim only the
+/// relay may make about itself: a redirect target whose `supported_nips`
+/// omits 43 would make a closed relay read as `OpenRelay`, which clears the
+/// agent's membership sidecar row, registers nothing, and leaves it unable to
+/// publish with no card state at all. An error keeps the row as `Unknown` and
+/// the next start retries.
 pub async fn relay_advertises_membership_at(
     state: &AppState,
     http_base_url: &str,
 ) -> Result<bool, String> {
     let url = format!("{}/info", http_base_url.trim_end_matches('/'));
     let response = state
-        .http_client
+        .relay_meta_client
         .get(url)
         .header("Accept", "application/nostr+json")
         .timeout(std::time::Duration::from_secs(15))
@@ -825,6 +858,12 @@ pub async fn relay_advertises_membership_at(
         .await
         .map_err(|error| classify_request_error(&error))?;
 
+    if response.status().is_redirection() {
+        return Err(format!(
+            "the relay information document was redirected off the relay ({}), so the relay did not answer it",
+            response.status()
+        ));
+    }
     if !response.status().is_success() {
         return Err(relay_error_message(response).await);
     }

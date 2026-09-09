@@ -31,6 +31,20 @@ pub struct AppState {
     /// response (surfaced as an error) so the auth token never leaves the
     /// validated relay origin.
     pub media_fetch_client: reqwest::Client,
+    /// A no-redirect client for the relay's own metadata endpoints: the
+    /// NIP-11 document (`GET /info`) and the public NIP-05 lookup
+    /// (`GET /.well-known/nostr.json`). Neither carries a credential, so this
+    /// is not the media client's SSRF hazard; the hazard here is *authority*.
+    /// Both answers are consumed as facts the relay asserted about itself,
+    /// and the app-wide `http_client` follows redirects, so a 3xx would let a
+    /// third origin supply them: a redirected well-known decides which agent
+    /// holds a handle (and a redirect target answering an empty `names` map
+    /// makes the desktop publish a handle the relay attributes to somebody
+    /// else, stranding it), and a redirected `/info` without NIP-43 makes a
+    /// closed relay read as `OpenRelay`, which clears the membership sidecar
+    /// row and registers nothing. `redirect::Policy::none()` returns the 3xx
+    /// verbatim so the caller rejects it as "the relay did not answer".
+    pub relay_meta_client: reqwest::Client,
     pub relay_url_override: Mutex<Option<String>>,
     pub workspace_apply_lock: Arc<AsyncMutex<()>>,
     pub workspace_apply_generation: AtomicU64,
@@ -184,6 +198,22 @@ pub fn build_media_fetch_client() -> reqwest::Result<reqwest::Client> {
         .build()
 }
 
+/// Client for the relay's own metadata endpoints (`/info`, the NIP-05
+/// well-known). See [`AppState::relay_meta_client`]: it MUST NOT follow
+/// redirects, because both answers are read as the relay's own assertions
+/// about itself and a 3xx would hand that authority to another origin.
+///
+/// Returned as a `Result` so the fail-closed invariant is testable: callers
+/// must never substitute a redirect-following client on build failure.
+pub fn build_relay_meta_client() -> reqwest::Result<reqwest::Client> {
+    reqwest::Client::builder()
+        .resolve("localhost", std::net::SocketAddr::from(([127, 0, 0, 1], 0)))
+        .pool_idle_timeout(std::time::Duration::from_secs(10))
+        .pool_max_idle_per_host(1)
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+}
+
 pub fn build_app_state() -> AppState {
     // Env var takes precedence (dev/CI). If absent, resolve_persisted_identity()
     // in setup() will replace the ephemeral placeholder with a persisted key.
@@ -211,6 +241,11 @@ pub fn build_app_state() -> AppState {
             "media_fetch_client must build with redirect::Policy::none(); a \
              redirect-following fallback would forward the minted media auth \
              header across origins (redirect-hop SSRF)",
+        ),
+        relay_meta_client: build_relay_meta_client().expect(
+            "relay_meta_client must build with redirect::Policy::none(); a \
+             redirect-following fallback would let a third origin decide an \
+             agent's NIP-05 handle and make a closed relay read as open",
         ),
         relay_url_override: Mutex::new(None),
         workspace_apply_lock: Arc::new(AsyncMutex::new(())),

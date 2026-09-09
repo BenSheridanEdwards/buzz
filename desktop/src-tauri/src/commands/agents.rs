@@ -57,11 +57,43 @@ pub(super) fn summarize_from_disk(
     )
 }
 
+/// Whether `create_managed_agent` must re-read the record from disk before it
+/// answers, rather than returning the summary it built in Phase 3.
+///
+/// Two things can have changed since then, and they are what the two terms
+/// are: Phase 3a's membership preflight wrote the `relay_membership` sidecar
+/// and it runs exactly when the create does not spawn
+/// (`!spawns_after_create`); a provider deploy may have written
+/// `backend_agent_id` and it only gets that far when it did not fail
+/// (`spawn_error_is_none`).
+///
+/// The predicate used to be `input.backend == BackendKind::Local ||
+/// spawn_error.is_none()`, which disagreed with the first term for one case:
+/// a provider-backed create whose deploy failed ran the preflight and then
+/// returned the pre-preflight summary, so the create's own reply carried
+/// `relay_membership: None` and the "Not a relay member" card only appeared
+/// after the mutation's `onSettled` refetch (`hooks.ts`,
+/// `useCreateManagedAgentMutation`).
+pub(super) fn summary_needs_rebuild(spawns_after_create: bool, spawn_error_is_none: bool) -> bool {
+    !spawns_after_create || spawn_error_is_none
+}
+
 /// Register the agent on the relay before it starts, so a closed relay
 /// accepts its first publish. Never blocks the start: a relay/network failure
 /// is persisted as `Unknown` by the preflight and logged here; the agent is
 /// still spawned (the relay may admit it via NIP-OA delegation, and the next
 /// start or profile reconcile retries the registration).
+///
+/// Deliberately unconditional, unlike launch restore (`restore.rs`) and the
+/// profile reconcile (`agents_profile.rs`), which both filter on
+/// `should_preflight_membership` and skip a pair the sidecar already records
+/// as `Member`. Those two are automatic and run over the whole fleet, so the
+/// skip is what keeps their cost proportional. A manual start is one agent
+/// the user just asked for, and it is the only place a *stale* `Member` gets
+/// re-verified: membership can be revoked on the relay at any time and
+/// nothing pushes that back to the desktop, so if the start skipped on
+/// `Member` too, no path would ever re-check one. One `/info` plus one
+/// `/query` on an explicit single-agent action is the right price for that.
 async fn preflight_relay_membership_for_start(
     app: &AppHandle,
     state: &AppState,
@@ -858,10 +890,7 @@ pub async fn create_managed_agent(
         spawn_error
     };
 
-    // Rebuild the summary: a provider deploy may have updated
-    // backend_agent_id, and the Phase 3a membership preflight ran after the
-    // Phase 3 summary was built.
-    let final_agent = if input.backend == BackendKind::Local || spawn_error.is_none() {
+    let final_agent = if summary_needs_rebuild(spawns_after_create, spawn_error.is_none()) {
         let _store_guard = state
             .managed_agents_store_lock
             .lock()

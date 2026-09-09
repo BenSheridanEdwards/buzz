@@ -787,3 +787,158 @@ async fn an_outage_is_never_a_refusal() {
     );
     reset_rate_limit_gate();
 }
+
+// ── Managed-agent profile sync: the pre-publish read is advisory ──────────
+//
+// Gated off Windows like the other stub-relay tests: `build_app_state()`
+// pulls native DLLs unavailable in the Windows CI runner.
+
+#[cfg(not(target_os = "windows"))]
+mod profile_sync_stub_relay {
+    use std::sync::{Arc, Mutex};
+
+    /// Stub relay for the "closed to the desktop, open to the agent" shape
+    /// this PR's own manual recipe produces at step 4.
+    ///
+    /// `POST /query` answers the bridge's membership refusal verbatim
+    /// (`api/mod.rs`, `enforce_relay_membership`): the operator ran
+    /// `buzz-admin add-member --pubkey <agent hex>`, so the AGENT is a member
+    /// and the desktop identity still is not. `POST /events` accepts, because
+    /// the agent signs its own NIP-98 there. `/.well-known/nostr.json`
+    /// answers an empty `names` map, so every handle is free.
+    ///
+    /// Returns the ws URL and the events the relay actually received.
+    async fn spawn_relay_closed_to_the_desktop() -> (String, Arc<Mutex<Vec<serde_json::Value>>>) {
+        use axum::{
+            http::header::CONTENT_TYPE, http::StatusCode, routing::get, routing::post, Router,
+        };
+
+        let posted: Arc<Mutex<Vec<serde_json::Value>>> = Arc::new(Mutex::new(Vec::new()));
+        let seen = posted.clone();
+        let app = Router::new()
+            .route(
+                "/query",
+                post(|| async {
+                    (
+                        StatusCode::FORBIDDEN,
+                        [(CONTENT_TYPE, "application/json")],
+                        serde_json::json!({
+                            "error": "relay_membership_required",
+                            "message": "You must be a relay member to access this relay"
+                        })
+                        .to_string(),
+                    )
+                }),
+            )
+            .route(
+                "/events",
+                post(move |body: String| {
+                    let seen = seen.clone();
+                    async move {
+                        let event: serde_json::Value =
+                            serde_json::from_str(&body).unwrap_or_default();
+                        let id = event
+                            .get("id")
+                            .and_then(|value| value.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        seen.lock().unwrap().push(event);
+                        (
+                            StatusCode::OK,
+                            [(CONTENT_TYPE, "application/json")],
+                            serde_json::json!({
+                                "event_id": id,
+                                "accepted": true,
+                                "message": ""
+                            })
+                            .to_string(),
+                        )
+                    }
+                }),
+            )
+            .route(
+                "/.well-known/nostr.json",
+                get(|| async {
+                    (
+                        StatusCode::OK,
+                        [(CONTENT_TYPE, "application/json")],
+                        serde_json::json!({ "names": {}, "relays": {} }).to_string(),
+                    )
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind stub relay");
+        let addr = listener.local_addr().expect("stub relay addr");
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.ok();
+        });
+        (format!("ws://{addr}"), posted)
+    }
+
+    /// The kind:0 must go out even when the relay refuses the desktop's read.
+    ///
+    /// The pre-publish `query_agent_profile` authenticates as the WORKSPACE
+    /// identity while the profile event it precedes is signed by the AGENT.
+    /// Propagating that 403 abandoned the publish, so on the recipe's own
+    /// "you are not an admin" path the agent never got a name, avatar or
+    /// handle at all, and no reconcile could fix it because the reconcile
+    /// does the same read. The read is a probe-order hint, not a safety
+    /// property: every candidate is confirmed against the relay's own
+    /// attribution regardless.
+    #[tokio::test]
+    async fn a_refused_profile_read_still_publishes_the_agents_kind_0() {
+        let (relay, posted) = spawn_relay_closed_to_the_desktop().await;
+        let state = crate::app_state::build_app_state();
+        let agent_keys = nostr::Keys::generate();
+
+        crate::relay::sync_managed_agent_profile(
+            &state,
+            &relay,
+            &agent_keys,
+            "Bob",
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap_or_else(|error| {
+            panic!("a refused read must not abandon the agent's own publish: {error}")
+        });
+
+        let events = posted.lock().unwrap();
+        let profile = events
+            .iter()
+            .find(|event| event.get("kind").and_then(serde_json::Value::as_u64) == Some(0))
+            .unwrap_or_else(|| panic!("no kind:0 was posted; got {events:?}"));
+        assert_eq!(
+            profile.get("pubkey").and_then(|value| value.as_str()),
+            Some(agent_keys.public_key().to_hex().as_str()),
+            "the profile is signed by the agent, which is why the desktop's \
+             read permission cannot be a precondition for it"
+        );
+        let content: serde_json::Value = serde_json::from_str(
+            profile
+                .get("content")
+                .and_then(|v| v.as_str())
+                .unwrap_or(""),
+        )
+        .expect("kind:0 content is JSON");
+        assert_eq!(
+            content
+                .get("display_name")
+                .or_else(|| content.get("name"))
+                .and_then(|v| v.as_str()),
+            Some("Bob")
+        );
+        // The handle is still resolved and carried: losing the hint costs
+        // probe order, never the handle itself.
+        assert!(
+            content
+                .get("nip05")
+                .and_then(|v| v.as_str())
+                .is_some_and(|handle| handle.starts_with("bob@")),
+            "the handle must still be resolved from the relay: {content}"
+        );
+    }
+}

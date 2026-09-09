@@ -393,6 +393,13 @@ export type ManagedAgentRelayMembership = {
   checkedAt: string;
   /** Human-readable detail for `not_member` / `unknown`. */
   detail: string | null;
+  /**
+   * Whose pubkey (hex) the detail is about, when that is not the agent.
+   * Set only when the relay refused the workspace identity at the roster
+   * read, so the card shows the user's npub and the operator command for it
+   * instead of blaming an agent the relay was never asked about.
+   */
+  subjectPubkey: string | null;
 };
 
 /** Inbound author gate mode. Mirrors buzz-acp's --respond-to CLI flag. */
