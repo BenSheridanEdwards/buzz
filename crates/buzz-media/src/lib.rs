@@ -15,8 +15,8 @@ pub mod upload_record;
 pub mod validation;
 
 pub use audio::{
-    is_supported_audio_mime, sniff_audio_mime, validate_audio_content, validate_iso_bmff_file,
-    validate_m4a_file, validate_mp3_stream, AudioMeta, IsoBmffMedia, MAX_AUDIO_DURATION_SECS,
+    sniff_audio_mime, validate_audio_content, validate_iso_bmff_file, validate_m4a_file,
+    validate_mp3_stream, AudioMeta, IsoBmffMedia, MAX_AUDIO_DURATION_SECS,
 };
 pub use bucket_index::{
     classify_key, fold_bucket_listing, is_tenant_owned_key, sweep_bucket_taxonomy, tenant_prefixes,

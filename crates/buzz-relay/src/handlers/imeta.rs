@@ -21,6 +21,9 @@ pub fn validate_imeta_tags(tags: &[Vec<String>], media_base_url: &str) -> Result
     // files carry arbitrary MIME types whose ext can't be derived from the MIME
     // alone, so their consistency is enforced against the sidecar in
     // `verify_imeta_blobs` rather than here.
+    // Audio (`audio/mpeg`, `audio/mp4`) is deliberately absent: it rides the
+    // generic-file branch below, so its URL extension is checked against the
+    // sidecar in `verify_imeta_blobs` rather than derived from the MIME here.
     const MEDIA_MIME: &[&str] = &[
         "image/jpeg",
         "image/png",
@@ -593,6 +596,21 @@ mod tests {
             "filename voice-note-1.mp3".into(),
         ];
         assert!(validate_imeta_tags(&[audio], BASE).is_ok());
+
+        // The positive M4A case: `audio/mp4` with a `.m4a` URL and a duration
+        // passes. Audio is not in `MEDIA_MIME`, so the extension is not
+        // cross-checked against the MIME here (the sidecar check does that);
+        // this pins that the generic branch really does admit it.
+        let m4a = vec![
+            "imeta".into(),
+            format!("url /media/{HASH}.m4a"),
+            "m audio/mp4".into(),
+            format!("x {HASH}"),
+            "size 6119".into(),
+            "duration 1.2".into(),
+            "filename voice-note-1.m4a".into(),
+        ];
+        assert!(validate_imeta_tags(&[m4a], BASE).is_ok());
 
         let with_poster = vec![
             "imeta".into(),

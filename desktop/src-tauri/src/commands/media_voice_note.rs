@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use tokio_util::sync::CancellationToken;
 
 use super::media_transcode::{
@@ -45,15 +47,19 @@ pub(super) fn voice_note_upload_filename(filename: &str, container: VoiceNoteCon
         )
 }
 
+/// Package a recorded voice note (`data`, the recorder's WAV) for upload in
+/// `container`. The source is shared rather than owned so the caller can
+/// package the same recording again as the envelope if the relay refuses the
+/// M4A, without copying it.
 pub(super) async fn prepare_voice_note_for_upload(
-    data: Vec<u8>,
+    data: Arc<Vec<u8>>,
     cancellation: Option<&CancellationToken>,
     container: VoiceNoteContainer,
 ) -> Result<(Vec<u8>, Option<Vec<u8>>), String> {
     validate_voice_note_input_size(data.len())?;
     let cancellation = cancellation.cloned();
     tokio::task::spawn_blocking(move || {
-        let detected = infer::get(&data)
+        let detected = infer::get(data.as_slice())
             .ok_or_else(|| "Voice note has an unrecognized audio format.".to_string())?;
         if !detected.mime_type().starts_with("audio/") {
             return Err("Voice note upload did not contain audio.".to_string());
@@ -62,7 +68,7 @@ pub(super) async fn prepare_voice_note_for_upload(
         let tmp_input =
             std::env::temp_dir().join(format!("buzz-voice-input-{}", uuid::Uuid::new_v4()));
         let result = (|| {
-            std::fs::write(&tmp_input, &data)
+            std::fs::write(&tmp_input, data.as_slice())
                 .map_err(|error| format!("failed to prepare voice note: {error}"))?;
             let output = match container {
                 VoiceNoteContainer::Mp4Envelope => transcode_voice_note_to_mp4_with_cancellation(

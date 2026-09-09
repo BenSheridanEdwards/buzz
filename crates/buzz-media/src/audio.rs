@@ -3,10 +3,13 @@
 //! Buzz stores uploads byte-for-byte (the Blossom `x` tag binds the client's
 //! SHA-256 to the stored blob), so the relay cannot rewrite an audio file to
 //! strip metadata. Instead, like the MP4 video validator, it accepts only
-//! *canonical* streams that carry no metadata at all and rejects everything
-//! else with [`MediaError::MetadataForbidden`]. Client encoders and the agent
-//! plugin produce such streams (`ffmpeg -map_metadata -1 -id3v2_version 0
-//! -write_id3v1 0`, or the platform AAC encoders with metadata disabled).
+//! *canonical* streams that carry no ID3, APE or `udta` metadata and rejects
+//! everything else with [`MediaError::MetadataForbidden`]. Client encoders and
+//! the agent plugin produce such streams (`ffmpeg -map_metadata -1
+//! -id3v2_version 0 -write_id3v1 0`, or the platform AAC encoders with
+//! metadata disabled). What survives is the encoder's own fingerprint: the
+//! LAME/Xing Info frame names the encoder, and the M4A box layout pins the
+//! muxer. Neither carries user or location data.
 //!
 //! Two containers are accepted:
 //!
@@ -25,7 +28,9 @@ use std::path::Path;
 
 use crate::config::MediaConfig;
 use crate::error::MediaError;
-use crate::validation::VideoMeta;
+use crate::validation::{
+    inspect_video_tracks, parse_mp4_file, track_duration_secs, ParsedMp4, VideoMeta,
+};
 
 /// Longest audio clip the relay accepts, in seconds (30 minutes).
 ///
@@ -49,29 +54,34 @@ pub enum IsoBmffMedia {
     Audio(AudioMeta),
 }
 
-/// MIME types the audio path accepts.
-pub fn is_supported_audio_mime(mime: &str) -> bool {
-    matches!(
-        mime,
-        "audio/mpeg" | "audio/mp4" | "audio/m4a" | "audio/x-m4a"
-    )
-}
-
 /// Sniff a buffered upload for MPEG audio.
 ///
 /// `infer` only recognises MPEG-1 Layer III headers (`FF FB`) and ID3-tagged
 /// files, so a 22.05 kHz MPEG-2 stream from a speech encoder would fall
 /// through to the generic path and be rejected as unrecognised audio. This
-/// sniff parses the first frame header instead. An `ID3` prefix also counts
-/// so a tagged file reaches the audio validator and fails with the precise
-/// [`MediaError::MetadataForbidden`] rather than a generic rejection.
-/// ISO-BMFF audio is routed by the container sniff, not here.
+/// sniff parses frame headers instead.
+///
+/// One header is not enough evidence: the eleven sync bits plus a plausible
+/// bitrate and sample-rate index also match the start of ordinary files. A
+/// UTF-16LE text file with a BOM begins `FF FE xx 00`, which parses as an
+/// MPEG-1 Layer I header for most first characters, and routing such a file
+/// to the audio validator would refuse a generic upload that used to be
+/// stored. So the body must carry two consecutive frames, the second starting
+/// exactly where the first ends and sharing its version and sample rate, or
+/// an `ID3` prefix. The prefix counts so a tagged file reaches the audio
+/// validator and fails with the precise [`MediaError::MetadataForbidden`]
+/// rather than a generic rejection. ISO-BMFF audio is routed by the container
+/// sniff, not here.
 pub fn sniff_audio_mime(bytes: &[u8]) -> Option<&'static str> {
-    if bytes.starts_with(b"ID3") || parse_frame_header(bytes).is_some() {
-        Some("audio/mpeg")
-    } else {
-        None
+    if bytes.starts_with(b"ID3") {
+        return Some("audio/mpeg");
     }
+    let first = parse_frame_header(bytes)?;
+    let second = bytes.get(first.len..).and_then(parse_frame_header)?;
+    if second.version != first.version || second.sample_rate != first.sample_rate {
+        return None;
+    }
+    Some("audio/mpeg")
 }
 
 /// Validate a buffered audio upload (the MP3 path).
@@ -110,18 +120,31 @@ pub fn validate_audio_content(
 }
 
 /// Validate an ISO-BMFF file that may be either a video or an audio-only
-/// M4A. Video is tried first; an audio-only file is accepted only when audio
-/// uploads are enabled.
+/// M4A.
+///
+/// The file is parsed once. Video is tried first; when the track scan finds
+/// no video track and audio uploads are enabled, the audio size cap is
+/// applied to the size already known and the same parse is inspected as an
+/// M4A. Nothing is re-opened or re-walked.
 pub fn validate_iso_bmff_file(
     path: &Path,
     config: &MediaConfig,
 ) -> Result<IsoBmffMedia, MediaError> {
-    match crate::validation::validate_video_file(path, config) {
+    let parsed = parse_mp4_file(path, config.max_video_bytes, MediaError::InvalidVideo)?;
+    match inspect_video_tracks(&parsed) {
         Ok(video) => Ok(IsoBmffMedia::Video(video)),
         Err(MediaError::DisallowedContentType(mime))
             if mime == "audio/mp4" && config.audio_uploads_enabled =>
         {
-            validate_m4a_file(path, config).map(IsoBmffMedia::Audio)
+            // No video track: this is an M4A, and the audio cap applies from
+            // here on, before any further work on the file.
+            if parsed.size > config.max_audio_bytes {
+                return Err(MediaError::FileTooLarge {
+                    size: parsed.size,
+                    max: config.max_audio_bytes,
+                });
+            }
+            inspect_m4a_tracks(&parsed).map(IsoBmffMedia::Audio)
         }
         Err(e) => Err(e),
     }
@@ -133,28 +156,15 @@ pub fn validate_iso_bmff_file(
 /// allow-list with no metadata boxes), then requires exactly one track, AAC,
 /// with a positive duration under [`MAX_AUDIO_DURATION_SECS`].
 pub fn validate_m4a_file(path: &Path, config: &MediaConfig) -> Result<AudioMeta, MediaError> {
-    let file = std::fs::File::open(path).map_err(|e| MediaError::Io(e.to_string()))?;
-    let size = file
-        .metadata()
-        .map_err(|e| MediaError::Io(e.to_string()))?
-        .len();
-    if size > config.max_audio_bytes {
-        return Err(MediaError::FileTooLarge {
-            size,
-            max: config.max_audio_bytes,
-        });
-    }
+    let parsed = parse_mp4_file(path, config.max_audio_bytes, MediaError::InvalidAudio)?;
+    inspect_m4a_tracks(&parsed)
+}
 
-    crate::validation::check_mp4_structure(path)?;
-
-    let reader = std::io::BufReader::new(file);
-    let mp4 = mp4::Mp4Reader::read_header(reader, size).map_err(|_| MediaError::InvalidAudio)?;
-    if *mp4.major_brand() == mp4::FourCC::from(*b"qt  ") {
-        return Err(MediaError::UnsupportedContainer);
-    }
-
+/// Walk the tracks of a parsed MP4 and apply the M4A constraints: exactly one
+/// track, AAC, positive duration under [`MAX_AUDIO_DURATION_SECS`].
+fn inspect_m4a_tracks(parsed: &ParsedMp4) -> Result<AudioMeta, MediaError> {
     let mut duration: Option<f64> = None;
-    for track in mp4.tracks().values() {
+    for track in parsed.mp4.tracks().values() {
         match track.track_type().map_err(|_| MediaError::InvalidAudio)? {
             mp4::TrackType::Audio => {
                 if duration.is_some() {
@@ -164,10 +174,7 @@ pub fn validate_m4a_file(path: &Path, config: &MediaConfig) -> Result<AudioMeta,
                 if media_type != mp4::MediaType::AAC {
                     return Err(MediaError::WrongCodec);
                 }
-                if track.timescale() == 0 {
-                    return Err(MediaError::InvalidAudio);
-                }
-                let secs = track.duration().as_millis() as f64 / 1000.0;
+                let secs = track_duration_secs(track).ok_or(MediaError::InvalidAudio)?;
                 if secs <= 0.0 {
                     return Err(MediaError::InvalidAudio);
                 }
@@ -292,17 +299,23 @@ fn parse_frame_header(h: &[u8]) -> Option<FrameHeader> {
     })
 }
 
-/// Whether the frame at `frame` is a LAME/Xing "Xing" or "Info" VBR header
-/// frame. Those frames carry no audio and must not count toward duration.
-fn is_xing_info_frame(frame: &[u8], header: &FrameHeader) -> bool {
-    // Side-info size: MPEG-1 is 17 (mono) / 32 (other), MPEG-2/2.5 is 9 / 17.
+/// Byte offset of the Xing/Info tag inside a Layer III frame: the four-byte
+/// header plus the side information, whose size depends on the version and
+/// channel mode (MPEG-1: 17 mono / 32 otherwise; MPEG-2 and 2.5: 9 / 17).
+fn xing_tag_offset(header: &FrameHeader) -> usize {
     let side_info = match (header.version == 3, header.channel_mode == 3) {
         (true, true) => 17,
         (true, false) => 32,
         (false, true) => 9,
         (false, false) => 17,
     };
-    let at = 4 + side_info;
+    4 + side_info
+}
+
+/// Whether the frame at `frame` is a LAME/Xing "Xing" or "Info" VBR header
+/// frame. Those frames carry no audio and must not count toward duration.
+fn is_xing_info_frame(frame: &[u8], header: &FrameHeader) -> bool {
+    let at = xing_tag_offset(header);
     frame.len() >= at + 4 && (&frame[at..at + 4] == b"Xing" || &frame[at..at + 4] == b"Info")
 }
 
@@ -311,7 +324,10 @@ fn is_xing_info_frame(frame: &[u8], header: &FrameHeader) -> bool {
 /// Every byte must belong to a frame: the walk starts at offset 0 and ends
 /// exactly at the last byte. Any tag (ID3v2 at the front, ID3v1 or APE at the
 /// back) or trailing junk fails with [`MediaError::MetadataForbidden`]; a
-/// malformed header fails with [`MediaError::InvalidAudio`].
+/// malformed header fails with [`MediaError::InvalidAudio`]. A final header
+/// whose frame runs past the end of the file is treated as trailing junk too:
+/// ffmpeg and LAME end on a frame boundary, and a short "frame" is where an
+/// appended tag with sync-looking bytes (an ID3v2.4 footer, say) would hide.
 pub fn validate_mp3_stream(bytes: &[u8]) -> Result<AudioMeta, MediaError> {
     if bytes.starts_with(b"ID3") {
         return Err(MediaError::MetadataForbidden);
@@ -341,13 +357,13 @@ pub fn validate_mp3_stream(bytes: &[u8]) -> Result<AudioMeta, MediaError> {
             None => return Err(MediaError::MetadataForbidden),
         };
         if off + header.len > bytes.len() {
-            // Truncated final frame: some encoders cut the last frame short
-            // when the input ends. Accept it only as the last frame.
+            // The frame runs past the end of the file. As the first frame the
+            // stream is simply broken; after real frames it is a trailer that
+            // happens to start with sync bits.
             if frames == 0 {
                 return Err(MediaError::InvalidAudio);
             }
-            samples += header.samples as u64;
-            break;
+            return Err(MediaError::MetadataForbidden);
         }
         match sample_rate {
             None => sample_rate = Some(header.sample_rate),
@@ -375,6 +391,10 @@ pub fn validate_mp3_stream(bytes: &[u8]) -> Result<AudioMeta, MediaError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::validation::mp4_test_support::{
+        mdhd_timescale, mdhd_v0, mdhd_v1, rewrite_first_mdhd,
+    };
+    use crate::validation::validate_file_content;
 
     fn test_config(enabled: bool) -> MediaConfig {
         MediaConfig {
@@ -401,12 +421,28 @@ mod tests {
     const FRAME_HEADER_128K: [u8; 4] = [0xFF, 0xFB, 0x90, 0x00];
 
     fn frame(n: usize) -> Vec<u8> {
-        let mut out = Vec::with_capacity(417 * n);
+        frames_with_header(&FRAME_HEADER_128K, n)
+    }
+
+    /// `n` zero-filled frames carrying `header`, sized from the header itself.
+    fn frames_with_header(header: &[u8; 4], n: usize) -> Vec<u8> {
+        let len = parse_frame_header(header).expect("valid header").len;
+        let mut out = Vec::with_capacity(len * n);
         for _ in 0..n {
-            out.extend_from_slice(&FRAME_HEADER_128K);
-            out.extend(std::iter::repeat_n(0u8, 417 - 4));
+            out.extend_from_slice(header);
+            out.extend(std::iter::repeat_n(0u8, len - 4));
         }
         out
+    }
+
+    /// The reviewer's probe: a UTF-16LE BOM followed by ordinary text. The
+    /// first four bytes (`FF FE 'H' 00`) parse as an MPEG-1 Layer I header.
+    fn utf16le_text() -> Vec<u8> {
+        let mut bytes = vec![0xFF, 0xFE];
+        for unit in "Hello world, quarterly notes".encode_utf16() {
+            bytes.extend_from_slice(&unit.to_le_bytes());
+        }
+        bytes
     }
 
     #[test]
@@ -430,6 +466,50 @@ mod tests {
     }
 
     #[test]
+    fn sniff_requires_two_consecutive_frames_or_an_id3_prefix() {
+        assert_eq!(sniff_audio_mime(&frame(2)), Some("audio/mpeg"));
+        assert_eq!(
+            sniff_audio_mime(b"ID3\x04\x00\x00\x00\x00\x00\x00"),
+            Some("audio/mpeg")
+        );
+        // One header on its own is not evidence of a stream.
+        assert_eq!(sniff_audio_mime(&frame(1)), None);
+        let mut one_then_junk = frame(1);
+        one_then_junk.extend_from_slice(b"not a frame header");
+        assert_eq!(sniff_audio_mime(&one_then_junk), None);
+        // Two headers that disagree on the sample rate are not one stream.
+        let mut mixed = frame(1);
+        mixed.extend(frames_with_header(&[0xFF, 0xFB, 0x94, 0x00], 1));
+        assert_eq!(sniff_audio_mime(&mixed), None);
+        assert_eq!(sniff_audio_mime(&[]), None);
+    }
+
+    /// Regression for the UTF-16LE misrouting: with audio enabled, a text
+    /// file whose BOM parses as a frame header must still take the generic
+    /// path and be stored as it was before the feature existed.
+    #[test]
+    fn utf16le_text_is_not_sniffed_as_audio() {
+        let bytes = utf16le_text();
+        // The fixture reproduces the hazard: one header does parse.
+        assert!(parse_frame_header(&bytes).is_some());
+        assert_eq!(sniff_audio_mime(&bytes), None);
+        assert_eq!(
+            validate_file_content(&bytes, &test_config(true)).expect("generic file"),
+            ("application/octet-stream".to_string(), "bin".to_string())
+        );
+        assert_eq!(
+            validate_file_content(&bytes, &test_config(false)).expect("generic file"),
+            ("application/octet-stream".to_string(), "bin".to_string())
+        );
+        // Sent straight to the audio validator it is refused, so the sniff
+        // is the only thing standing between the file and a 422.
+        assert!(matches!(
+            validate_audio_content(&bytes, &test_config(true)),
+            Err(MediaError::DisallowedContentType(_))
+        ));
+    }
+
+    #[test]
     fn canonical_stream_is_measured() {
         // 100 frames * 1152 samples / 44100 Hz = 2.612 s
         let meta = validate_mp3_stream(&frame(100)).expect("canonical stream");
@@ -445,6 +525,46 @@ mod tests {
         let meta = validate_mp3_stream(&bytes).expect("info frame is a frame");
         let expected = 10.0 * 1152.0 / 44_100.0;
         assert!((meta.duration_secs - expected).abs() < 0.0001, "{meta:?}");
+    }
+
+    /// Every side-info layout, so a wrong table entry fails here rather than
+    /// hiding inside a 0.1 s duration tolerance on a real fixture. For each
+    /// layout the tag is recognised at its own offset and at no other
+    /// layout's offset, and the walker drops exactly one frame's samples.
+    #[test]
+    fn xing_info_side_info_sizes_cover_every_layout() {
+        // (header, expected tag offset, label)
+        let layouts: [([u8; 4], usize, &str); 5] = [
+            ([0xFF, 0xFB, 0x90, 0x00], 36, "MPEG-1 stereo"),
+            ([0xFF, 0xFB, 0x90, 0xC0], 21, "MPEG-1 mono"),
+            ([0xFF, 0xF3, 0x80, 0x00], 21, "MPEG-2 stereo"),
+            ([0xFF, 0xF3, 0x80, 0xC0], 13, "MPEG-2 mono"),
+            ([0xFF, 0xE3, 0x80, 0x00], 21, "MPEG-2.5 stereo"),
+        ];
+        let offsets = [13usize, 21, 36];
+        for (header_bytes, expected, label) in layouts {
+            let header = parse_frame_header(&header_bytes).expect(label);
+            assert_eq!(xing_tag_offset(&header), expected, "{label}");
+            for candidate in offsets {
+                let mut single = frames_with_header(&header_bytes, 1);
+                single[candidate..candidate + 4].copy_from_slice(b"Info");
+                assert_eq!(
+                    is_xing_info_frame(&single, &header),
+                    candidate == expected,
+                    "{label}: Info at {candidate}"
+                );
+            }
+            let mut stream = frames_with_header(&header_bytes, 1);
+            stream[expected..expected + 4].copy_from_slice(b"Xing");
+            stream.extend(frames_with_header(&header_bytes, 10));
+            let meta = validate_mp3_stream(&stream).expect(label);
+            let want = 10.0 * header.samples as f64 / header.sample_rate as f64;
+            assert!(
+                (meta.duration_secs - want).abs() < 1e-9,
+                "{label}: got {} want {want}",
+                meta.duration_secs
+            );
+        }
     }
 
     #[test]
@@ -483,6 +603,57 @@ mod tests {
         ));
     }
 
+    /// An ID3v2.4 tag appended after the stream with its footer flag set,
+    /// preceded by four sync-looking bytes. The old truncated-final-frame
+    /// allowance accepted this as a short last frame; it is a trailer.
+    #[test]
+    fn id3v24_footer_tag_after_the_stream_is_rejected() {
+        let mut bytes = frame(2);
+        bytes.extend_from_slice(&FRAME_HEADER_128K);
+        // Header: ID3, version 2.4, flags 0x10 (footer present), size 25.
+        bytes.extend_from_slice(b"ID3\x04\x00\x10\x00\x00\x00\x19");
+        // One TIT2 frame: id, syncsafe size 15, flags, 15 bytes of text.
+        bytes.extend_from_slice(b"TIT2\x00\x00\x00\x0F\x00\x00");
+        bytes.extend_from_slice(b"\x03quarterly note");
+        // Footer mirrors the header with the reversed identifier.
+        bytes.extend_from_slice(b"3DI\x04\x00\x10\x00\x00\x00\x19");
+        assert_eq!(bytes.len(), 417 * 2 + 4 + 45);
+        // The sniff still routes it to the audio validator, which must refuse it.
+        assert_eq!(sniff_audio_mime(&bytes), Some("audio/mpeg"));
+        assert!(matches!(
+            validate_mp3_stream(&bytes),
+            Err(MediaError::MetadataForbidden)
+        ));
+    }
+
+    #[test]
+    fn truncated_last_frame_is_rejected_as_a_trailer() {
+        let mut bytes = frame(3);
+        bytes.truncate(417 * 2 + 100);
+        assert!(matches!(
+            validate_mp3_stream(&bytes),
+            Err(MediaError::MetadataForbidden)
+        ));
+        // A lone short frame is a broken stream, not a trailer.
+        let mut short = frame(1);
+        short.truncate(100);
+        assert!(matches!(
+            validate_mp3_stream(&short),
+            Err(MediaError::InvalidAudio)
+        ));
+    }
+
+    #[test]
+    fn sample_rate_change_mid_stream_is_invalid() {
+        let mut bytes = frame(2);
+        // MPEG-1 Layer III, 128 kbit/s at 48 kHz: 384-byte frame.
+        bytes.extend(frames_with_header(&[0xFF, 0xFB, 0x94, 0x00], 1));
+        assert!(matches!(
+            validate_mp3_stream(&bytes),
+            Err(MediaError::InvalidAudio)
+        ));
+    }
+
     #[test]
     fn garbage_and_empty_input_are_invalid() {
         assert!(matches!(
@@ -493,13 +664,6 @@ mod tests {
             validate_mp3_stream(&[]),
             Err(MediaError::InvalidAudio)
         ));
-    }
-
-    #[test]
-    fn truncated_last_frame_is_tolerated() {
-        let mut bytes = frame(3);
-        bytes.truncate(417 * 2 + 100);
-        assert!(validate_mp3_stream(&bytes).is_ok());
     }
 
     #[test]
@@ -537,16 +701,6 @@ mod tests {
             validate_audio_content(&bytes, &small),
             Err(MediaError::FileTooLarge { .. })
         ));
-    }
-
-    #[test]
-    fn supported_mimes() {
-        assert!(is_supported_audio_mime("audio/mpeg"));
-        assert!(is_supported_audio_mime("audio/mp4"));
-        assert!(is_supported_audio_mime("audio/m4a"));
-        assert!(!is_supported_audio_mime("audio/ogg"));
-        assert!(!is_supported_audio_mime("audio/wav"));
-        assert!(!is_supported_audio_mime("video/mp4"));
     }
 
     // Real encoder output, generated with ffmpeg from a 1.2 s sine wave:
@@ -610,6 +764,27 @@ mod tests {
         ));
     }
 
+    /// The audio cap, not the video cap, bounds an M4A on the streaming
+    /// path, and it is applied as soon as the track scan shows no video.
+    #[test]
+    fn m4a_on_the_iso_bmff_path_is_bounded_by_the_audio_cap() {
+        let file = temp_file(CLEAN_M4A);
+        let mut config = test_config(true);
+        config.max_audio_bytes = 100;
+        let result = validate_iso_bmff_file(file.path(), &config);
+        assert!(
+            matches!(
+                result,
+                Err(MediaError::FileTooLarge { size, max })
+                    if size == CLEAN_M4A.len() as u64 && max == 100
+            ),
+            "expected FileTooLarge at the audio cap, got {result:?}"
+        );
+        // A video-sized cap on the same file is not what applies.
+        config.max_audio_bytes = CLEAN_M4A.len() as u64;
+        assert!(validate_iso_bmff_file(file.path(), &config).is_ok());
+    }
+
     #[test]
     fn ffmpeg_tagged_m4a_is_rejected() {
         let file = temp_file(TAGGED_M4A);
@@ -617,5 +792,100 @@ mod tests {
             validate_m4a_file(file.path(), &test_config(true)),
             Err(MediaError::MetadataForbidden)
         ));
+    }
+
+    /// Both M4A entry points, so the fixture surgery exercises the shared
+    /// track inspection through the streaming path as well.
+    fn m4a_verdicts(
+        bytes: &[u8],
+    ) -> (
+        Result<AudioMeta, MediaError>,
+        Result<IsoBmffMedia, MediaError>,
+    ) {
+        let file = temp_file(bytes);
+        (
+            validate_m4a_file(file.path(), &test_config(true)),
+            validate_iso_bmff_file(file.path(), &test_config(true)),
+        )
+    }
+
+    #[test]
+    fn m4a_over_the_duration_cap_is_rejected() {
+        let long = rewrite_first_mdhd(CLEAN_M4A, |old| {
+            let timescale = mdhd_timescale(old);
+            mdhd_v0(timescale, 2000 * timescale)
+        });
+        let (direct, streamed) = m4a_verdicts(&long);
+        assert!(
+            matches!(direct, Err(MediaError::DurationTooLong)),
+            "{direct:?}"
+        );
+        assert!(
+            matches!(streamed, Err(MediaError::DurationTooLong)),
+            "{streamed:?}"
+        );
+    }
+
+    #[test]
+    fn m4a_zero_timescale_is_invalid() {
+        let zero = rewrite_first_mdhd(CLEAN_M4A, |old| {
+            let duration = u32::from_be_bytes(old[16..20].try_into().expect("v0 duration bytes"));
+            mdhd_v0(0, duration)
+        });
+        let (direct, streamed) = m4a_verdicts(&zero);
+        assert!(
+            matches!(direct, Err(MediaError::InvalidAudio)),
+            "{direct:?}"
+        );
+        assert!(
+            matches!(streamed, Err(MediaError::InvalidAudio)),
+            "{streamed:?}"
+        );
+    }
+
+    /// The reviewer's version-1 `mdhd` probe: `duration = 2^58 + timescale`
+    /// wraps to one second in `mp4::Mp4Track::duration` (release) or panics
+    /// (debug). The checked helper must reject it, and a sane version-1
+    /// header must still be measured, so the rejection is about the value.
+    #[test]
+    fn m4a_version1_mdhd_uses_checked_duration() {
+        let sane = rewrite_first_mdhd(CLEAN_M4A, |old| {
+            let timescale = mdhd_timescale(old);
+            let duration = u32::from_be_bytes(old[16..20].try_into().expect("v0 duration bytes"));
+            mdhd_v1(timescale, u64::from(duration))
+        });
+        let (direct, streamed) = m4a_verdicts(&sane);
+        let meta = direct.expect("sane version-1 mdhd");
+        assert!((meta.duration_secs - 1.2).abs() < 0.1, "{meta:?}");
+        assert!(
+            matches!(streamed, Ok(IsoBmffMedia::Audio(_))),
+            "{streamed:?}"
+        );
+
+        let huge = rewrite_first_mdhd(CLEAN_M4A, |old| {
+            let timescale = mdhd_timescale(old);
+            mdhd_v1(timescale, (1u64 << 58) + u64::from(timescale))
+        });
+        let (direct, streamed) = m4a_verdicts(&huge);
+        assert!(
+            matches!(direct, Err(MediaError::DurationTooLong)),
+            "{direct:?}"
+        );
+        assert!(
+            matches!(streamed, Err(MediaError::DurationTooLong)),
+            "{streamed:?}"
+        );
+
+        // Microseconds beyond u64 are an overflow, not a duration.
+        let overflow = rewrite_first_mdhd(CLEAN_M4A, |_| mdhd_v1(1, u64::MAX));
+        let (direct, streamed) = m4a_verdicts(&overflow);
+        assert!(
+            matches!(direct, Err(MediaError::InvalidAudio)),
+            "{direct:?}"
+        );
+        assert!(
+            matches!(streamed, Err(MediaError::InvalidAudio)),
+            "{streamed:?}"
+        );
     }
 }
