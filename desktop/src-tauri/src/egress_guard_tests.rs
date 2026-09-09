@@ -323,9 +323,10 @@ const EVENTS_INVENTORY: &[(&str, usize, usize)] = &[
     // `relay.rs`.
     ("src/commands/agents_profile_reconcile_tests.rs", 1, 0),
     // Stub-relay route in the profile-sync tests (the "closed to the desktop,
-    // open to the agent" relay); the production kind:0 publish goes through
-    // the guarded boundary-2 site in `relay.rs`.
-    ("src/relay/tests.rs", 1, 0),
+    // open to the agent" relay, now in their own file so the rest of
+    // `relay/tests.rs` has no events URL at all); the production kind:0
+    // publish goes through the guarded boundary-2 site in `relay.rs`.
+    ("src/relay/profile_sync_tests.rs", 1, 0),
 ];
 
 // Needles are assembled at runtime so this scan file itself contains no

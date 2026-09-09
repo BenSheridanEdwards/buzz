@@ -690,11 +690,26 @@ pub async fn sync_managed_agent_profile(
     // always refused. `read_agent_profile_advisory` asks again as the AGENT,
     // the identity the relay does admit, so the fallback has a source that
     // does not depend on the refused read.
+    //
+    // Both of those sources are still `/query` on one host, and both are
+    // bounded by `QUERY_REQUEST_TIMEOUT`, so a relay that is merely SLOW
+    // loses both while `/events` goes on accepting the publish that then
+    // strips the handle. `last_known_agent_nip05` is the last resort for
+    // exactly that, and its doc comment states what it does not cover: this
+    // process's very first publish for a pair.
     let agent_pubkey = agent_keys.public_key().to_hex();
     let existing =
         read_agent_profile_advisory(state, relay_url, Some(agent_keys), &agent_pubkey, auth_tag)
             .await
-            .and_then(|info| info.nip05);
+            .and_then(|info| info.nip05)
+            // ...and when NEITHER read could be completed, the last handle
+            // this process saw the relay attribute to this agent. A refusal
+            // has a second identity to ask; a read that runs past
+            // `QUERY_REQUEST_TIMEOUT` has none, and a slow relay answers
+            // `/events` long after it stopped answering `/query`, so the
+            // publish lands and takes the handle with it. See
+            // `last_known_agent_nip05` for what this does and does not cover.
+            .or_else(|| last_known_agent_nip05(state, relay_url, &agent_pubkey));
     let nip05 = nip05::resolve_managed_agent_nip05(
         state,
         relay_url,
@@ -760,6 +775,17 @@ pub async fn sync_managed_agent_profile_with_nip05(
         return Err(format!(
             "Could not sync the agent's profile metadata: {msg}"
         ));
+    }
+
+    // The relay accepted this kind:0, so the handle it carries is the handle
+    // the relay now holds. Remembering it here rather than only on the read
+    // covers the agent whose profile this process created: it has a handle
+    // from its very first publish, so a later publish whose reads both time
+    // out has something to keep. A publish that deliberately carries NO
+    // handle leaves the entry alone; see `AppState::agent_nip05_cache` for
+    // why "the read failed" must not look like "there is no handle".
+    if let Some(nip05) = nip05 {
+        remember_agent_nip05(state, relay_url, &agent_keys.public_key().to_hex(), nip05);
     }
 
     Ok(())
@@ -843,28 +869,134 @@ pub async fn read_agent_profile_advisory(
     agent_pubkey: &str,
     auth_tag: Option<&str>,
 ) -> Option<AgentProfileInfo> {
+    // An EMPTY success is not an answer about this agent, so it does not
+    // short-circuit the fallback. `Ok(None)` means "this relay returned no
+    // kind:0 for these filters", which a fresh agent genuinely produces and
+    // which a relay that answers a non-member's `/query` with `200 []`
+    // instead of a 403 also produces, as some proxies and some relay
+    // configurations do. Treating the second as the first skipped the
+    // agent-authenticated read entirely and stripped the handle exactly as
+    // before the fallback existed. Only a NON-empty answer ends the search;
+    // the cost of the other reading is one extra `/query` on the publish
+    // that first gives an agent a profile.
     let workspace_error = match query_agent_profile(state, relay_url, agent_pubkey).await {
-        Ok(profile) => return profile,
-        Err(error) => error,
+        Ok(Some(profile)) => {
+            return Some(remember_profile_handle(
+                state,
+                relay_url,
+                agent_pubkey,
+                profile,
+            ))
+        }
+        Ok(None) => None,
+        Err(error) => Some(error),
     };
     let Some(agent_keys) = agent_keys else {
-        eprintln!(
-            "buzz-desktop: could not read {agent_pubkey} kind:0 as the workspace identity and \
-             have no agent keys to ask again with: {workspace_error}"
-        );
+        if let Some(workspace_error) = workspace_error {
+            eprintln!(
+                "buzz-desktop: could not read {agent_pubkey} kind:0 as the workspace identity and \
+                 have no agent keys to ask again with: {workspace_error}"
+            );
+        }
         return None;
     };
     match query_agent_profile_with_keys(state, relay_url, agent_keys, auth_tag).await {
-        Ok(profile) => profile,
+        Ok(profile) => {
+            profile.map(|profile| remember_profile_handle(state, relay_url, agent_pubkey, profile))
+        }
         Err(agent_error) => {
+            let workspace_error = workspace_error.unwrap_or_else(|| "no profile".to_string());
             eprintln!(
                 "buzz-desktop: could not read {agent_pubkey} kind:0 as the workspace identity \
-                 ({workspace_error}) nor as the agent ({agent_error}), publishing without the \
-                 existing-profile hint"
+                 ({workspace_error}) nor as the agent ({agent_error}), falling back to the last \
+                 handle this process saw for it"
             );
             None
         }
     }
+}
+
+/// Entries kept in [`AppState::agent_nip05_cache`].
+///
+/// One per (relay, managed agent) pair the desktop has published for, so the
+/// live working set is the agent count. The cap is the bound for a process
+/// that switches communities repeatedly: at the cap new pairs simply are not
+/// remembered, which degrades to the behaviour that existed before the cache,
+/// rather than letting the map grow with every relay ever visited.
+const MAX_REMEMBERED_AGENT_HANDLES: usize = 512;
+
+/// Cache key: the relay the handle belongs to, then the agent that holds it.
+/// A NIP-05 handle is scoped to one relay's domain, so a pair-scoped key is
+/// the only correct one: keyed by agent alone, switching communities would
+/// offer a handle from the previous relay's domain as this relay's hint.
+fn agent_handle_cache_key(relay_url: &str, agent_pubkey: &str) -> String {
+    format!(
+        "{}|{}",
+        relay_http_base_url(relay_url),
+        agent_pubkey.trim().to_ascii_lowercase()
+    )
+}
+
+/// Remember a handle the relay itself asserted for this agent.
+///
+/// Best-effort in every direction: a poisoned mutex or a full map is a lost
+/// hint, never an error, because the caller is on a path whose whole point is
+/// that it does not fail on a missing hint.
+pub(crate) fn remember_agent_nip05(
+    state: &AppState,
+    relay_url: &str,
+    agent_pubkey: &str,
+    handle: &str,
+) {
+    let handle = handle.trim();
+    if handle.is_empty() {
+        return;
+    }
+    let key = agent_handle_cache_key(relay_url, agent_pubkey);
+    let Ok(mut cache) = state.agent_nip05_cache.lock() else {
+        return;
+    };
+    if !cache.contains_key(&key) && cache.len() >= MAX_REMEMBERED_AGENT_HANDLES {
+        return;
+    }
+    cache.insert(key, handle.to_string());
+}
+
+/// The last handle this process saw the relay attribute to this agent, if any.
+///
+/// The last-resort `existing_handle`, used only when neither read could be
+/// completed. It closes the case the agent-authenticated read cannot: a read
+/// that is refused has a second identity to try, a read that runs past
+/// [`QUERY_REQUEST_TIMEOUT`] has none, and a slow relay under load produces
+/// exactly that while `/events` still accepts the publish that then clears
+/// the handle.
+///
+/// RESIDUAL, stated plainly rather than implied away: this lives in the
+/// process, so the first publish after a cold start has nothing to fall back
+/// on. Every later publish in that process does, including every reconcile.
+/// Persisting it on the managed-agent record would close that last window
+/// too, at the cost of a new persisted field and a write-back on each of the
+/// six call sites of [`sync_managed_agent_profile`]; it is not done here.
+pub(crate) fn last_known_agent_nip05(
+    state: &AppState,
+    relay_url: &str,
+    agent_pubkey: &str,
+) -> Option<String> {
+    let key = agent_handle_cache_key(relay_url, agent_pubkey);
+    state.agent_nip05_cache.lock().ok()?.get(&key).cloned()
+}
+
+/// Record the handle a successful read carried, and hand the profile back.
+fn remember_profile_handle(
+    state: &AppState,
+    relay_url: &str,
+    agent_pubkey: &str,
+    profile: AgentProfileInfo,
+) -> AgentProfileInfo {
+    if let Some(handle) = profile.nip05.as_deref() {
+        remember_agent_nip05(state, relay_url, agent_pubkey, handle);
+    }
+    profile
 }
 
 /// The one filter both reads use.

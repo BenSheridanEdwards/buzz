@@ -306,12 +306,22 @@ pub(crate) async fn reconcile_agent_profile<R: tauri::Runtime>(
     // lookup that cannot be completed neither strips the handle nor abandons
     // the publish: it keeps the handle the agent already carries and the
     // profile still goes out (see `resolve_managed_agent_nip05`).
+    //
+    // When NEITHER read could be completed, the last handle this process saw
+    // the relay attribute to this agent stands in. A refused read has a
+    // second identity to ask; a read that runs past `QUERY_REQUEST_TIMEOUT`
+    // has none, and a relay slow enough to lose both reads still accepts the
+    // publish below, which then clears the handle.
+    let existing_handle = existing
+        .as_ref()
+        .and_then(|info| info.nip05.clone())
+        .or_else(|| crate::relay::last_known_agent_nip05(state, &relay_url, agent_pubkey));
     let expected_nip05 = crate::relay::nip05::resolve_managed_agent_nip05(
         state,
         &relay_url,
         agent_pubkey,
         &data.name,
-        existing.as_ref().and_then(|info| info.nip05.as_deref()),
+        existing_handle.as_deref(),
     )
     .await?;
 

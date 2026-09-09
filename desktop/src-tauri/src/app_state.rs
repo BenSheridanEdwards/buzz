@@ -170,6 +170,34 @@ pub struct AppState {
     /// another relay's identity; only verified `Some` values are stored (an
     /// outage or a document without `self` must stay retryable).
     pub relay_self_cache: Mutex<HashMap<String, (std::time::Instant, String)>>,
+    /// The last NIP-05 handle the desktop saw or published for a managed
+    /// agent, keyed by `<relay http base>|<agent pubkey hex>`.
+    ///
+    /// The LAST-RESORT source for `existing_handle`, and the only one that
+    /// does not require the relay to answer right now. kind:0 is absolute
+    /// state, so a managed-agent profile publish that carries no `nip05`
+    /// CLEARS the handle the relay holds, and `resolve_managed_agent_nip05`
+    /// only keeps a handle it was given. Both remote sources for that handle
+    /// (the agent's own kind:0, read as the workspace identity and then as
+    /// the agent) address the relay, so a relay that is refusing, down, or
+    /// merely slower than `relay::QUERY_REQUEST_TIMEOUT` supplies neither,
+    /// and a well-known that cannot answer at the same time (the same host,
+    /// so usually the same fault) left the publish with nothing to keep.
+    ///
+    /// Written only from a handle the relay itself asserted: one read back
+    /// off the agent's kind:0, or one just published and accepted. Never
+    /// cleared by a publish that carries no handle, because "the read failed"
+    /// and "there is no handle" are the two cases this exists to tell apart.
+    /// It is a hint, exactly like the read it stands in for: every candidate
+    /// is still confirmed against the relay's attribution before it is
+    /// republished, except in the branch where the relay cannot be asked,
+    /// which is the branch that must keep the handle rather than delete it.
+    ///
+    /// Bounded by `MAX_REMEMBERED_AGENT_HANDLES` entries. Process-lifetime
+    /// only: a cold start whose very first publish races a relay that answers
+    /// neither read still has no source, which is the residual of this and is
+    /// documented on `relay::last_known_agent_nip05`.
+    pub agent_nip05_cache: Mutex<HashMap<String, String>>,
     pub archive_db: crate::archive::ArchiveDb,
 }
 
@@ -316,6 +344,7 @@ pub fn build_app_state() -> AppState {
         mesh_coordinator: AsyncMutex::new(None),
         pending_owned_channels: Mutex::new(std::collections::HashSet::new()),
         relay_self_cache: Mutex::new(HashMap::new()),
+        agent_nip05_cache: Mutex::new(HashMap::new()),
         archive_db: crate::archive::ArchiveDb::default(),
     }
 }
