@@ -1170,13 +1170,36 @@ That catches the accident (a package store, a de-duplicated backup) and not a
 deliberate `mv`, which leaves one link; it is a hygiene check, not proof of
 where a file came from.
 
-**Inbound attachments are the part with a real boundary.** The URL, hash,
-size, declared type, filename and bytes of an attachment all come from another
-relay member who has no account on this host. The harness writes those bytes
-under `<attachment root>/<turn id>/<index>-<their filename>`, a name they can
-predict exactly, so that write is `openat`-relative to a descriptor taken when
+**Inbound attachments: what the descriptor-relative write is and is not.**
+The URL, hash, size, declared type, filename and bytes of an attachment all
+come from another relay member who has no account on this host, and the
+harness writes those bytes under
+`<attachment root>/<turn id>/<index>-<their filename>`, a name they can
+predict exactly. That write is `openat`-relative to a descriptor taken when
 the turn directory was opened, with `O_CREAT | O_EXCL | O_NOFOLLOW` and mode
-`0600`. A link planted at that name is refused, never followed.
+`0600`, so a link planted at that name is refused, never followed.
+
+Read that as defence in depth, not as a boundary against the sender.
+A remote member cannot reach it alone: the filename is reduced to a single
+path component with no separator and never `.` or `..`, the `<index>-` prefix
+rules out collisions between accepted attachments, and `openat` against the
+retained descriptor would ignore a separator that somehow survived. Planting
+the symlink requires a local process running at the harness's uid, which is
+the engine, and the engine is explicitly not treated as contained anywhere
+else on this page. The rule the guard enforces is the narrower one that
+survives that: the harness must not be an arbitrary-write primitive for a
+name and bytes it did not choose. A confused engine reaches such a primitive
+without deciding to, the bytes are hash-verified content an outsider picked,
+and it is the hole that would still be open the day the engine runs as a
+different uid.
+
+The one thing a member with no host account can make this harness do that it
+could not do itself is elsewhere: the attachment URL check constrains scheme,
+host and port but not path or query, so a crafted `imeta url` aims the
+harness's agent-signed kind-24242 GET at any path on the relay origin. It is
+blind (the body is discarded unless it hashes to the tag's `x`, and a refusal
+is collapsed to a status code before it reaches the prompt) and same-origin,
+and it is tracked as a follow-up rather than fixed here.
 
 ### Pod shape
 

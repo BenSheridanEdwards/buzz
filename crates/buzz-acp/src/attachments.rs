@@ -13,20 +13,41 @@
 //! Nothing is dropped silently: every rejected tag, failed download, and
 //! over-cap attachment is named in the section with its reason (rule 1).
 //!
-//! # Remote input is where this module has a boundary
+//! # Why the blob write goes through a descriptor, stated accurately
 //!
-//! Unlike the outbound side (see `crate::media_publish`'s module doc: the
-//! engine shares the harness's uid and has a shell, so the rules there are
-//! defence in depth rather than a privilege boundary), everything this module
-//! consumes comes from another relay member: the URL, the hash, the size,
-//! the declared type, the `filename`, and the bytes themselves. That member
-//! has no account on the host. So the one thing the harness must not do is
-//! turn their input into a write of their bytes at a path they chose: the
-//! name is `<index>-<their own filename>`, fully predictable, in a directory
-//! the engine can write, and a plain `fs::write` there follows a symlink at
-//! the last component. Every blob therefore goes through [`DirHandle`],
-//! `openat`-relative to a descriptor taken once when the turn directory was
-//! opened, with `O_CREAT | O_EXCL | O_NOFOLLOW`.
+//! Everything this module consumes comes from another relay member: the URL,
+//! the hash, the size, the declared type, the `filename`, and the bytes.
+//! That member has no account on the host, and it would be convenient to
+//! call the descriptor-relative write a boundary against them. It is not,
+//! and the fourth confirmation pass on PR #10 established that by probe:
+//! there is no engine-free route by which a remote sender alone influences
+//! where an inbound blob lands. [`safe_attachment_filename`] reduces any
+//! `filename` to a single component with no separator, never `.` or `..`
+//! (checked against 27 hostile shapes: traversal, encoded traversal, NUL,
+//! CR/LF, bidi overrides, Windows separators, 4 KiB names), the `<index>-`
+//! prefix makes collisions between two accepted attachments impossible, and
+//! `openat` against the retained descriptor would ignore a separator even if
+//! one survived. **The remote-only version of this attack does not exist.**
+//!
+//! The sender contributes a basename and bytes. The party who must plant a
+//! symlink at that name is a local process running at the harness's own uid,
+//! which in this deployment is the engine, the same engine the outbound doc
+//! declines to treat as contained (see `crate::media_publish`'s module doc).
+//! So this is not a privilege boundary against a channel member. It is a
+//! narrower and still worthwhile rule: the harness must not be an
+//! arbitrary-write primitive for a name and bytes it did not choose. A
+//! confused engine reaches such a primitive without deciding to, the write
+//! is of hash-verified content an outsider picked, and it is the hole that
+//! would still be open the day the engine is given a different uid, when
+//! every other rule here starts to mean something. Every blob therefore
+//! goes through [`DirHandle`], `openat`-relative to a descriptor taken once
+//! when the turn directory was opened, with `O_CREAT | O_EXCL | O_NOFOLLOW`.
+//!
+//! The one capability a member with no host account genuinely does have is
+//! elsewhere and is not fixed here: [`RelayOrigin::permits`] constrains
+//! scheme, host and port but not path or query, so a crafted `imeta url`
+//! aims the harness's agent-signed kind-24242 GET at any path on the relay
+//! origin. It is blind and same-origin, and it is deferred to a follow-up.
 //!
 //! Storage is bounded two ways: the whole inbound phase runs under
 //! [`INBOUND_DEADLINE`], and the attachment root keeps at most
@@ -764,6 +785,14 @@ impl DirHandle {
     /// `0600`. `O_EXCL` refuses anything already at the name, a planted
     /// symlink included, so this never writes through one and never silently
     /// overwrites.
+    ///
+    /// `O_EXCL` is the load-bearing flag here and `O_NOFOLLOW` is redundant
+    /// with it: `O_CREAT | O_EXCL` fails with `EEXIST` on a symlink at the
+    /// name whether or not it dangles, so removing `O_NOFOLLOW` from *this*
+    /// call cannot change an outcome and no test binds it. It is kept as
+    /// belt and braces, and the flag that is bound lives on
+    /// [`open_dir_no_follow`], a different site. Do not go looking for the
+    /// test that would catch dropping it here; there cannot be one.
     #[cfg(unix)]
     pub fn create_at(&self, name: &std::ffi::OsStr) -> std::io::Result<std::fs::File> {
         use std::os::fd::AsFd as _;
@@ -1180,7 +1209,10 @@ fn verified_handle(
 /// reduced to a basename and prefixed with the tag's index, so it is fully
 /// predictable), and the directory is writable by the engine, which is the
 /// exact shape [`DirHandle`] exists to refuse. A plain `fs::write` here is
-/// an arbitrary host-file overwrite with sender-chosen bytes.
+/// an arbitrary host-file overwrite with sender-chosen bytes. The link at
+/// that name has to be planted by a local process at the harness's uid, so
+/// this is defence in depth against a confused engine rather than a boundary
+/// against the sender; see the module doc for why it is still worth having.
 pub async fn collect_inbound_attachments(
     rest: &RestClient,
     events: &[&Event],

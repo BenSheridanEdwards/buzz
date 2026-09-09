@@ -34,6 +34,16 @@ pub fn find_ffmpeg() -> Option<PathBuf> {
         .find(|p| p.is_file())
 }
 
+/// Run one bounded ffmpeg invocation writing to `out`.
+///
+/// The final `out` check is **advisory only**. It is a second resolution of a
+/// name in a directory the engine can write, by path and following symlinks,
+/// so after a swap it can report the attacker's file rather than the one the
+/// caller reserved. It exists to turn a silent no-output run into an error,
+/// not to establish what was produced. Every caller is authoritative for that
+/// and re-reads the result through the descriptor it holds on the directory
+/// (`read_back_size` inbound, `PublishScratch::open_file` outbound); nothing
+/// downstream may be built on this call's answer.
 async fn run(ffmpeg: &Path, args: &[&str], out: &Path) -> Result<(), String> {
     let mut cmd = tokio::process::Command::new(ffmpeg);
     cmd.args(["-hide_banner", "-loglevel", "error", "-y", "-nostdin"])
@@ -63,6 +73,8 @@ async fn run(ffmpeg: &Path, args: &[&str], out: &Path) -> Result<(), String> {
             tail.trim()
         ));
     }
+    // Advisory, per this function's doc: by path, following symlinks, and
+    // never the authority on what the caller ended up with.
     match std::fs::metadata(out) {
         Ok(meta) if meta.len() > 0 => Ok(()),
         Ok(_) => Err("ffmpeg produced an empty file".into()),
