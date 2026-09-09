@@ -356,9 +356,19 @@ class MainActivity : FlutterFragmentActivity() {
         arguments: Any?,
         result: MethodChannel.Result,
     ) {
-        val sourcePath = arguments as? String ?: run {
-            invalidArguments(result, "Expected source file path as String.")
+        // Accepts `{path, container}`; a bare path keeps the MP4 envelope.
+        val payload = arguments as? Map<*, *>
+        val sourcePath = (payload?.get("path") ?: arguments) as? String ?: run {
+            invalidArguments(result, "Expected source file path and container.")
             return
+        }
+        val container = if (payload == null) {
+            AndroidVoiceNotePackager.Container.MP4_ENVELOPE
+        } else {
+            AndroidVoiceNotePackager.Container.fromWireName(payload["container"] as? String) ?: run {
+                invalidArguments(result, "Expected container to be \"mp4\" or \"m4a\".")
+                return
+            }
         }
 
         Thread {
@@ -367,6 +377,7 @@ class MainActivity : FlutterFragmentActivity() {
                     AndroidVoiceNotePackager.packageForUpload(
                         sourcePath = sourcePath,
                         cacheDirectory = cacheDir,
+                        container = container,
                     ),
                 )
             } catch (error: Exception) {

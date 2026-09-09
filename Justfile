@@ -822,6 +822,11 @@ mobile-check:
 mobile-test:
     unset GIT_DIR GIT_WORK_TREE; cd {{mobile_dir}} && flutter test
 
+# Run the iOS voice-note packaging checks against the production Swift.
+# macOS only (AVFoundation); no Xcode install needed, swiftc is enough.
+mobile-ios-checks:
+    ./scripts/mobile-ios-voice-note-checks.sh
+
 # Regenerate the emoji dataset asset from desktop's emoji-mart install.
 # Output is committed — rerun after bumping @emoji-mart/data.
 mobile-emoji-data:

@@ -416,29 +416,42 @@ Future<void> _retainAndQueueImages(
   }
 }
 
+/// Uploads one queued attachment.
+///
+/// [relayAudioSupport] is the relay's NIP-11 `buzz-audio` verdict. The caller
+/// only starts that read when the queue holds a voice note, so an image, video
+/// or file send never touches the network for it and this parameter is null;
+/// the await here is reached only on the voice-note arm. (A queued voice note
+/// is exclusive, see `_rejectsNonVoiceAttachment`, so no send mixes the two.)
+/// [onRelayAudioRejected] fires when the relay refuses the bare audio despite
+/// that verdict, before the note is resent as the envelope.
 Future<BlobDescriptor> _uploadPendingAttachment(
   MediaUploadService service,
   _PendingAttachment attachment, {
+  Future<bool>? relayAudioSupport,
+  VoidCallback? onRelayAudioRejected,
   ValueChanged<double>? onProgress,
   UploadCancellationToken? cancellationToken,
-}) => switch (attachment.kind) {
-  _PendingAttachmentKind.image => service.uploadImage(
+}) async => switch (attachment.kind) {
+  _PendingAttachmentKind.image => await service.uploadImage(
     attachment.file,
     onProgress: onProgress,
     cancellationToken: cancellationToken,
   ),
-  _PendingAttachmentKind.video => service.uploadVideo(
+  _PendingAttachmentKind.video => await service.uploadVideo(
     attachment.file,
     onProgress: onProgress,
     cancellationToken: cancellationToken,
   ),
-  _PendingAttachmentKind.voiceNote => service.uploadVoiceNote(
+  _PendingAttachmentKind.voiceNote => await service.uploadVoiceNote(
     attachment.file,
     duration: attachment.duration ?? Duration.zero,
+    relayAcceptsAudio: (await relayAudioSupport) ?? false,
+    onAudioRejected: onRelayAudioRejected,
     onProgress: onProgress,
     cancellationToken: cancellationToken,
   ),
-  _PendingAttachmentKind.file => service.uploadFile(
+  _PendingAttachmentKind.file => await service.uploadFile(
     attachment.file,
     onProgress: onProgress,
     cancellationToken: cancellationToken,
