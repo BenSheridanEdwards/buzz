@@ -491,9 +491,11 @@ pub async fn confirm_agent_snapshot_import(
         snapshot.definition.parallelism,
         input.keep_allowlist,
     )?;
-    // The portable "no opinion" value the definition keeps; the record stores
-    // `minted.parallelism`, which already folded in the harness default.
-    let minted_parallelism = minted.definition_parallelism;
+    // The portable "no opinion" value the definition keeps. Named for its
+    // destination, not its source: the record's own field is
+    // `minted.parallelism`, which already folded in the harness default, and
+    // the two must not be confused at the write sites below.
+    let definition_parallelism = minted.definition_parallelism;
 
     // Profile metadata must contain a hosted URL. Inline avatar data can be far
     // larger than the relay's kind:0 content limit, so upload imported pixels
@@ -592,7 +594,7 @@ pub async fn confirm_agent_snapshot_import(
             env_vars: std::collections::BTreeMap::new(),
             respond_to: respond_to_wire.clone(),
             respond_to_allowlist: minted.respond_to_allowlist.clone(),
-            parallelism: minted_parallelism,
+            parallelism: definition_parallelism,
             created_at: now.clone(),
             updated_at: now.clone(),
         };
@@ -665,7 +667,7 @@ pub async fn confirm_agent_snapshot_import(
             team_catalog_source: None,
             definition_respond_to: respond_to_wire.clone(),
             definition_respond_to_allowlist: minted.respond_to_allowlist.clone(),
-            definition_parallelism: minted_parallelism,
+            definition_parallelism,
             relay_mesh: None,
             effort_level: None,
             runtime: snapshot.definition.runtime.clone(),

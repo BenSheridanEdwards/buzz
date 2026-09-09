@@ -13,6 +13,7 @@ import {
   mergeMockCustomHarnesses,
   handleSaveCustomHarness,
   handleDeleteCustomHarness,
+  mockHarnessDefaultParallelismFrom,
 } from "./e2eBridgeCustomHarnesses.ts";
 
 import type {
@@ -8405,15 +8406,19 @@ function declaredMockCatalogs(
  * the selected catalog entry's `default_parallelism` (Hermes: 1), else the app
  * default. Resolving through the catalog is what keeps the stored value and
  * the placeholder the same catalog advertises from disagreeing.
+ *
+ * The lookup itself lives in `e2eBridgeCustomHarnesses.ts` so it can be unit
+ * tested without a browser environment, and so it can search the save-handler's
+ * mutation store as well as the spec's declared config.
  */
 function mockHarnessDefaultParallelism(
   command: string,
   config: E2eConfig | undefined,
 ): number {
-  const entry = declaredMockCatalogs(config).find(
-    (runtime) => runtime.command === command || runtime.id === command,
+  return mockHarnessDefaultParallelismFrom(
+    command,
+    declaredMockCatalogs(config),
   );
-  return entry?.default_parallelism ?? DEFAULT_AGENT_PARALLELISM;
 }
 
 function withMockRuntimeConfigMetadata(
