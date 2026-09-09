@@ -157,12 +157,52 @@ function MessageComposerImpl({
   );
   const internalMedia = useMediaUpload({ deferUploadsUntilSend: true });
   const media = mediaController ?? internalMedia;
+  // Filled once `submitMessage` exists below; a finished voice note with the
+  // review setting off submits through it.
+  const voiceNoteSubmitRef = React.useRef<() => void>(() => {});
+  const submitVoiceNote = React.useCallback(
+    () => voiceNoteSubmitRef.current(),
+    [],
+  );
+  // Same shape for focus: the editor is created further down.
+  const voiceNoteFocusEditorRef = React.useRef<() => void>(() => {});
+  const focusEditorForVoiceNote = React.useCallback(
+    () => voiceNoteFocusEditorRef.current(),
+    [],
+  );
+  // Escape belongs to an open autocomplete list wherever focus is. From the
+  // editor each list closes itself and the recorder declines; from a focused
+  // recorder control the row's capture-phase handler is the first listener in
+  // the window, so it closes the lists through this instead.
+  const dismissAutocomplete = React.useCallback(() => {
+    if (
+      !mentions.isMentionOpen &&
+      !channelLinks.isChannelOpen &&
+      !emojiAutocomplete.isEmojiAutocompleteOpen
+    ) {
+      return false;
+    }
+    mentions.cancelMentionAutocomplete();
+    channelLinks.clearChannels();
+    emojiAutocomplete.clearEmojis();
+    return true;
+  }, [
+    channelLinks.clearChannels,
+    channelLinks.isChannelOpen,
+    emojiAutocomplete.clearEmojis,
+    emojiAutocomplete.isEmojiAutocompleteOpen,
+    mentions.cancelMentionAutocomplete,
+    mentions.isMentionOpen,
+  ]);
   const voiceNote = useComposerVoiceNote({
+    dismissAutocomplete,
     draftKey: effectiveDraftKey,
     editTargetId: editTarget?.id ?? null,
+    focusEditor: focusEditorForVoiceNote,
     media,
     setFormattingOpen: setIsFormattingOpen,
     setEmojiPickerOpen: setIsEmojiPickerOpen,
+    submit: submitVoiceNote,
   });
   React.useEffect(() => {
     onAttachmentAcceptanceChange?.(voiceNote.acceptsAttachment);
@@ -693,6 +733,8 @@ function MessageComposerImpl({
     voiceNote.statusRef,
   ]);
   submitMessageRef.current = submitMessage;
+  voiceNoteSubmitRef.current = () => void submitMessage();
+  voiceNoteFocusEditorRef.current = richText.focusPreserve;
   // Draft auto-submit runs once after persisted editor state loads.
   const onAutoSubmitCompleteRef = React.useRef(onAutoSubmitComplete);
   onAutoSubmitCompleteRef.current = onAutoSubmitComplete;
@@ -739,6 +781,20 @@ function MessageComposerImpl({
         if (channelResult.suggestion) {
           applyChannelInsert(channelResult.suggestion);
         }
+        return;
+      }
+      // Voice note keys: Space holds to record in an empty editor, L locks a
+      // live hold, Esc discards. Shift+Space and other chords fall through.
+      if (
+        voiceNote.handleEditorKeyDown(event, {
+          editorEmpty: richText.editor
+            ? richText.editor.isEmpty
+            : isContentEmpty,
+          // Escape belongs to the mention list while it is open; the recorder
+          // handler runs first here, so it has to be told.
+          mentionOpen: mentions.isMentionOpen,
+        })
+      ) {
         return;
       }
       // Shift+Tab is the keyboard route from the editor into the mention
@@ -796,7 +852,21 @@ function MessageComposerImpl({
       linkEditor.focusCardFirstControl,
       isDeferredEditPending,
       onCancelEdit,
+      voiceNote.handleEditorKeyDown,
+      isContentEmpty,
     ],
+  );
+  // A keyboard hold cannot outlive the editor's focus (rule 8): focus leaving
+  // the composer releases it the same way a pointer release would. Focus
+  // moving within the composer (the lock chip, discard) keeps the hold; the
+  // window keyup still ends it when Space is released there.
+  const handleEditorBlur = React.useCallback(
+    (event: React.FocusEvent<HTMLDivElement>) => {
+      const next = event.relatedTarget;
+      if (next instanceof Node && formRef.current?.contains(next)) return;
+      voiceNote.releaseKeyboardHold();
+    },
+    [voiceNote.releaseKeyboardHold],
   );
   useComposerPasteHandler({
     editor: richText.editor,
@@ -943,11 +1013,14 @@ function MessageComposerImpl({
                 ) : null}
               </div>
             )}
+            {voiceNote.reviewElement}
+            {voiceNote.liveRegionElement}
             {/* biome-ignore lint/a11y/noStaticElementInteractions: keydown handler bridges Tiptap editor to autocomplete and submit */}
             <div
               className="rich-text-composer relative max-h-32 overflow-y-auto"
               data-testid="message-input-scroll"
               ref={composerScrollRef}
+              onBlur={handleEditorBlur}
               onKeyDown={handleEditorKeyDown}
             >
               <EditorContent editor={richText.editor} />
@@ -967,8 +1040,13 @@ function MessageComposerImpl({
               isFormattingOpen={isFormattingOpen}
               isSending={isSending || mentionSendFlow.isPreparingMentionSend}
               isUploading={media.isUploading}
-              isVoiceNoteProcessing={voiceNote.status !== "recording"}
+              isVoiceNoteLocked={voiceNote.locked}
+              isVoiceNoteProcessing={
+                voiceNote.status === "requesting" ||
+                voiceNote.status === "processing"
+              }
               isVoiceNoteRecording={voiceNote.status !== "idle"}
+              isVoiceNoteBlocked={voiceNote.otherComposerIsRecording}
               hasVoiceNoteAttachment={voiceNote.hasAttachment}
               voiceNoteRecorder={voiceNote.recorderElement}
               onCaptureSelection={handleCaptureSelection}
@@ -981,8 +1059,11 @@ function MessageComposerImpl({
               onLinkButton={linkEditor.openFromToolbar}
               onOpenMentionPicker={mentionPicker.openMentionSettings}
               onPaperclip={handlePaperclipClick}
-              onFinishVoiceNote={() => void voiceNote.finish()}
-              onVoiceNote={voiceNote.toggle}
+              onSendVoiceNote={voiceNote.send}
+              onVoiceNote={voiceNote.startLocked}
+              onVoiceNoteHoldCancel={voiceNote.cancelHold}
+              onVoiceNoteHoldEnd={voiceNote.endHold}
+              onVoiceNoteHoldStart={voiceNote.beginPointerHold}
               onRemoveAddressedAgent={removeAddressedAgent}
               pulseVersionByPubkey={addressPulse.pulseVersionByPubkey}
               sendDisabled={sendDisabled}
