@@ -496,8 +496,23 @@ impl AcpClient {
         // Per-runtime environment defaults (e.g. Hermes MCP-startup isolation).
         // Applied first so both persona `extra_env` (below, via `Command::env`
         // key replacement) and inherited parent env (via the parent-presence
-        // check) override them.
-        for &(key, value) in crate::config::default_agent_env(command) {
+        // check) override them. A Hermes record that carries `HERMES_HOME`
+        // (in either layer, including an ambient one this harness process
+        // inherited) is profile-backed and keeps its configured MCP servers;
+        // see `config::default_agent_env`.
+        //
+        // Both layers apply the same emptiness test: `hermes_profile_backed`
+        // trims the `extra_env` value, so the parent one is trimmed here too.
+        // Without that, a parent `HERMES_HOME="   "` would be profile-backed
+        // while the identical value in the record would not, and the two
+        // layers would disagree about the same string.
+        let hermes_profile_backed = crate::config::hermes_profile_backed(
+            extra_env,
+            crate::config::hermes_home_is_profile_backing(
+                std::env::var_os(crate::config::HERMES_HOME_ENV).as_deref(),
+            ),
+        );
+        for &(key, value) in crate::config::default_agent_env(command, hermes_profile_backed) {
             if std::env::var_os(key).is_none() {
                 cmd.env(key, value);
             }
@@ -3069,6 +3084,60 @@ mod tests {
         (client, dir)
     }
 
+    /// Serializes the spawn tests that must observe a specific process
+    /// environment, so their scrubbing cannot interleave. Async-aware: the
+    /// guard is held across the probe spawn's `.await`.
+    ///
+    /// It serializes *these* tests against each other and nothing else: the
+    /// scrub still mutates process-global state while the rest of the binary
+    /// runs. That is safe only because no other test in this crate reads
+    /// `HERMES_HOME` or `HERMES_ACP_SKIP_CONFIGURED_MCP`. Anything new that
+    /// does must take this lock too — it is not a process-wide env lock.
+    static HERMES_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    /// Remove the Hermes env layering keys from this process for the lifetime
+    /// of the guard, restoring them on drop.
+    ///
+    /// A spawned child inherits the harness's environment, so a runner that
+    /// carries a sticky `HERMES_HOME` (a dev box with a Hermes profile) or an
+    /// explicit `HERMES_ACP_SKIP_CONFIGURED_MCP` would otherwise make the
+    /// spawn defaults unobservable. Skipping the assertions there is what the
+    /// guard replaces: the test must protect the seam on every machine, not
+    /// only on a clean one.
+    #[cfg(unix)]
+    struct ScrubbedHermesEnv {
+        saved: Vec<(&'static str, Option<std::ffi::OsString>)>,
+        _lock: tokio::sync::MutexGuard<'static, ()>,
+    }
+
+    #[cfg(unix)]
+    impl ScrubbedHermesEnv {
+        async fn acquire() -> Self {
+            let lock = HERMES_ENV_LOCK.lock().await;
+            let saved = ["HERMES_HOME", "HERMES_ACP_SKIP_CONFIGURED_MCP"]
+                .into_iter()
+                .map(|key| {
+                    let previous = std::env::var_os(key);
+                    std::env::remove_var(key);
+                    (key, previous)
+                })
+                .collect();
+            Self { saved, _lock: lock }
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for ScrubbedHermesEnv {
+        fn drop(&mut self) {
+            for (key, value) in self.saved.drain(..) {
+                match value {
+                    Some(value) => std::env::set_var(key, value),
+                    None => std::env::remove_var(key),
+                }
+            }
+        }
+    }
+
     /// Spawn a probe script whose file name carries a runtime identity (e.g.
     /// `hermes-acp`) and return the value of `var` as the child observed it.
     /// `<unset>` means the child did not receive the var.
@@ -3118,11 +3187,9 @@ mod tests {
     #[tokio::test]
     async fn spawn_applies_runtime_env_defaults_with_extra_env_precedence() {
         const VAR: &str = "HERMES_ACP_SKIP_CONFIGURED_MCP";
-        if std::env::var_os(VAR).is_some() {
-            // Inherited parent values win over both layers; the default and
-            // override behavior below is unobservable in such an environment.
-            return;
-        }
+        // Inherited parent values win over both layers, so the runner's own
+        // environment is scrubbed for the duration rather than skipped over.
+        let _env = ScrubbedHermesEnv::acquire().await;
 
         assert_eq!(
             spawn_named_and_read_child_env("hermes-acp", VAR, &[]).await,
@@ -3138,6 +3205,102 @@ mod tests {
             spawn_named_and_read_child_env("other-agent", VAR, &[]).await,
             "<unset>",
             "non-Hermes spawns must not receive Hermes defaults"
+        );
+    }
+
+    /// A Hermes record that carries `HERMES_HOME` is profile-backed: the
+    /// profile's MCP servers are the agent's own tools, so the isolation
+    /// default flips to `0`. An explicit persona value still wins, and the
+    /// profile env never leaks the Hermes default onto other harnesses.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn spawn_keeps_configured_mcp_for_profile_backed_hermes() {
+        const VAR: &str = "HERMES_ACP_SKIP_CONFIGURED_MCP";
+        // The record's `HERMES_HOME` must be the only one in play: a runner
+        // that exports its own would decide the flag before `extra_env` is
+        // read, and the assertions below would prove nothing.
+        let _env = ScrubbedHermesEnv::acquire().await;
+        let profile_env = |pairs: &[(&str, &str)]| -> Vec<(String, String)> {
+            pairs
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect()
+        };
+
+        assert_eq!(
+            spawn_named_and_read_child_env(
+                "hermes-acp",
+                VAR,
+                &profile_env(&[("HERMES_HOME", "/tmp/hermes-profile")]),
+            )
+            .await,
+            "0",
+            "profile-backed Hermes spawns must default {VAR}=0"
+        );
+        assert_eq!(
+            spawn_named_and_read_child_env(
+                "hermes-acp",
+                VAR,
+                &profile_env(&[("HERMES_HOME", "/tmp/hermes-profile"), (VAR, "1")]),
+            )
+            .await,
+            "1",
+            "an explicit extra_env entry must still override the profile-backed default"
+        );
+        assert_eq!(
+            spawn_named_and_read_child_env(
+                "hermes-acp",
+                VAR,
+                &profile_env(&[("HERMES_HOME", "")]),
+            )
+            .await,
+            "1",
+            "a blank HERMES_HOME is not a profile"
+        );
+        assert_eq!(
+            spawn_named_and_read_child_env(
+                "other-agent",
+                VAR,
+                &profile_env(&[("HERMES_HOME", "/tmp/hermes-profile")]),
+            )
+            .await,
+            "<unset>",
+            "HERMES_HOME on a non-Hermes spawn must not produce Hermes defaults"
+        );
+    }
+
+    /// The parent layer and the record layer apply the SAME emptiness test to
+    /// `HERMES_HOME`, so the profile-backed decision cannot depend on which
+    /// layer happened to carry the value.
+    ///
+    /// This binds the spawn site, not just `hermes_home_is_profile_backing`:
+    /// an inherited whitespace-only `HERMES_HOME` is not a profile, so the
+    /// child still gets the isolation default. Replacing the trimmed check at
+    /// the spawn with a bare `!value.is_empty()` reads `"   "` as a profile
+    /// and hands the child `0` instead.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn spawn_treats_a_blank_inherited_hermes_home_as_no_profile() {
+        const VAR: &str = "HERMES_ACP_SKIP_CONFIGURED_MCP";
+        // Restores whatever this runner had on drop, including the value set
+        // below, and holds the lock for the whole test.
+        let _env = ScrubbedHermesEnv::acquire().await;
+
+        for blank in ["   ", "\t"] {
+            std::env::set_var(crate::config::HERMES_HOME_ENV, blank);
+            assert_eq!(
+                spawn_named_and_read_child_env("hermes-acp", VAR, &[]).await,
+                "1",
+                "an inherited HERMES_HOME of {blank:?} is not a profile"
+            );
+        }
+
+        // The same variable with real content is a profile, from the same layer.
+        std::env::set_var(crate::config::HERMES_HOME_ENV, "/tmp/hermes-profile");
+        assert_eq!(
+            spawn_named_and_read_child_env("hermes-acp", VAR, &[]).await,
+            "0",
+            "an inherited HERMES_HOME with a path is profile-backed"
         );
     }
 

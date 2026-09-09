@@ -703,6 +703,11 @@ pub struct AcpRuntimeCatalogEntry {
     /// Spawn-time parallelism cap; absent for uncapped harnesses.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_parallelism: Option<u32>,
+    /// Parallelism a new record stores when the form leaves it blank. The
+    /// app-wide `DEFAULT_AGENT_PARALLELISM` unless the harness overrides it
+    /// (see `harness_default_parallelism`); the form shows it as the
+    /// placeholder so the blank state is never a surprise.
+    pub default_parallelism: u32,
 }
 
 /// Result of a single install step (CLI or adapter).
@@ -894,8 +899,21 @@ pub fn validate_respond_to_allowlist(input: &[String]) -> Result<Vec<String>, St
 pub struct MintBehavioralDefaults {
     pub respond_to: RespondTo,
     pub respond_to_allowlist: Vec<String>,
-    /// Validated (1..=32) when present; caller applies its own default.
-    pub parallelism: Option<u32>,
+    /// The *requested* parallelism, validated (1..=32) when present and `None`
+    /// when neither the input nor the linked definition asked for one. This is
+    /// the portable value: it travels in `AgentDefinition.parallelism` and
+    /// `ManagedAgentRecord.definition_parallelism` unchanged, so a snapshot
+    /// exported from this instance still says "no opinion" rather than baking
+    /// in whatever default this machine's harness happened to have.
+    pub definition_parallelism: Option<u32>,
+    /// The parallelism a freshly minted `ManagedAgentRecord` stores: the
+    /// requested value when present, else the harness default.
+    ///
+    /// Resolved here, not at the call sites, so no mint site can reproduce the
+    /// precedence slightly differently. The type is deliberately `u32` and not
+    /// `Option<u32>`: a call site cannot fall back to `DEFAULT_AGENT_PARALLELISM`
+    /// on its own without first reaching past this field.
+    pub parallelism: u32,
 }
 
 /// Resolve the NIP-AP behavioral quad for a new instance: explicit input
@@ -910,7 +928,16 @@ pub struct MintBehavioralDefaults {
 /// `input_allowlist` must already be normalized via
 /// [`validate_respond_to_allowlist`]; the definition's allowlist is
 /// validated here since it arrives from the wire.
+///
+/// `harness` is the harness the new instance will run on, as either a runtime
+/// id ("hermes", a custom harness's id) or a command ("hermes-acp", path-
+/// prefixed or `.exe`-suffixed); pass `""` when the mint site genuinely has
+/// none. It selects the parallelism default that fills a blank, so the two key
+/// spaces the mint sites actually hold cannot diverge — see
+/// [`super::mint_parallelism`], which canonicalizes both through the same
+/// three-tier harness lookup.
 pub fn resolve_mint_behavioral_defaults(
+    harness: &str,
     input_respond_to: Option<RespondTo>,
     input_allowlist: Vec<String>,
     input_parallelism: Option<u32>,
@@ -944,7 +971,7 @@ pub fn resolve_mint_behavioral_defaults(
         );
     }
 
-    let parallelism = match input_parallelism {
+    let definition_parallelism = match input_parallelism {
         // Explicit input is validated here too (not just at the command
         // call sites) so the "validated when present" contract on
         // `MintBehavioralDefaults.parallelism` is unskippable.
@@ -968,7 +995,10 @@ pub fn resolve_mint_behavioral_defaults(
     Ok(MintBehavioralDefaults {
         respond_to,
         respond_to_allowlist,
-        parallelism,
+        definition_parallelism,
+        // Hermes mints at 1 (every worker is a full Hermes process loading the
+        // profile's MCP servers); everything else at DEFAULT_AGENT_PARALLELISM.
+        parallelism: super::mint_parallelism(harness, definition_parallelism),
     })
 }
 

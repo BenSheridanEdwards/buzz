@@ -13,6 +13,7 @@ import {
   mergeMockCustomHarnesses,
   handleSaveCustomHarness,
   handleDeleteCustomHarness,
+  mockHarnessDefaultParallelismFrom,
 } from "./e2eBridgeCustomHarnesses.ts";
 
 import type {
@@ -22,7 +23,7 @@ import type {
 import type { UnreadCatchUpChannelResult } from "@/shared/api/tauriUnreadCatchUp";
 import { relayClient } from "@/shared/api/relayClient";
 import { activateRateLimit } from "@/shared/api/relayRateLimitGate";
-import { resolveAgentParallelism } from "@/features/agents/lib/agentParallelism";
+import { DEFAULT_AGENT_PARALLELISM } from "@/features/agents/lib/agentParallelism";
 import { awaitLiveSwitchOutcome } from "@/features/agents/lib/liveSwitchOutcome";
 import {
   _testRegisterKnownAgents,
@@ -254,13 +255,13 @@ type E2eConfig = {
       normalized_host?: string;
       archived_at?: string | null;
     };
-    acpRuntimesCatalog?: RawAcpRuntimeCatalogEntry[];
+    acpRuntimesCatalog?: MockRawAcpRuntimeCatalogEntry[];
     /** Catalog returned after a successful mocked install. */
-    acpRuntimesCatalogAfterInstall?: RawAcpRuntimeCatalogEntry[];
+    acpRuntimesCatalogAfterInstall?: MockRawAcpRuntimeCatalogEntry[];
     /** Catalog responses after install for testing later sign-in completion. */
-    acpRuntimesCatalogAfterInstallSequence?: RawAcpRuntimeCatalogEntry[][];
+    acpRuntimesCatalogAfterInstallSequence?: MockRawAcpRuntimeCatalogEntry[][];
     /** Catalog responses for successive discovery calls. The final response repeats. */
-    acpRuntimesCatalogSequence?: RawAcpRuntimeCatalogEntry[][];
+    acpRuntimesCatalogSequence?: MockRawAcpRuntimeCatalogEntry[][];
     acpRuntimesDelayMs?: number;
     /** When true, the catalog discovery call throws — simulates a failed query. */
     acpRuntimesError?: boolean;
@@ -279,7 +280,7 @@ type E2eConfig = {
     connectAcpRuntimeDelayMs?: number;
     connectAcpRuntimeError?: string;
     /** Catalog returned after a successful mocked connect (sign-in). */
-    acpRuntimesCatalogAfterConnect?: RawAcpRuntimeCatalogEntry[];
+    acpRuntimesCatalogAfterConnect?: MockRawAcpRuntimeCatalogEntry[];
     activePersonaIds?: string[];
     installAcpRuntimeDelayMs?: number;
     /** Live output lines the mocked install emits before it settles. */
@@ -8369,11 +8370,66 @@ async function handleListRelayAgents(
   return mockRelayAgents.map(cloneRelayAgent);
 }
 
+/**
+ * Spec-authored catalog entries may omit fields the native backend always
+ * emits; `withMockRuntimeConfigMetadata` fills them so the bridge stays
+ * faithful to the Rust shape (`AcpRuntimeCatalogEntry`).
+ */
+type MockRawAcpRuntimeCatalogEntry = Omit<
+  RawAcpRuntimeCatalogEntry,
+  "default_parallelism"
+> & {
+  default_parallelism?: number;
+};
+
+/**
+ * Every catalog the spec declared, in one list. Mint-time lookups read this
+ * rather than one branch of `handleDiscoverAcpRuntimes`, whose choice depends
+ * on how many discovery calls have already run.
+ */
+function declaredMockCatalogs(
+  config: E2eConfig | undefined,
+): MockRawAcpRuntimeCatalogEntry[] {
+  const mock = config?.mock;
+  if (mock === undefined) return [];
+  return [
+    ...(mock.acpRuntimesCatalog ?? []),
+    ...(mock.acpRuntimesCatalogSequence ?? []).flat(),
+    ...(mock.acpRuntimesCatalogAfterInstall ?? []),
+    ...(mock.acpRuntimesCatalogAfterInstallSequence ?? []).flat(),
+    ...(mock.acpRuntimesCatalogAfterConnect ?? []),
+  ];
+}
+
+/**
+ * The parallelism a blank create stores, mirroring Rust's `mint_parallelism`:
+ * the selected catalog entry's `default_parallelism` (Hermes: 1), else the app
+ * default. Resolving through the catalog is what keeps the stored value and
+ * the placeholder the same catalog advertises from disagreeing.
+ *
+ * The lookup itself lives in `e2eBridgeCustomHarnesses.ts` so it can be unit
+ * tested without a browser environment, and so it can search the save-handler's
+ * mutation store as well as the spec's declared config.
+ */
+function mockHarnessDefaultParallelism(
+  command: string,
+  config: E2eConfig | undefined,
+): number {
+  return mockHarnessDefaultParallelismFrom(
+    command,
+    declaredMockCatalogs(config),
+  );
+}
+
 function withMockRuntimeConfigMetadata(
-  runtime: RawAcpRuntimeCatalogEntry,
+  runtime: MockRawAcpRuntimeCatalogEntry,
 ): RawAcpRuntimeCatalogEntry {
   return {
     ...runtime,
+    // Native-shaped: the backend always emits the harness default (Hermes: 1;
+    // everything else the app default), never omits the key.
+    default_parallelism:
+      runtime.default_parallelism ?? DEFAULT_AGENT_PARALLELISM,
     node_required: runtime.node_required ?? false,
     auth_status: runtime.auth_status ?? { status: "unknown" },
     model_env_var:
@@ -8473,7 +8529,7 @@ async function handleDiscoverAcpRuntimes(
       configured.map(withMockRuntimeConfigMetadata),
     );
   }
-  const defaultCatalog: RawAcpRuntimeCatalogEntry[] = [
+  const defaultCatalog: MockRawAcpRuntimeCatalogEntry[] = [
     {
       id: "goose",
       label: "Goose",
@@ -9533,10 +9589,6 @@ async function handleCreateManagedAgent(
     args.input.respondTo !== undefined
       ? (args.input.respondToAllowlist ?? [])
       : (linkedPersona?.respond_to_allowlist ?? []);
-  const mintParallelism = resolveAgentParallelism(
-    args.input.parallelism,
-    linkedPersona?.parallelism,
-  );
   const personaAvatarUrl =
     args.input.personaId === undefined
       ? null
@@ -9557,6 +9609,14 @@ async function handleCreateManagedAgent(
       : agentCommand === "goose"
         ? ["acp"]
         : [];
+  // Mint-parity with `mint_parallelism`: an explicit input wins, then the
+  // linked definition's value, then the harness default from the catalog,
+  // NOT the app default, which would mint 10 for a Hermes create whose own
+  // placeholder reads "Hermes default (1)".
+  const mintParallelism =
+    args.input.parallelism ??
+    linkedPersona?.parallelism ??
+    mockHarnessDefaultParallelism(agentCommand, config);
   const managedAgent: MockManagedAgent = {
     pubkey,
     name,
