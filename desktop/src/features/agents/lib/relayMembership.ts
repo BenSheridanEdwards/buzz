@@ -19,6 +19,14 @@ export function relayAddMemberCommand(agentPubkeyHex: string): string {
 export type RelayMembershipNotice = {
   /** Badge label on the agent card. */
   badge: string;
+  /**
+   * Who the relay's answer was about. `workspace` is the roster-read refusal:
+   * the relay turned away the USER's identity before it was ever asked about
+   * an agent, so the problem, the npub and the operator command are all the
+   * user's and are identical for every agent on that relay. `agent` is every
+   * other path, where the relay answered about this agent specifically.
+   */
+  subject: "agent" | "workspace";
   /** Visual weight: `not_member` is a blocking condition, `unknown` is not. */
   severity: "blocked" | "unverified";
   /** Persisted detail from the check, verbatim. */
@@ -51,10 +59,20 @@ export function relayMembershipNotice(
   // to an operator with a command that may already have been run and that
   // could never clear the card.
   const subjectHex = membership.subjectPubkey ?? agentPubkeyHex;
+  const subject = membership.subjectPubkey ? "workspace" : "agent";
   const npubLabel = membership.subjectPubkey ? "Your npub" : "Agent npub";
   if (membership.state === "not_member") {
     return {
-      badge: "Not a relay member",
+      // The badge is the last thing on the card still able to say the agent
+      // is at fault. On the workspace branch it is not: the relay never saw
+      // the agent, and one refusal of the user renders on every card, so a
+      // fleet reads as N broken agents for a single problem that is not
+      // theirs. The strings differ; the block header still owns the label.
+      badge:
+        subject === "workspace"
+          ? "Relay refused your identity"
+          : "Not a relay member",
+      subject,
       severity: "blocked",
       detail: membership.detail,
       npub: safeNpub(subjectHex),
@@ -64,10 +82,53 @@ export function relayMembershipNotice(
   }
   return {
     badge: "Relay membership unverified",
+    subject,
     severity: "unverified",
     detail: membership.detail,
     npub: safeNpub(subjectHex),
     npubLabel,
     command: null,
   };
+}
+
+/** The shape `workspaceRelayMembershipNotice` needs from an agent. */
+export type RelayMembershipSubject = {
+  pubkey: string;
+  relayMembership?: ManagedAgentRelayMembership | null;
+};
+
+/**
+ * The one notice to render for a whole group of agents when the relay's
+ * answer was about the USER, not about any agent.
+ *
+ * A roster-read refusal is a single user-level fact: same identity, same
+ * npub, same operator command, repeated once per agent. Rendered per row it
+ * became seventeen identical amber blocks on a seventeen-agent fleet, each
+ * one reading as if that agent were broken. Collapsing it to one keeps the
+ * remedy exactly where it was and states how many agents it holds up.
+ *
+ * Returns `null` when no agent in the group carries one. Agents whose card
+ * state is about themselves are untouched and keep their own block.
+ */
+export function workspaceRelayMembershipNotice(
+  agents: readonly RelayMembershipSubject[],
+): { notice: RelayMembershipNotice; agentCount: number } | null {
+  const byNpub = new Map<string, RelayMembershipNotice[]>();
+  for (const agent of agents) {
+    const notice = relayMembershipNotice(agent.pubkey, agent.relayMembership);
+    if (notice?.subject !== "workspace") continue;
+    // Keyed by the refused identity, not by the agent: two workspace
+    // identities cannot be collapsed into one card.
+    const key = notice.npub ?? "";
+    const group = byNpub.get(key);
+    if (group) group.push(notice);
+    else byNpub.set(key, [notice]);
+  }
+  let largest: RelayMembershipNotice[] | null = null;
+  for (const group of byNpub.values()) {
+    if (!largest || group.length > largest.length) largest = group;
+  }
+  const first = largest?.[0];
+  if (!first || !largest) return null;
+  return { notice: first, agentCount: largest.length };
 }

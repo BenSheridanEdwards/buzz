@@ -183,8 +183,13 @@ export function ManagedAgentRow({
       </div>
 
       {/* Sibling of the expansion button, like the restart badge above: the
-          block carries copy buttons, which must never nest inside it. */}
-      {membershipNotice ? (
+          block carries copy buttons, which must never nest inside it.
+
+          A `workspace`-subject notice is deliberately NOT rendered here: the
+          relay refused the user's identity, not this agent, so the group
+          renders it once above the rows (`AgentGroupRows`) instead of once
+          per agent. */}
+      {membershipNotice && membershipNotice.subject === "agent" ? (
         <RelayMembershipBlock notice={membershipNotice} />
       ) : null}
 
@@ -415,11 +420,18 @@ function StatusBlock({
 /**
  * Shown when the desktop could not register the agent on a closed relay
  * (or could not verify it). Gives the operator everything they need in one
- * place: why, the agent's npub, and the exact `buzz-admin` command.
+ * place: why, the npub, and the exact `buzz-admin` command.
+ *
+ * `agentCount` is set only by the group-level render of a user-level
+ * refusal, where one block stands in for several agents; the sentence it
+ * adds is the only place that number is stated, so the count has one owner
+ * like every other label here.
  */
-function RelayMembershipBlock({
+export function RelayMembershipBlock({
+  agentCount,
   notice,
 }: {
+  agentCount?: number;
   notice: NonNullable<ReturnType<typeof relayMembershipNotice>>;
 }) {
   const blocked = notice.severity === "blocked";
@@ -447,6 +459,11 @@ function RelayMembershipBlock({
       </div>
       {notice.detail ? (
         <p className="text-muted-foreground">{notice.detail}</p>
+      ) : null}
+      {agentCount && agentCount > 1 ? (
+        <p className="text-muted-foreground">
+          {`This holds up ${agentCount} agents on this relay. Clearing it clears all of them.`}
+        </p>
       ) : null}
       {notice.npub ? (
         <div className="flex items-start gap-1.5">

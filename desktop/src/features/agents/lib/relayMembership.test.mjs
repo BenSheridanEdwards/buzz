@@ -8,6 +8,7 @@ import {
   RELAY_CONTAINER_PLACEHOLDER,
   relayAddMemberCommand,
   relayMembershipNotice,
+  workspaceRelayMembershipNotice,
 } from "./relayMembership.ts";
 
 const AGENT_HEX =
@@ -84,6 +85,29 @@ describe("relayMembership card notice", () => {
     assert.equal(notice.npub, npubOf(USER_HEX));
     assert.notEqual(notice.npub, npubOf(AGENT_HEX));
     assert.equal(notice.command, relayAddMemberCommand(USER_HEX));
+    assert.equal(notice.subject, "workspace");
+  });
+
+  // The badge was the last thing on the card still saying the agent is the
+  // problem: the detail, the npub, the label and the command are all the
+  // user's. It also renders once per agent, so a fleet showed N broken
+  // agents for one refusal of one identity.
+  it("does not badge the agent as the problem when the relay refused the user", () => {
+    const agentFault = relayMembershipNotice(AGENT_HEX, {
+      state: "not_member",
+      checkedAt: "t",
+      detail: null,
+    });
+    const userFault = relayMembershipNotice(AGENT_HEX, {
+      state: "not_member",
+      checkedAt: "t",
+      detail: null,
+      subjectPubkey: USER_HEX,
+    });
+    assert.equal(agentFault?.badge, "Not a relay member");
+    assert.equal(agentFault?.subject, "agent");
+    assert.notEqual(userFault?.badge, agentFault?.badge);
+    assert.equal(userFault?.badge, "Relay refused your identity");
   });
 
   // Same substitution on the non-blocking state, so an `unknown` carrying a
@@ -120,5 +144,59 @@ describe("relayMembership card notice", () => {
     });
     assert.ok(notice);
     assert.equal(notice.npub, null);
+  });
+});
+
+describe("workspace-level relay membership notice", () => {
+  const OTHER_AGENT_HEX =
+    "b2e4d1c0ffee00000000000000000000000000000000000000000000000face1";
+  const refusedByRelay = (subjectPubkey) => ({
+    state: "not_member",
+    checkedAt: "t",
+    detail: "This relay only accepts members and it did not accept your identity.",
+    subjectPubkey,
+  });
+
+  it("collapses one refusal of the user into a single notice for the group", () => {
+    const collapsed = workspaceRelayMembershipNotice([
+      { pubkey: AGENT_HEX, relayMembership: refusedByRelay(USER_HEX) },
+      { pubkey: OTHER_AGENT_HEX, relayMembership: refusedByRelay(USER_HEX) },
+    ]);
+    assert.ok(collapsed);
+    assert.equal(collapsed.agentCount, 2);
+    assert.equal(collapsed.notice.npub, npubOf(USER_HEX));
+    assert.equal(collapsed.notice.command, relayAddMemberCommand(USER_HEX));
+  });
+
+  it("leaves an agent-level refusal to the agent's own row", () => {
+    assert.equal(
+      workspaceRelayMembershipNotice([
+        {
+          pubkey: AGENT_HEX,
+          relayMembership: { state: "not_member", checkedAt: "t", detail: null },
+        },
+      ]),
+      null,
+    );
+    assert.equal(workspaceRelayMembershipNotice([]), null);
+    assert.equal(
+      workspaceRelayMembershipNotice([
+        { pubkey: AGENT_HEX, relayMembership: null },
+      ]),
+      null,
+    );
+  });
+
+  // Two different workspace identities are two different problems with two
+  // different npubs, so they must never be merged into one card.
+  it("never merges refusals of two different identities", () => {
+    const other =
+      "cafebabe00000000000000000000000000000000000000000000000000001234";
+    const collapsed = workspaceRelayMembershipNotice([
+      { pubkey: AGENT_HEX, relayMembership: refusedByRelay(USER_HEX) },
+      { pubkey: OTHER_AGENT_HEX, relayMembership: refusedByRelay(other) },
+    ]);
+    assert.ok(collapsed);
+    assert.equal(collapsed.agentCount, 1);
   });
 });
