@@ -2818,12 +2818,16 @@ async fn tokio_main() -> Result<()> {
         pubkey_hex.get(..16).unwrap_or(pubkey_hex.as_str()),
     )
     .map_err(|e| {
-        let reason = format!(
-            "attachment root under {} refused: {e}",
-            attachment_base.display()
+        // The reason is kept path-free because it reaches a channel: a reply
+        // that names a file gets it back as its failure notice, and the base
+        // is the host temp directory plus the agent's pubkey. The path is on
+        // the log line beside it.
+        tracing::error!(
+            target: "acp::media",
+            base = %attachment_base.display(),
+            "attachment root refused: {e}; attachments are disabled"
         );
-        tracing::error!(target: "acp::media", "{reason}; attachments are disabled");
-        reason
+        format!("attachment root refused: {e}")
     });
     let ffmpeg = crate::ffmpeg::find_ffmpeg();
     tracing::info!(

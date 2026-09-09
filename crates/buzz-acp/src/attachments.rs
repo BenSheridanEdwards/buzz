@@ -632,30 +632,52 @@ fn private_dir_builder() -> std::fs::DirBuilder {
     builder
 }
 
+/// Refuse a directory in the attachment storage path that is not a real
+/// directory this process owns.
+///
+/// The messages name the condition and never the path. Every one of them can
+/// reach a channel: `prepare_turn_dir` and [`PublishScratch::create`] call
+/// this on the publish path, and their errors become the reply's failure
+/// notice, which every member of the channel reads. The absolute path (the
+/// host temp directory and the agent pubkey) goes to `tracing` here instead,
+/// beside the same condition.
 fn check_private_dir(dir: &Path) -> std::io::Result<()> {
+    let refuse = |detail: String, class: &str| -> std::io::Error {
+        tracing::error!(
+            target: "acp::media",
+            dir = %dir.display(),
+            "attachment storage refused: {detail}"
+        );
+        std::io::Error::other(class.to_string())
+    };
     let meta = std::fs::symlink_metadata(dir)?;
     if meta.file_type().is_symlink() {
-        return Err(std::io::Error::other(format!(
-            "{} is a symlink; refusing to store attachments through it",
-            dir.display()
-        )));
+        return Err(refuse(
+            format!("{} is a symlink", dir.display()),
+            "a directory in the attachment storage path is a symlink; refusing to store \
+             attachments through it",
+        ));
     }
     if !meta.is_dir() {
-        return Err(std::io::Error::other(format!(
-            "{} is not a directory",
-            dir.display()
-        )));
+        return Err(refuse(
+            format!("{} is not a directory", dir.display()),
+            "a directory in the attachment storage path is not a directory",
+        ));
     }
     #[cfg(unix)]
     {
         use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
         let uid = nix::unistd::Uid::current().as_raw();
         if meta.uid() != uid {
-            return Err(std::io::Error::other(format!(
-                "{} is owned by uid {} rather than this process (uid {uid}); refusing to use it",
-                dir.display(),
-                meta.uid()
-            )));
+            return Err(refuse(
+                format!(
+                    "{} is owned by uid {} rather than this process (uid {uid})",
+                    dir.display(),
+                    meta.uid()
+                ),
+                "a directory in the attachment storage path is owned by another user; refusing \
+                 to use it",
+            ));
         }
         let mode = meta.permissions().mode() & 0o777;
         if mode & 0o077 != 0 {
@@ -1038,10 +1060,42 @@ pub fn open_verified(
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt as _;
-        options.custom_flags(nix::fcntl::OFlag::O_NOFOLLOW.bits());
+        // `O_NONBLOCK` because the open itself must not be able to block.
+        // Both roots are writable by the engine, so the name can be a FIFO
+        // by the time we get here, and `open(2)` on a FIFO for reading blocks
+        // until a writer arrives, forever if none ever does. This runs
+        // inside `spawn_blocking`, so a blocked open is a thread of the
+        // blocking pool that no timeout can recover: the publish deadline
+        // frees the report and leaks the thread (rule 4 wants resources
+        // bounded, not permanently lost). With the flag the open returns
+        // immediately and the handle check below refuses the FIFO.
+        options
+            .custom_flags((nix::fcntl::OFlag::O_NOFOLLOW | nix::fcntl::OFlag::O_NONBLOCK).bits());
     }
     let file = options.open(path)?;
-    verified_handle(file, expected_len, true)
+    let (file, len) = verified_handle(file, expected_len, true)?;
+    // A regular file now: clear `O_NONBLOCK` so the reads that follow are
+    // the ordinary blocking ones (it is a no-op for regular files on every
+    // platform we run on, but the flag was for the open, not for the reads).
+    #[cfg(unix)]
+    clear_nonblocking(&file)?;
+    Ok((file, len))
+}
+
+/// Drop `O_NONBLOCK` from an already-open handle.
+#[cfg(unix)]
+fn clear_nonblocking(file: &std::fs::File) -> std::io::Result<()> {
+    use std::os::fd::AsFd as _;
+    let fd = file.as_fd();
+    let flags = nix::fcntl::OFlag::from_bits_truncate(
+        nix::fcntl::fcntl(fd, nix::fcntl::FcntlArg::F_GETFL).map_err(std::io::Error::from)?,
+    );
+    nix::fcntl::fcntl(
+        fd,
+        nix::fcntl::FcntlArg::F_SETFL(flags & !nix::fcntl::OFlag::O_NONBLOCK),
+    )
+    .map_err(std::io::Error::from)?;
+    Ok(())
 }
 
 /// Check an open handle: a regular file, of exactly `expected_len` bytes
@@ -1727,9 +1781,17 @@ mod tests {
         let err = prepare_attachment_root(&base, "abcdef0123456789")
             .expect_err("a planted `buzz-acp` component is refused");
         assert!(err.to_string().contains("symlink"), "{err}");
+        // This binds the `buzz-acp` component specifically: everything below
+        // it is a real directory this process created and owns, so with that
+        // component dropped from the checked list the call would succeed.
+        // The component is deliberately not *named*: this reason reaches a channel as
+        // the reply's failure notice (S1 of the third confirmation pass), so
+        // the host path stays on the log line beside it.
+        let text = err.to_string();
         assert!(
-            err.to_string().contains("buzz-acp"),
-            "the refusal names the component: {err}"
+            !text.contains(&base.display().to_string())
+                && !text.contains(&planted.display().to_string()),
+            "the refusal carries no host path: {text}"
         );
         let _ = std::fs::remove_dir_all(&base);
         let _ = std::fs::remove_dir_all(&planted);
@@ -2229,6 +2291,47 @@ mod tests {
         );
         let _ = std::fs::remove_dir_all(&elsewhere);
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// S2 from the third confirmation pass. Both outbound roots are
+    /// engine-writable, so a name the reply gives can be a FIFO by the time
+    /// the publish opens it, and `open(2)` on a FIFO for reading blocks until
+    /// a writer arrives. The open runs inside `spawn_blocking`, so a block
+    /// there is a blocking-pool thread lost for the life of the process, past
+    /// any timeout. `O_NONBLOCK` makes the open return so the handle check
+    /// can refuse it.
+    #[cfg(unix)]
+    #[test]
+    fn a_named_pipe_is_refused_rather_than_waited_on() {
+        let dir = std::env::temp_dir().join(format!("buzz-acp-fifo-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let fifo = dir.join("note.mp3");
+        nix::unistd::mkfifo(&fifo, nix::sys::stat::Mode::from_bits_truncate(0o600)).unwrap();
+
+        // No writer is ever opened, so a blocking open never returns; the
+        // whole test is the assertion that this call does.
+        let (tx, rx) = std::sync::mpsc::channel();
+        let probe = fifo.clone();
+        let handle = std::thread::spawn(move || {
+            let _ = tx.send(open_verified(&probe, None).map(|(_, len)| len));
+        });
+        let outcome = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("open_verified returned rather than blocking on the FIFO");
+        handle.join().unwrap();
+
+        let err = outcome.expect_err("a FIFO is not publishable");
+        assert!(err.to_string().contains("regular file"), "{err}");
+        // And an ordinary file beside it still opens, so the flag did not
+        // simply break the read path.
+        let plain = dir.join("plain.mp3");
+        std::fs::write(&plain, b"bytes").unwrap();
+        let (mut file, len) = open_verified(&plain, None).unwrap();
+        assert_eq!(len, 5);
+        let mut got = Vec::new();
+        std::io::Read::read_to_end(&mut file, &mut got).unwrap();
+        assert_eq!(got, b"bytes");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]

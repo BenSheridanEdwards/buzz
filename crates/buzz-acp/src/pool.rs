@@ -7989,6 +7989,131 @@ done"#
         let _ = std::fs::remove_dir_all(&scratch);
     }
 
+    /// S1 from the third confirmation pass. The storage checks run again at
+    /// publish time, and their reason is wrapped straight into the reply's
+    /// failure notice, which every member of the channel reads. In production
+    /// the attachment root is `<host temp dir>/buzz-acp/<agent pubkey
+    /// prefix>/attachments`, and the engine can make this fire on demand by
+    /// replacing the root or `.outbound` with a link, so the notice must
+    /// carry the class and not the path.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_storage_refusal_notice_carries_the_class_and_not_the_host_path() {
+        let (base, seen) = media_relay_server(b"unused".to_vec(), "unused".into(), None).await;
+        let scratch = std::env::temp_dir().join(format!("buzz-acp-pool-store-{}", Uuid::new_v4()));
+        let elsewhere = scratch.join("elsewhere");
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        // The root the harness was given is a link to a directory it does not
+        // own the name of: `create_dir_all` walks through it, and
+        // `check_private_dir` is the thing that refuses it.
+        let attachment_root = scratch.join("attachments");
+        std::os::unix::fs::symlink(&elsewhere, &attachment_root).unwrap();
+        let reply_file = scratch.join("reply.txt");
+        std::fs::write(&reply_file, b"under the harness cwd").unwrap();
+        let reply_text = format!("here\\nMEDIA:{}", reply_file.display());
+        let script = format!(
+            r#"count=0
+while IFS= read -r line; do
+  count=$((count + 1))
+  printf '%s\n' '{{"jsonrpc":"2.0","method":"session/update","params":{{"sessionId":"live-session","update":{{"sessionUpdate":"agent_message_chunk","content":{{"type":"text","text":"{reply_text}"}}}}}}}}'
+  printf '%s\n' "{{\"jsonrpc\":\"2.0\",\"id\":$((count - 1)),\"result\":{{\"stopReason\":\"end_turn\"}}}}"
+done"#
+        );
+        let acp = AcpClient::spawn("bash", &["-c".to_string(), script], &[], false)
+            .await
+            .expect("spawn storage-refusal ACP script");
+        let channel_id = Uuid::new_v4();
+        let mut agent = OwnedAgent {
+            index: 0,
+            acp,
+            state: SessionState::default(),
+            model_capabilities: None,
+            desired_model: None,
+            model_overridden: false,
+            desired_model_request_id: None,
+            desired_model_pending_ack: false,
+            startup_effort: None,
+            agent_name: "storage-test-agent".into(),
+            goose_system_prompt_supported: None,
+            protocol_version: 1,
+        };
+        agent
+            .state
+            .sessions
+            .insert(conv(channel_id), "live-session".into());
+        agent
+            .state
+            .deliveries
+            .insert(conv(channel_id), ChannelDeliveryState::default());
+
+        let mut ctx = make_prompt_context_no_owner();
+        ctx.rest_client.base_url = base.clone();
+        ctx.attachment_dir = Ok(attachment_root.clone());
+        ctx.cwd = scratch.to_string_lossy().into_owned();
+        let ctx = Arc::new(ctx);
+        let (result_tx, mut result_rx) = mpsc::unbounded_channel();
+
+        let author = Keys::generate();
+        let event = EventBuilder::new(Kind::Custom(9), "send me that file")
+            .sign_with_keys(&author)
+            .unwrap();
+        run_prompt_task(
+            agent,
+            Some(FlushBatch {
+                channel_id,
+                scope: SessionScope::Conversation { channel_id },
+                events: vec![crate::queue::BatchEvent {
+                    event,
+                    prompt_tag: "test".into(),
+                    received_at: std::time::Instant::now(),
+                }],
+                cancelled_events: vec![],
+                cancel_reason: None,
+            }),
+            None,
+            Arc::clone(&ctx),
+            result_tx.clone(),
+            None,
+            "turn-1".into(),
+        )
+        .await;
+        let result = result_rx.recv().await.expect("prompt result");
+        let mut agent = result.agent;
+
+        let requests = wait_for_requests(&seen, "the storage refusal notice", |seen| {
+            kind9_posts(seen).iter().any(|e| {
+                e["content"]
+                    .as_str()
+                    .unwrap_or("")
+                    .contains("attachment storage unavailable")
+            })
+        })
+        .await;
+        let notice = kind9_posts(&requests)
+            .into_iter()
+            .find(|e| {
+                e["content"]
+                    .as_str()
+                    .unwrap_or("")
+                    .contains("attachment storage unavailable")
+            })
+            .unwrap();
+        let text = notice["content"].as_str().unwrap().to_string();
+        assert!(text.contains("symlink"), "{text}");
+        assert!(
+            !text.contains(&scratch.display().to_string())
+                && !text.contains(&elsewhere.display().to_string()),
+            "the notice names the class of failure, not the host path: {text}"
+        );
+        assert!(
+            !requests.iter().any(|r| r.body == b"under the harness cwd"),
+            "nothing was published"
+        );
+
+        agent.acp.shutdown().await;
+        let _ = std::fs::remove_dir_all(&scratch);
+    }
+
     /// S5 from the confirmation pass: on a steer the live message must get
     /// the attachment budget before the blobs of the turn it superseded.
     /// Swapping the two chains in `batch_attachment_events` makes the
