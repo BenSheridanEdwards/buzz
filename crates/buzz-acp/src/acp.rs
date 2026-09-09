@@ -936,6 +936,14 @@ impl AcpClient {
         std::mem::take(&mut self.turn_media)
     }
 
+    /// The reply text captured so far this turn, without consuming the
+    /// capture. Read before [`take_turn_media`](Self::take_turn_media) so the
+    /// text-reply fallback can see what the engine said while the media path
+    /// still receives the whole capture.
+    pub fn peek_turn_text(&self) -> &str {
+        self.turn_media.text()
+    }
+
     /// Notify the usage tracker that buzz-acp just spawned a new session.
     ///
     /// Seeds a zero baseline so the first usage notification for `session_id`
