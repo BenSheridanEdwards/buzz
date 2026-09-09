@@ -1296,7 +1296,21 @@ async fn write_blob(dir: &Arc<DirHandle>, name: &str, data: Vec<u8>) -> Result<P
     tokio::task::spawn_blocking(move || {
         use std::io::Write as _;
         let mut file = dir.create_at(std::ffi::OsStr::new(&name))?;
-        file.write_all(&data)?;
+        if let Err(e) = file.write_all(&data) {
+            // A short write or `ENOSPC` leaves a partial file at a name the
+            // sender chose, next to the failure note that says nothing was
+            // stored. Take it back out through the same descriptor so the
+            // turn directory never contradicts the outcome it reports.
+            //
+            // No test binds this arm and none can portably: reaching it
+            // needs a real write failure on a real filesystem. It is
+            // cleanup on a path that already failed, not a guard, and the
+            // sibling arm in `fetch_attachment` (which a test does bind) is
+            // where the same rule is proven.
+            drop(file);
+            let _ = dir.unlink_at(std::ffi::OsStr::new(&name));
+            return Err(e);
+        }
         Ok::<PathBuf, std::io::Error>(dir.path().join(&name))
     })
     .await
@@ -1374,18 +1388,35 @@ async fn fetch_attachment(
                 // at the path ffmpeg is about to be handed, check the
                 // directory is still the one we opened, and read the result
                 // back through the descriptor. A swap after that costs the
-                // extraction rather than moving it.
-                let extracted = match turn_dir
-                    .create_at(std::ffi::OsStr::new(&mp3_name))
-                    .and_then(|_| turn_dir.still_at_its_path())
-                {
-                    Ok(()) => {
-                        match crate::ffmpeg::extract_voice_note_audio(ffmpeg, &path, &mp3_path)
-                            .await
-                        {
-                            Ok(()) => read_back_size(turn_dir, &mp3_name).await,
-                            Err(e) => Err(e),
+                // extraction rather than moving it, and the reservation is
+                // unlinked on every failing arm so nothing is left behind.
+                let extracted = match turn_dir.create_at(std::ffi::OsStr::new(&mp3_name)) {
+                    Ok(_reserved) => {
+                        let outcome = match turn_dir.still_at_its_path() {
+                            Ok(()) => {
+                                match crate::ffmpeg::extract_voice_note_audio(
+                                    ffmpeg, &path, &mp3_path,
+                                )
+                                .await
+                                {
+                                    Ok(()) => read_back_size(turn_dir, &mp3_name).await,
+                                    Err(e) => Err(e),
+                                }
+                            }
+                            Err(e) => {
+                                Err(format!("could not reserve a file for the extraction: {e}"))
+                            }
+                        };
+                        if outcome.is_err() {
+                            // The reservation is ours and the extraction did
+                            // not produce anything we will adopt, so the
+                            // 0-byte (or swapped-away) `.mp3` must not be
+                            // left sitting next to the envelope the engine is
+                            // about to open. Removed through the descriptor,
+                            // so this cannot follow a link either.
+                            let _ = turn_dir.unlink_at(std::ffi::OsStr::new(&mp3_name));
                         }
+                        outcome
                     }
                     Err(e) => Err(format!("could not reserve a file for the extraction: {e}")),
                 };
@@ -2268,6 +2299,113 @@ mod tests {
             "the file the link pointed at was not overwritten"
         );
         let _ = std::fs::remove_file(&victim);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// SF1 from the fourth confirmation pass. The guard the reservation
+    /// above cannot provide on its own: what happens when the swap lands
+    /// *after* `still_at_its_path` has passed.
+    ///
+    /// [`DirHandle`]'s doc stakes the whole subprocess story on the claim
+    /// that such a swap "costs the operation rather than moving it", and the
+    /// only thing making that true is that [`read_back_size`] reopens the
+    /// output through the retained descriptor. Nothing bound it: replacing
+    /// that `open_at` with `std::fs::File::open(dir.path().join(&name))`
+    /// left the whole suite green, because `ffmpeg::run`'s own advisory
+    /// `metadata` check resolves the same name the same way and the two
+    /// simply agree with each other.
+    ///
+    /// The sequence is deterministic, not a race: the stand-in encoder
+    /// performs the swap itself, between the check and its write, exactly
+    /// where a real one would be running. It then writes where the *name*
+    /// now points. The harness must read the reserved, still-empty file the
+    /// descriptor holds, report the extraction as failed, and hand the
+    /// engine the untouched MP4 envelope. With a path-based read-back it
+    /// adopts the attacker's bytes instead, calls them `audio/mpeg`, and
+    /// tells the engine they were extracted from the note.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_extraction_output_swapped_after_the_check_is_not_read_back() {
+        let body = b"fake mp4 envelope".to_vec();
+        let sha = blossom::sha256_hex(&body);
+        let (base, _head) = one_shot_server("200 OK", body.clone(), Some(body.len())).await;
+        let rest = rest_for(&base);
+        let event = imeta_event_for(&base, &sha, body.len(), "video/mp4", "voice-note-1.mp4");
+        let root = std::env::temp_dir().join(format!("buzz-acp-dl-{}", uuid::Uuid::new_v4()));
+        let turn_dir = prepare_turn_dir(&root, "turn-1", &LiveTurnDirs::default()).unwrap();
+        // Where the turn directory goes, and what takes its name.
+        let moved = root.join("moved");
+        let attacker = root.join("attacker");
+        std::fs::create_dir_all(&attacker).unwrap();
+
+        // The stand-in encoder is the attacker: it swaps the directory out
+        // from under the path it was handed and then writes to that path,
+        // which is now a name in the attacker's directory.
+        let fake = root.join("fake-ffmpeg");
+        std::fs::write(
+            &fake,
+            format!(
+                "#!/bin/sh\nfor a in \"$@\"; do last=\"$a\"; done\nmv {turn} {moved}\n\
+                 ln -s {attacker} {turn}\nprintf 'ID3attacker output' > \"$last\"\n",
+                turn = turn_dir.display(),
+                moved = moved.display(),
+                attacker = attacker.display(),
+            ),
+        )
+        .unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        let inbound =
+            collect_inbound_attachments(&rest, &[&event], &turn_dir, Some(&fake), far_deadline())
+                .await;
+
+        // The subprocess really did write through the swapped name: the
+        // read-back is the only thing between those bytes and the engine.
+        assert_eq!(
+            std::fs::read(attacker.join("1-voice-note-1.mp3")).unwrap(),
+            b"ID3attacker output",
+            "the stand-in encoder wrote into the attacker's directory"
+        );
+
+        let AttachmentOutcome::Stored { local, .. } = &inbound.outcomes[0] else {
+            panic!("expected the envelope itself to be stored: {inbound:?}");
+        };
+        assert_eq!(
+            (local.filename.as_str(), local.mime_type.as_str()),
+            ("1-voice-note-1.mp4", "video/mp4"),
+            "the swapped output was not adopted"
+        );
+        assert!(
+            !local.path.starts_with(&attacker),
+            "the engine is not pointed into the attacker's directory: {}",
+            local.path.display()
+        );
+        let note = local.note.as_deref().unwrap_or_default();
+        assert!(
+            note.contains("extraction failed") && note.contains("empty"),
+            "the reserved file is what was read back, and it is empty: {note}"
+        );
+
+        // N1 from the same pass: the failing arm takes its reservation back
+        // out, so the directory the descriptor holds is left with the
+        // envelope alone rather than a 0-byte `.mp3` beside it.
+        let mut left: Vec<String> = std::fs::read_dir(&moved)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        left.sort();
+        assert_eq!(
+            left,
+            vec!["1-voice-note-1.mp4".to_string()],
+            "no reserved or partial file left behind"
+        );
+
+        let _ = std::fs::remove_file(&turn_dir);
+        let _ = std::fs::remove_dir_all(&attacker);
+        let _ = std::fs::remove_dir_all(&moved);
         let _ = std::fs::remove_dir_all(&root);
     }
 
