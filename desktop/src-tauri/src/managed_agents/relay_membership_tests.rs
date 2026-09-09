@@ -158,12 +158,17 @@ fn refusal_classification_table() {
         ("invalid nip-98 authorization", false),
         ("invalid: unknown kind", false),
         ("", false),
+        // `relay_membership_required` is a machine token, so it counts only
+        // when the relay put it in `error` on its own. A proxy page or a
+        // sentence that merely quotes it is somebody else talking.
+        (
+            "Bad Gateway: upstream returned relay_membership_required",
+            false,
+        ),
+        ("  Relay_Membership_Required  ", true),
     ];
     for (code, expected) in cases {
-        let refusal = crate::relay::RelayRefusal {
-            code: Some(code.to_string()),
-            detail: None,
-        };
+        let refusal = crate::relay::RelayRefusal::new(Some(code.to_string()), None);
         assert_eq!(
             refusal_is_about_authority(&refusal),
             expected,
@@ -172,10 +177,17 @@ fn refusal_classification_table() {
     }
     // The bridge sends the machine reason and a human sentence; either
     // half naming the refusal is enough.
-    assert!(refusal_is_about_authority(&crate::relay::RelayRefusal {
-        code: Some("relay_membership_required".into()),
-        detail: Some("You must be a relay member to access this relay".into()),
-    }));
+    assert!(refusal_is_about_authority(
+        &crate::relay::RelayRefusal::new(
+            Some("relay_membership_required".into()),
+            Some("You must be a relay member to access this relay".into()),
+        )
+    ));
+    // ...but the human half alone carrying the token is not the relay
+    // emitting the code, and the sentence says nothing about roles.
+    assert!(!refusal_is_about_authority(
+        &crate::relay::RelayRefusal::new(None, Some("relay_membership_required".into()),)
+    ));
 }
 
 /// The `Err -> Unknown` rule: a check that could not be completed must
@@ -268,6 +280,14 @@ mod stub_relay {
         /// When set, `/events` refuses every kind:9030 with this 400 JSON
         /// `error`, whatever the sender's role.
         events_refusal: Arc<Mutex<Option<String>>>,
+        /// When set, `/events` refuses every kind:9030 the way Buzz's own
+        /// relay does for an ordinary non-rejection: HTTP **200** with
+        /// `{"event_id", "accepted": false, "message"}` (`api/bridge.rs`
+        /// hands `ingest_event`'s own `result.message` straight back). This
+        /// is a different door from the 400 above, on a different branch of
+        /// `submit_signed_event_verdict_at_with_keys`, and it is the one the
+        /// relay this feature targets actually uses.
+        events_soft_refusal: Arc<Mutex<Option<String>>>,
     }
 
     /// The relay's own refusal for an unauthorized kind:9030, as the HTTP
@@ -347,6 +367,8 @@ mod stub_relay {
         let outage = events_outage.clone();
         let events_refusal: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
         let refusal = events_refusal.clone();
+        let events_soft_refusal: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+        let soft_refusal = events_soft_refusal.clone();
 
         let relay_keys = nostr::Keys::generate();
         let roster_event = {
@@ -425,6 +447,7 @@ mod stub_relay {
                     let stewards = stewards.clone();
                     let outage = outage.clone();
                     let refusal = refusal.clone();
+                    let soft_refusal = soft_refusal.clone();
                     let events_roster = events_roster.clone();
                     async move {
                         let json = [(CONTENT_TYPE, "application/json")];
@@ -467,6 +490,20 @@ mod stub_relay {
                                     serde_json::json!({ "error": reason }).to_string(),
                                 );
                             }
+                            // The success-status door: HTTP 200, `accepted`
+                            // false, the relay's words in `message`.
+                            if let Some(message) = soft_refusal.lock().unwrap().clone() {
+                                return (
+                                    StatusCode::OK,
+                                    json,
+                                    serde_json::json!({
+                                        "event_id": id,
+                                        "accepted": false,
+                                        "message": message,
+                                    })
+                                    .to_string(),
+                                );
+                            }
                         }
                         if is_admin_command && !stewards.contains(&sender) {
                             return (
@@ -500,6 +537,7 @@ mod stub_relay {
             posted,
             events_outage,
             events_refusal,
+            events_soft_refusal,
         }
     }
 
@@ -972,7 +1010,7 @@ mod stub_relay {
             detail.chars().count()
         );
         assert!(
-            !detail.contains(&"x".repeat(crate::relay::MAX_RELAY_TEXT_CHARS + 1)),
+            !detail.contains(&"x".repeat(crate::relay::refusal::MAX_RELAY_TEXT_CHARS + 1)),
             "the relay's text must be cut, not merely wrapped: {detail}"
         );
         // Bounded, not discarded: the classification and the surviving prefix
@@ -980,6 +1018,98 @@ mod stub_relay {
         assert!(
             detail.contains("actor not authorized"),
             "the relay's own words must survive the bound: {detail}"
+        );
+    }
+
+    /// The SECOND refusal door is bounded too, and it is the one Buzz's own
+    /// relay uses.
+    ///
+    /// `api/bridge.rs` answers `POST /events` with HTTP **200** and
+    /// `{"event_id", "accepted": false, "message"}`, carrying `ingest_event`'s
+    /// own message. That lands on a different branch of
+    /// `submit_signed_event_verdict_at_with_keys` than the 4xx the test above
+    /// drives, and that branch never touched `relay_error_details`, where the
+    /// bound used to live: a two-megabyte `message` went verbatim into
+    /// `relay-membership.json`, one row per agent on a fleet that multiplies.
+    /// The bound now lives in `RelayRefusal::new`, the type's only
+    /// constructor, so both doors inherit it and a third cannot be opened
+    /// without it.
+    #[tokio::test]
+    async fn a_huge_refusal_on_the_success_status_door_is_bounded_too() {
+        let admin = nostr::Keys::generate();
+        let relay = spawn_stub_relay(true, vec![(admin.public_key().to_hex(), "admin")]).await;
+        let huge = format!("actor not authorized: {}", "x".repeat(2 * 1024 * 1024));
+        *relay.events_soft_refusal.lock().unwrap() = Some(huge.clone());
+        let state = state_with_identity(&admin);
+
+        let outcome = ensure_managed_agent_relay_membership(&state, &relay.ws_url, AGENT)
+            .await
+            .expect("a 200 with accepted:false is an answer, not a transport failure");
+        let record =
+            membership_record_for_outcome(&outcome, "t".into()).expect("a refusal is persisted");
+        let detail = record.detail.unwrap_or_default();
+        assert!(
+            detail.chars().count() < 1_000,
+            "the persisted detail must be bounded on this door too, got {} chars",
+            detail.chars().count()
+        );
+        assert!(
+            !detail.contains(&"x".repeat(crate::relay::refusal::MAX_RELAY_TEXT_CHARS + 1)),
+            "the relay's text must be cut, not merely wrapped: {detail}"
+        );
+        assert!(
+            detail.contains("actor not authorized"),
+            "the relay's own words must survive the bound: {detail}"
+        );
+        // The raw run never reaches the record. Proven against the source
+        // string so the assertion cannot pass on a differently-shaped detail.
+        assert!(
+            !detail.contains(&huge),
+            "the unbounded refusal must not be persisted"
+        );
+    }
+
+    /// An empty capability list is not a NIP-11 document either.
+    ///
+    /// `{"supported_nips": []}` is genuinely an array, so a presence-and-type
+    /// check let it through onto `OpenRelay`, the one outcome that CLEARS
+    /// the sidecar row. NIP-11 has no relay supporting nothing and Buzz's own
+    /// always advertises at least NIP-1, so an empty list is an ingress or a
+    /// proxy answering in the relay's place, exactly like a missing field.
+    #[tokio::test]
+    async fn an_empty_capability_list_cannot_clear_the_membership_row() {
+        use axum::{http::StatusCode, routing::get, Router};
+
+        let app = Router::new().route(
+            "/info",
+            get(|| async {
+                (
+                    StatusCode::OK,
+                    serde_json::json!({ "supported_nips": [] }).to_string(),
+                )
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind stub relay");
+        let addr = listener.local_addr().expect("stub relay addr");
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.ok();
+        });
+
+        let state = state_with_identity(&nostr::Keys::generate());
+        let result =
+            ensure_managed_agent_relay_membership(&state, &format!("ws://{addr}"), AGENT).await;
+
+        let error = result.expect_err("an empty capability list says nothing about membership");
+        assert!(
+            error.contains("NIP-11"),
+            "the error must say what was missing: {error}"
+        );
+        assert_eq!(
+            membership_record_for_result(&Err(error), "t".into()).map(|record| record.state),
+            Some(RelayMembershipState::Unknown),
+            "an unanswered check keeps the row; only a real OpenRelay clears it"
         );
     }
 }

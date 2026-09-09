@@ -91,12 +91,20 @@ pub async fn submit_signed_event_verdict_at_with_keys(
 
     let result: SubmitEventResponse = parse_json_response(response).await?;
     if !result.accepted {
+        // The SECOND refusal door, and the one Buzz's own relay actually
+        // uses: `api/bridge.rs` answers `POST /events` with HTTP 200 and
+        // `{event_id, accepted, message}`, so an ordinary non-rejection
+        // refusal never reaches `relay_error_details` and never touched the
+        // bound that lives there. `RelayRefusal::new` applies it here too,
+        // and it is the only constructor, so this cannot drift again.
+        //
+        // The relay's `message` is a human sentence, not a machine code, so
+        // it goes in the `detail` half. `code_is` compares the machine-code
+        // half exactly; a sentence in it would be a category error.
+        let refusal = RelayRefusal::new(None, Some(result.message.clone()));
         return Ok(SubmitVerdict::Refused {
-            error: format!("relay rejected event: {}", result.message),
-            refusal: RelayRefusal {
-                code: Some(result.message.clone()),
-                detail: None,
-            },
+            error: format!("relay rejected event: {}", refusal.message()),
+            refusal,
         });
     }
 

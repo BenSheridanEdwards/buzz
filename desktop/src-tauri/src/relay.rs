@@ -282,67 +282,8 @@ fn extract_retry_in_hint(body: &str) -> Option<u64> {
     digits.parse::<u64>().ok()
 }
 
-/// The relay's own reason for refusing a request, parsed once from the JSON
-/// body it answered with.
-///
-/// The relay writes two different fields: `error` is the machine-readable
-/// reason a caller can branch on (`relay_membership_required` from the HTTP
-/// bridge's membership gate, `invalid: actor not authorized: ...` from
-/// `handlers/relay_admin.rs`), and `message` is the human sentence it
-/// sometimes adds. Callers that must classify a refusal read `code`; callers
-/// that show it to a user read `message()`. Neither re-parses a rendered
-/// string.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RelayRefusal {
-    /// The body's `error` field, verbatim.
-    pub code: Option<String>,
-    /// The body's `message` field, verbatim.
-    pub detail: Option<String>,
-}
-
-/// Longest run of relay-authored text kept from a refusal, in characters.
-///
-/// The relay writes `error` and `message` and nothing upstream bounds the
-/// body: `relay_error_details` reads it with `text()`, and this branch is the
-/// first thing to *persist* it. `membership_record_for_outcome` writes the
-/// refusal into `relay-membership.json` (one row per agent/relay pair, on a
-/// fleet that multiplies) and the card renders it on every summary pass. A
-/// relay answering megabytes would put megabytes there. Bound it at
-/// construction so every consumer inherits the bound: [`RelayRefusal::message`],
-/// [`RelayRefusal::haystack`], the rendered `relay returned <status>: <text>`
-/// string, and the `*_detail` copy that embeds it.
-pub const MAX_RELAY_TEXT_CHARS: usize = 200;
-
-/// `text` cut to [`MAX_RELAY_TEXT_CHARS`] characters on a char boundary, with
-/// a marker so a reader can tell the relay said more. Counted in `char`s, not
-/// bytes, so a multi-byte body can never split a code point.
-fn bound_relay_text(text: &str) -> String {
-    match text.char_indices().nth(MAX_RELAY_TEXT_CHARS) {
-        None => text.to_string(),
-        Some((cut, _)) => format!("{}... (truncated)", &text[..cut]),
-    }
-}
-
-impl RelayRefusal {
-    /// The text to show a user: the human `message` when the relay sent one,
-    /// else the machine reason.
-    pub fn message(&self) -> String {
-        self.detail
-            .clone()
-            .or_else(|| self.code.clone())
-            .unwrap_or_default()
-    }
-
-    /// Everything the relay said, lowercased, for classification.
-    pub fn haystack(&self) -> String {
-        format!(
-            "{} {}",
-            self.code.as_deref().unwrap_or(""),
-            self.detail.as_deref().unwrap_or("")
-        )
-        .to_ascii_lowercase()
-    }
-}
+pub mod refusal;
+pub use refusal::RelayRefusal;
 
 /// A non-2xx relay response, read once: the caller-facing string every
 /// existing call site already used, plus the relay's structured refusal when
@@ -430,29 +371,29 @@ pub async fn relay_error_details(response: reqwest::Response) -> RelayErrorDetai
     }
 
     if let Ok(value) = serde_json::from_str::<serde_json::Value>(&body) {
-        // Bounded HERE, at the one place a refusal is built, so the cap
-        // cannot be applied on one consumer and dropped from another: the
-        // rendered `error` string below is composed from these same two
-        // values, and so is everything the sidecar persists.
-        let code = value
-            .get("error")
-            .and_then(serde_json::Value::as_str)
-            .map(bound_relay_text);
-        let detail = value
-            .get("message")
-            .and_then(serde_json::Value::as_str)
-            .map(bound_relay_text);
-        if code.is_some() || detail.is_some() {
-            // Message first in the rendered string, unchanged: it is the
-            // sentence written for a human when the relay sends both.
-            let rendered = detail.as_deref().or(code.as_deref()).unwrap_or_default();
+        // Bounded by construction: `RelayRefusal::new` is the only way to
+        // build one (see `relay/refusal.rs`), so the cap cannot be applied on
+        // this door and dropped from another. The rendered `error` string
+        // below is composed from the same bounded values, and so is
+        // everything the sidecar persists.
+        let refusal = RelayRefusal::new(
+            value
+                .get("error")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string),
+            value
+                .get("message")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string),
+        );
+        if !refusal.is_silent() {
+            // `message()` is the human sentence when the relay sent both,
+            // unchanged: it is the one written for a reader.
             return RelayErrorDetails {
-                error: format!("relay returned {status}: {rendered}"),
+                error: format!("relay returned {status}: {}", refusal.message()),
                 // Only a client-side refusal is the relay's definitive answer
                 // about this request. A 5xx is an outage and must stay one.
-                refusal: status
-                    .is_client_error()
-                    .then_some(RelayRefusal { code, detail }),
+                refusal: status.is_client_error().then_some(refusal),
             };
         }
     }
@@ -738,17 +679,22 @@ pub async fn sync_managed_agent_profile(
     // the first candidate, so nothing moves back), it happens once, it lands
     // on the nicer handle, and mentions bind pubkeys rather than handles, so
     // a moved handle breaks no reference.
+    //
+    // The handle itself is a different matter, and it is why this read has a
+    // SECOND source. `resolve_managed_agent_nip05` keeps whatever handle the
+    // agent already carries when the well-known cannot confirm it, and this
+    // read is the only place it learns that handle. Both reads address the
+    // same host, so when one ingress fault takes both, a hint that degrades
+    // to `None` published a kind:0 with no `nip05` and the relay CLEARED the
+    // agent's handle, on precisely the relay where the workspace read is
+    // always refused. `read_agent_profile_advisory` asks again as the AGENT,
+    // the identity the relay does admit, so the fallback has a source that
+    // does not depend on the refused read.
     let agent_pubkey = agent_keys.public_key().to_hex();
-    let existing = match query_agent_profile(state, relay_url, &agent_pubkey).await {
-        Ok(profile) => profile.and_then(|info| info.nip05),
-        Err(error) => {
-            eprintln!(
-                "buzz-desktop: could not read {agent_pubkey} kind:0 before profile sync, \
-                 publishing without the existing-handle hint: {error}"
-            );
-            None
-        }
-    };
+    let existing =
+        read_agent_profile_advisory(state, relay_url, Some(agent_keys), &agent_pubkey, auth_tag)
+            .await
+            .and_then(|info| info.nip05);
     let nip05 = nip05::resolve_managed_agent_nip05(
         state,
         relay_url,
@@ -836,23 +782,105 @@ pub async fn query_agent_profile(
     relay_url: &str,
     agent_pubkey: &str,
 ) -> Result<Option<AgentProfileInfo>, String> {
-    let filter = serde_json::json!({
+    let events = query_relay_at(
+        state,
+        &relay_http_base_url(relay_url),
+        &[agent_profile_filter(agent_pubkey)],
+    )
+    .await?;
+    Ok(parse_agent_profile(&events))
+}
+
+/// [`query_agent_profile`] authenticated as the AGENT rather than as the
+/// workspace identity, carrying the agent's NIP-OA auth tag when it has one.
+///
+/// Same filter, same parse, different subject on the NIP-98 header, which is
+/// the whole point on a closed relay, where those two identities have
+/// different standing.
+pub async fn query_agent_profile_with_keys(
+    state: &AppState,
+    relay_url: &str,
+    agent_keys: &Keys,
+    auth_tag: Option<&str>,
+) -> Result<Option<AgentProfileInfo>, String> {
+    let events = query_relay_at_with_keys(
+        state,
+        &relay_http_base_url(relay_url),
+        &[agent_profile_filter(&agent_keys.public_key().to_hex())],
+        agent_keys,
+        auth_tag,
+    )
+    .await?;
+    Ok(parse_agent_profile(&events))
+}
+
+/// The agent's own kind:0, read as the workspace identity and, when that read
+/// cannot be completed, as the AGENT.
+///
+/// Advisory in both directions: a failure is logged and yields `None`,
+/// exactly as each call site did on its own before. What changes is that
+/// there is now a second source, and it is the one that works on the relay
+/// this feature exists for.
+///
+/// Why a second source is needed at all. The workspace read is refused on a
+/// relay closed to the desktop identity (the operator ran
+/// `buzz-admin add-member --pubkey <agent hex>`, so the AGENT is a member and
+/// the desktop is not) and that refusal is not transient: it repeats on
+/// every publish and every reconcile for as long as the user is not a member.
+/// The profile this read precedes carries the handle, and kind:0 is absolute
+/// state, so a publish with no `nip05` CLEARS the handle the relay holds.
+/// `resolve_managed_agent_nip05` keeps whatever handle the agent already
+/// carries when the well-known cannot confirm it, but the only place it
+/// learned that handle was this read. Both reads address the same host, so a
+/// single ingress fault took both, and the sentence "keeps the handle the
+/// agent already carries" was true everywhere except the relay it was
+/// written for. Asking again as the agent gives the fallback a source that
+/// does not depend on the refused read.
+pub async fn read_agent_profile_advisory(
+    state: &AppState,
+    relay_url: &str,
+    agent_keys: Option<&Keys>,
+    agent_pubkey: &str,
+    auth_tag: Option<&str>,
+) -> Option<AgentProfileInfo> {
+    let workspace_error = match query_agent_profile(state, relay_url, agent_pubkey).await {
+        Ok(profile) => return profile,
+        Err(error) => error,
+    };
+    let Some(agent_keys) = agent_keys else {
+        eprintln!(
+            "buzz-desktop: could not read {agent_pubkey} kind:0 as the workspace identity and \
+             have no agent keys to ask again with: {workspace_error}"
+        );
+        return None;
+    };
+    match query_agent_profile_with_keys(state, relay_url, agent_keys, auth_tag).await {
+        Ok(profile) => profile,
+        Err(agent_error) => {
+            eprintln!(
+                "buzz-desktop: could not read {agent_pubkey} kind:0 as the workspace identity \
+                 ({workspace_error}) nor as the agent ({agent_error}), publishing without the \
+                 existing-profile hint"
+            );
+            None
+        }
+    }
+}
+
+/// The one filter both reads use.
+fn agent_profile_filter(agent_pubkey: &str) -> serde_json::Value {
+    serde_json::json!({
         "authors": [agent_pubkey],
         "kinds": [0],
         "limit": 1
-    });
+    })
+}
 
-    let events = query_relay_at(state, &relay_http_base_url(relay_url), &[filter]).await?;
-
-    let Some(event) = events.first() else {
-        return Ok(None);
-    };
-
-    let Ok(content) = serde_json::from_str::<serde_json::Value>(&event.content) else {
-        return Ok(None);
-    };
-
-    Ok(Some(AgentProfileInfo {
+/// The one parse both reads use.
+fn parse_agent_profile(events: &[nostr::Event]) -> Option<AgentProfileInfo> {
+    let event = events.first()?;
+    let content = serde_json::from_str::<serde_json::Value>(&event.content).ok()?;
+    Some(AgentProfileInfo {
         display_name: content
             .get("display_name")
             .and_then(|v| v.as_str())
@@ -871,7 +899,7 @@ pub async fn query_agent_profile(
             .map(str::trim)
             .filter(|v| !v.is_empty())
             .map(str::to_string),
-    }))
+    })
 }
 
 /// Parsed fields from a kind:0 profile event.
@@ -933,15 +961,25 @@ pub async fn relay_advertises_membership_at(
     }
 
     let document = parse_json_response::<serde_json::Value>(response).await?;
-    let Some(supported_nips) = document
+    // Present, an array, and NON-EMPTY. An empty list is as non-conforming as
+    // a missing field: NIP-11 has no relay that supports nothing, and Buzz's
+    // own always advertises at least NIP-1. `{"supported_nips": []}` from an
+    // ingress or a proxy is genuinely an array, so a presence-and-type check
+    // alone let it through onto `OpenRelay`, the one outcome that CLEARS the
+    // agent's membership sidecar row, registers nothing, and leaves no card
+    // at all. An error keeps the row `Unknown` and the next start retries.
+    let supported_nips = match document
         .get("supported_nips")
         .and_then(serde_json::Value::as_array)
-    else {
-        return Err(
-            "the relay answered /info with something that is not a NIP-11 document \
-             (no supported_nips list), so it did not say whether it is open"
-                .to_string(),
-        );
+    {
+        Some(nips) if !nips.is_empty() => nips,
+        _ => {
+            return Err(
+                "the relay answered /info with something that is not a NIP-11 document \
+                 (no non-empty supported_nips list), so it did not say whether it is open"
+                    .to_string(),
+            )
+        }
     };
     // A stringly-typed `"43"` counts too. NIP-11 says numbers and Buzz's own
     // relay emits numbers, so this only fires for a non-conforming document,

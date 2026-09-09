@@ -717,7 +717,15 @@ async fn a_4xx_json_body_keeps_the_relays_own_error_and_message() {
     let details = super::relay_error_details(response).await;
 
     let refusal = details.refusal.expect("a 4xx JSON body is a refusal");
-    assert_eq!(refusal.code.as_deref(), Some("relay_membership_required"));
+    // Compared against the only constructor: `RelayRefusal`'s fields are
+    // private precisely so no door can fill them without the bound.
+    assert_eq!(
+        refusal,
+        super::RelayRefusal::new(
+            Some("relay_membership_required".to_string()),
+            Some("You must be a relay member to access this relay".to_string()),
+        )
+    );
     assert_eq!(
         refusal.message(),
         "You must be a relay member to access this relay",
@@ -751,7 +759,14 @@ async fn an_error_only_body_reports_that_error_as_both() {
         "invalid: actor not authorized: must be admin or owner",
         "with no human sentence the machine reason is the message"
     );
-    assert_eq!(refusal.detail, None);
+    assert_eq!(
+        refusal,
+        super::RelayRefusal::new(
+            Some("invalid: actor not authorized: must be admin or owner".to_string()),
+            None,
+        ),
+        "an error-only body leaves the human-sentence half empty"
+    );
 }
 
 #[tokio::test]
@@ -795,6 +810,7 @@ async fn an_outage_is_never_a_refusal() {
 
 #[cfg(not(target_os = "windows"))]
 mod profile_sync_stub_relay {
+    use nostr::JsonUtil;
     use std::sync::{Arc, Mutex};
 
     /// Stub relay for the "closed to the desktop, open to the agent" shape
@@ -812,14 +828,50 @@ mod profile_sync_stub_relay {
         spawn_stub_relay(QueryDoor::RefusesTheDesktop, WellKnown::EmptyNames).await
     }
 
-    /// How the stub answers the desktop's `POST /query`.
-    #[derive(Clone, Copy)]
+    /// How the stub answers a `POST /query`.
+    #[derive(Clone)]
     enum QueryDoor {
         /// The bridge's membership refusal: the operator admitted the agent,
         /// not the desktop.
         RefusesTheDesktop,
         /// A perfectly ordinary empty answer: this agent has no kind:0 yet.
         AnswersEmpty,
+        /// The recipe's step-4 relay told apart by WHO is asking. The
+        /// operator ran `buzz-admin add-member --pubkey <agent hex>`, so the
+        /// relay refuses the desktop identity at the door and answers the
+        /// AGENT, which is the whole point of the agent-authenticated
+        /// fallback read. Carries the agent's hex and the kind:0 JSON the
+        /// relay already holds for it.
+        RefusesTheDesktopAnswersTheAgent {
+            agent_hex: String,
+            existing_kind_0: String,
+        },
+    }
+
+    /// The pubkey that signed a request's NIP-98 `Authorization` header, or
+    /// an empty string when there is none. The stub tells the desktop and the
+    /// agent apart exactly the way a real relay does.
+    fn nip98_sender(headers: &axum::http::HeaderMap) -> String {
+        use base64::Engine as _;
+
+        let Some(encoded) = headers
+            .get(axum::http::header::AUTHORIZATION)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.strip_prefix("Nostr "))
+        else {
+            return String::new();
+        };
+        base64::engine::general_purpose::STANDARD
+            .decode(encoded.trim())
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+            .and_then(|event| {
+                event
+                    .get("pubkey")
+                    .and_then(|value| value.as_str())
+                    .map(str::to_ascii_lowercase)
+            })
+            .unwrap_or_default()
     }
 
     /// How the stub answers `GET /.well-known/nostr.json`.
@@ -841,6 +893,23 @@ mod profile_sync_stub_relay {
         query: QueryDoor,
         well_known: WellKnown,
     ) -> (String, Arc<Mutex<Vec<serde_json::Value>>>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind stub relay");
+        spawn_stub_relay_on(listener, query, well_known).await
+    }
+
+    /// [`spawn_stub_relay`] on a listener the caller already bound.
+    ///
+    /// A test that needs the relay's own domain BEFORE the relay exists (to
+    /// build the handle the relay is supposed to be holding) binds first and
+    /// serves on the same socket, so there is no unbind/rebind window another
+    /// process could take the port in.
+    async fn spawn_stub_relay_on(
+        listener: tokio::net::TcpListener,
+        query: QueryDoor,
+        well_known: WellKnown,
+    ) -> (String, Arc<Mutex<Vec<serde_json::Value>>>) {
         use axum::{
             http::header::CONTENT_TYPE, http::StatusCode, routing::get, routing::post, Router,
         };
@@ -850,9 +919,10 @@ mod profile_sync_stub_relay {
         let app = Router::new()
             .route(
                 "/query",
-                post(move || async move {
-                    match query {
-                        QueryDoor::RefusesTheDesktop => (
+                post(move |headers: axum::http::HeaderMap| {
+                    let query = query.clone();
+                    async move {
+                        let refused = (
                             StatusCode::FORBIDDEN,
                             [(CONTENT_TYPE, "application/json")],
                             serde_json::json!({
@@ -860,12 +930,29 @@ mod profile_sync_stub_relay {
                                 "message": "You must be a relay member to access this relay"
                             })
                             .to_string(),
-                        ),
-                        QueryDoor::AnswersEmpty => (
-                            StatusCode::OK,
-                            [(CONTENT_TYPE, "application/json")],
-                            "[]".to_string(),
-                        ),
+                        );
+                        match query {
+                            QueryDoor::RefusesTheDesktop => refused,
+                            QueryDoor::AnswersEmpty => (
+                                StatusCode::OK,
+                                [(CONTENT_TYPE, "application/json")],
+                                "[]".to_string(),
+                            ),
+                            QueryDoor::RefusesTheDesktopAnswersTheAgent {
+                                agent_hex,
+                                existing_kind_0,
+                            } => {
+                                if nip98_sender(&headers) == agent_hex.to_ascii_lowercase() {
+                                    (
+                                        StatusCode::OK,
+                                        [(CONTENT_TYPE, "application/json")],
+                                        format!("[{existing_kind_0}]"),
+                                    )
+                                } else {
+                                    refused
+                                }
+                            }
+                        }
                     }
                 }),
             )
@@ -912,9 +999,6 @@ mod profile_sync_stub_relay {
                     }
                 }),
             );
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("bind stub relay");
         let addr = listener.local_addr().expect("stub relay addr");
         tokio::spawn(async move {
             axum::serve(listener, app).await.ok();
@@ -1076,6 +1160,91 @@ mod profile_sync_stub_relay {
                 "a {status} on the well-known must republish the handle unchanged, never strip it"
             );
         }
+    }
+
+    /// Both reads failing together must still keep the handle, and on the
+    /// relay this feature exists for, both reads failing together is the
+    /// NORMAL case, not an edge one.
+    ///
+    /// The pre-publish kind:0 read authenticates as the WORKSPACE identity,
+    /// and on a relay closed to the desktop that read is refused on every
+    /// publish and every reconcile, permanently: the operator ran
+    /// `buzz-admin add-member --pubkey <agent hex>`, so the agent is a member
+    /// and the desktop is not. That left `resolve_managed_agent_nip05` with
+    /// no `existing_handle` at all, so when the well-known ALSO could not
+    /// answer (same host, so one ingress fault takes both), the fallback had
+    /// nothing to keep, the kind:0 went out with no `nip05`, and the relay
+    /// CLEARED the handle it was holding.
+    ///
+    /// The fix gives the fallback a source the closed relay does admit: ask
+    /// again as the AGENT. This drives the real `sync_managed_agent_profile`
+    /// against a stub that refuses the desktop at `/query`, answers the same
+    /// query for the agent with the kind:0 it already holds, and 502s the
+    /// well-known.
+    #[tokio::test]
+    async fn both_reads_failing_together_still_keeps_the_agents_handle() {
+        let agent = nostr::Keys::generate();
+        let agent_hex = agent.public_key().to_hex();
+
+        // Bind first so the handle in the relay's stored kind:0 carries this
+        // relay's own domain: `unconfirmable_handle` drops a handle from
+        // another relay, correctly, and that must not be what this test
+        // observes. The same listener is then served on, so there is no
+        // window where the port is free.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind stub relay");
+        let addr = listener.local_addr().expect("stub relay addr");
+        let existing_handle = format!(
+            "bob-a1f3@{}",
+            crate::relay::nip05::nip05_domain(&format!("ws://{addr}"))
+        );
+
+        let stored = nostr::EventBuilder::new(
+            nostr::Kind::Custom(0),
+            serde_json::json!({
+                "display_name": "Bob",
+                "nip05": existing_handle,
+            })
+            .to_string(),
+        )
+        .sign_with_keys(&agent)
+        .expect("sign the agent's existing kind:0")
+        .as_json();
+
+        let (relay, posted) = spawn_stub_relay_on(
+            listener,
+            QueryDoor::RefusesTheDesktopAnswersTheAgent {
+                agent_hex: agent_hex.clone(),
+                existing_kind_0: stored,
+            },
+            WellKnown::Status(502),
+        )
+        .await;
+        let state = crate::app_state::build_app_state();
+
+        crate::relay::sync_managed_agent_profile(&state, &relay, &agent, "Bob", None, None, None)
+            .await
+            .unwrap_or_else(|error| panic!("neither read is a gate: {error}"));
+
+        let events = posted.lock().unwrap();
+        let profile = events
+            .iter()
+            .find(|event| event.get("kind").and_then(serde_json::Value::as_u64) == Some(0))
+            .unwrap_or_else(|| panic!("no kind:0 was posted; got {events:?}"));
+        let content: serde_json::Value = serde_json::from_str(
+            profile
+                .get("content")
+                .and_then(|value| value.as_str())
+                .unwrap_or(""),
+        )
+        .expect("kind:0 content is JSON");
+        assert_eq!(
+            content.get("nip05").and_then(|value| value.as_str()),
+            Some(existing_handle.as_str()),
+            "kind:0 is absolute state, so a publish without the handle strips \
+             it; the agent-authenticated read is what keeps it: {content}"
+        );
     }
 
     /// With nothing to protect, an unanswerable well-known publishes no

@@ -110,9 +110,20 @@ pub enum RelayMembershipOutcome {
 /// (`api/mod.rs`, `enforce_relay_membership`). Everything else the same 4xx
 /// door emits (clock skew, a ban, a NIP-98 failure) refuses the command
 /// without saying anything about roles.
+///
+/// The two are matched differently because the relay writes them
+/// differently. `actor not authorized` is the head of a sentence the relay
+/// composes (`actor not authorized: must be admin or owner`, prefixed with
+/// `invalid: ` by the ingest path), so it is matched as a substring of what
+/// the relay said. `relay_membership_required` is a machine token the relay
+/// emits in the body's `error` field and nowhere else (`api/mod.rs`,
+/// `enforce_relay_membership`), so it is compared to that field exactly: a
+/// proxied error page or a human sentence that merely quotes the token is not
+/// the relay answering with it, and reading it as one sends the user to an
+/// operator with a command that could never clear the card.
 pub fn refusal_is_about_authority(refusal: &crate::relay::RelayRefusal) -> bool {
-    let said = refusal.haystack();
-    said.contains("actor not authorized") || said.contains("relay_membership_required")
+    refusal.haystack().contains("actor not authorized")
+        || refusal.code_is("relay_membership_required")
 }
 
 /// Turn a relay refusal into the outcome it justifies.

@@ -195,7 +195,7 @@ pub(crate) async fn reconcile_agent_profile<R: tauri::Runtime>(
     agent_pubkey: &str,
     data: &ProfileReconcileData,
 ) -> Result<ProfileReconcileOutcome, String> {
-    use crate::relay::{query_agent_profile, sync_managed_agent_profile_with_nip05};
+    use crate::relay::sync_managed_agent_profile_with_nip05;
 
     // Resolved ONCE and used for both the read and the write-back. A pinned
     // `target_relay_url` wins unconditionally — see `resolve_reconcile_relay`.
@@ -235,19 +235,25 @@ pub(crate) async fn reconcile_agent_profile<R: tauri::Runtime>(
     // Degrading to "no existing profile" is the honest reading of a read that
     // did not happen, and it is idempotent: `profile_needs_sync` returns true
     // and the publish below republishes the profile the desktop already knows
-    // it wants. The one thing the read protects, the handle, is protected
-    // separately by `resolve_managed_agent_nip05`, which keeps the existing
-    // handle when its own confirmation cannot be completed.
-    let existing = match query_agent_profile(state, &relay_url, agent_pubkey).await {
-        Ok(existing) => existing,
-        Err(error) => {
-            eprintln!(
-                "buzz-desktop: could not read {agent_pubkey} kind:0 before reconciling on \
-                 {relay_url}, republishing the expected profile instead: {error}"
-            );
-            None
-        }
-    };
+    // it wants.
+    //
+    // The handle is the exception, and it is why the read is asked twice.
+    // `resolve_managed_agent_nip05` keeps the handle the agent already
+    // carries when its own confirmation cannot be completed, and this read is
+    // the only place it learns that handle, so when the well-known fails
+    // too, which on one host is the same fault, degrading to `None` published
+    // a kind:0 with no `nip05` and CLEARED the handle. Asking again as the
+    // AGENT (`read_agent_profile_advisory`) gives it a source the closed
+    // relay does admit. Keys parsed leniently here: a record whose nsec will
+    // not parse still reaches the hard parse below, with the same error.
+    let existing = crate::relay::read_agent_profile_advisory(
+        state,
+        &relay_url,
+        Keys::parse(&data.private_key_nsec).ok().as_ref(),
+        agent_pubkey,
+        data.auth_tag.as_deref(),
+    )
+    .await;
 
     // Resolve the expected avatar — backfilling for legacy records that have no
     // stored avatar_url yet.

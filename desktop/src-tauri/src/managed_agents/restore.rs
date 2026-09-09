@@ -105,13 +105,17 @@ async fn preflight_relay_membership_for_restore(
     agents_to_start: &[super::ManagedAgentRecord],
     workspace_relay: &str,
 ) {
-    let memberships = super::load_relay_memberships(&match managed_agents_base_dir(app) {
+    // Resolved as its own statement: an early `return` buried in the
+    // scrutinee of a call argument is a control-flow exit a reader has to
+    // find inside an expression.
+    let base_dir = match managed_agents_base_dir(app) {
         Ok(base_dir) => base_dir,
         Err(error) => {
             eprintln!("buzz-desktop: relay membership preflight skipped on restore: {error}");
             return;
         }
-    });
+    };
+    let memberships = super::load_relay_memberships(&base_dir);
 
     let pending: Vec<(String, String)> = agents_to_start
         .iter()
