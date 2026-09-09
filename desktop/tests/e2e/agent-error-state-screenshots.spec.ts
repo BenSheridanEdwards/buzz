@@ -6,12 +6,9 @@
  *     with a lastError / lastErrorCode and explicit Offline presence.
  *   - Online/Away presence taking precedence over a stopped record's error.
  *
- * ManagedAgentRow (StatusBlock text) is also exercised here even though it is
- * not yet wired into a reachable route in the main app — it will be connected
- * in the follow-up config-bridge PR.  We render it in isolation by navigating
- * to the agents view and letting the mock bridge expose the row through the
- * unified section once that wiring lands; for now we capture the card badges
- * which ARE reachable in the current build.
+ * The old ManagedAgentRow surface this note used to describe was never wired
+ * into a reachable route and has since been deleted; only the card badges
+ * captured below are reachable, and they are what this spec asserts.
  */
 
 import { expect, test } from "@playwright/test";

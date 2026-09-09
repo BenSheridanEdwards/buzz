@@ -8,7 +8,10 @@ import {
 import { resolveAgentCardModelLabel } from "@/features/agents/lib/agentCardModelLabel";
 import { effectiveAgentDescription } from "@/features/agents/lib/agentDescription";
 import { friendlyAgentLastError } from "@/features/agents/lib/friendlyAgentLastError";
-import { relayMembershipNotice } from "@/features/agents/lib/relayMembership";
+import {
+  relayMembershipNotice,
+  workspaceRelayMembershipNotices,
+} from "@/features/agents/lib/relayMembership";
 import type { AgentAvailabilityReader } from "@/features/agents/lib/useAgentAvailability";
 import { isManagedAgentActive } from "@/features/agents/lib/managedAgentControlActions";
 import { pickProfileAgent } from "@/features/agents/lib/pickProfileAgent";
@@ -27,6 +30,7 @@ import { AgentIdentityCard } from "./AgentIdentityCard";
 import { AgentRuntimeAvatarControl } from "./AgentRuntimeAvatarControl";
 import { CreateIdentityCard } from "./CreateIdentityCard";
 import { PersonaActionsMenu } from "./PersonaActionsMenu";
+import { RelayMembershipBlock } from "./RelayMembershipBlock";
 import { buildUnifiedGroups } from "./unifiedAgentGroups";
 
 type UnifiedAgentsSectionProps = {
@@ -110,6 +114,14 @@ export function UnifiedAgentsSection(props: UnifiedAgentsSectionProps) {
     () => buildUnifiedGroups(personas, agents, isArchived),
     [personas, agents, isArchived],
   );
+  // Every distinct user-level refusal across the whole section, not just the
+  // biggest: the agent rows suppress workspace-subject notices unconditionally,
+  // so a group dropped here is an agent whose npub and operator command no
+  // component renders at all.
+  const workspaceNotices = React.useMemo(
+    () => workspaceRelayMembershipNotices(agents),
+    [agents],
+  );
   const [collapsed, setCollapsed] = React.useState<Set<string>>(new Set());
   function toggle(key: string) {
     setCollapsed((prev) => {
@@ -133,6 +145,25 @@ export function UnifiedAgentsSection(props: UnifiedAgentsSectionProps) {
 
       {!isLoading ? (
         <div className="space-y-3" data-testid="unified-agents-groups">
+          {/*
+            A relay that refused the WORKSPACE identity refused it once, for
+            every agent below: same npub, same operator command, same remedy.
+            Rendered per card it would be one identical amber block per agent
+            for a single problem that is not any agent's, so it renders here,
+            once per distinct problem, above the agents it holds up.
+
+            This is the feature's only recovery affordance. It lived in a
+            component nothing imported until this render existed, which made
+            the npub and the `buzz-admin add-member` command unreachable in
+            the running app.
+          */}
+          {workspaceNotices.map(({ notice, agentCount }) => (
+            <RelayMembershipBlock
+              agentCount={agentCount}
+              key={`${notice.subjectHex}|${notice.severity}`}
+              notice={notice}
+            />
+          ))}
           <div className={IDENTITY_CARD_GRID_CLASS}>
             <CreateIdentityCard
               ariaLabel="New agent"
@@ -371,9 +402,10 @@ function AgentPersonaCard({
 }
 
 /**
- * Card-face badge for an agent a closed relay will not let publish. The
- * full explanation, npub and operator command live in the agent's runtime
- * row (`ManagedAgentRow`), which the card opens.
+ * Card-face badge for an agent a closed relay will not let publish. The full
+ * explanation, npub and operator command live in the `RelayMembershipBlock`
+ * this section renders above the grid, so the badge names the problem and the
+ * block carries the way out of it.
  */
 function RelayMembershipBadge({ agent }: { agent: ManagedAgent }) {
   const notice = relayMembershipNotice(agent.pubkey, agent.relayMembership);
