@@ -6,10 +6,10 @@ import { describe, it } from "node:test";
 // `shared/api/relayMembershipTypes` and is covered by its own test.
 import {
   RELAY_CONTAINER_PLACEHOLDER,
+  noticeGroupKey,
   relayAddMemberCommand,
   relayMembershipNotice,
-  rowRelayMembershipNotice,
-  workspaceRelayMembershipNotices,
+  relayMembershipNoticeGroups,
 } from "./relayMembership.ts";
 
 const AGENT_HEX =
@@ -153,7 +153,7 @@ describe("relayMembership card notice", () => {
   });
 });
 
-describe("workspace-level relay membership notice", () => {
+describe("relay membership notice groups", () => {
   const OTHER_AGENT_HEX =
     "b2e4d1c0ffee00000000000000000000000000000000000000000000000face1";
   const THIRD_AGENT_HEX =
@@ -168,7 +168,7 @@ describe("workspace-level relay membership notice", () => {
   });
 
   it("collapses one refusal of the user into a single notice for the group", () => {
-    const groups = workspaceRelayMembershipNotices([
+    const groups = relayMembershipNoticeGroups([
       { pubkey: AGENT_HEX, relayMembership: refusedByRelay(USER_HEX) },
       { pubkey: OTHER_AGENT_HEX, relayMembership: refusedByRelay(USER_HEX) },
     ]);
@@ -178,26 +178,83 @@ describe("workspace-level relay membership notice", () => {
     assert.equal(groups[0].notice.command, relayAddMemberCommand(USER_HEX));
   });
 
-  it("leaves an agent-level refusal to the agent's own row", () => {
-    assert.deepEqual(
-      workspaceRelayMembershipNotices([
-        {
-          pubkey: AGENT_HEX,
-          relayMembership: {
-            state: "not_member",
-            checkedAt: "t",
-            detail: null,
-          },
+  // The agent subject has no second renderer to fall back on: this list is
+  // the only thing the section maps over, so an agent-level refusal missing
+  // from it is a card with a badge and no way out.
+  it("gives an agent-level refusal its own group, with the agent's remedy", () => {
+    const groups = relayMembershipNoticeGroups([
+      {
+        pubkey: AGENT_HEX,
+        name: "Bob",
+        relayMembership: {
+          state: "not_member",
+          checkedAt: "t",
+          detail: "the relay does not list this agent",
         },
-      ]),
-      [],
-    );
-    assert.deepEqual(workspaceRelayMembershipNotices([]), []);
+      },
+    ]);
+    assert.equal(groups.length, 1);
+    assert.equal(groups[0].notice.subject, "agent");
+    assert.equal(groups[0].notice.npubLabel, "Agent npub");
+    assert.equal(groups[0].notice.command, relayAddMemberCommand(AGENT_HEX));
+    assert.deepEqual(groups[0].agentNames, ["Bob"]);
+    assert.equal(groups[0].agentCount, 1);
+  });
+
+  it("has nothing to render when no agent carries a notice", () => {
+    assert.deepEqual(relayMembershipNoticeGroups([]), []);
     assert.deepEqual(
-      workspaceRelayMembershipNotices([
+      relayMembershipNoticeGroups([
         { pubkey: AGENT_HEX, relayMembership: null },
       ]),
       [],
+    );
+  });
+
+  // Two agents refused in their own right are two remedies, never one card
+  // speaking for both: the `add-member` names one agent's hex.
+  it("never merges two agent-subject refusals", () => {
+    const groups = relayMembershipNoticeGroups([
+      {
+        pubkey: AGENT_HEX,
+        relayMembership: { state: "not_member", checkedAt: "t", detail: "no" },
+      },
+      {
+        pubkey: OTHER_AGENT_HEX,
+        relayMembership: { state: "not_member", checkedAt: "t", detail: "no" },
+      },
+    ]);
+    assert.equal(groups.length, 2);
+    assert.deepEqual(
+      groups.map((group) => group.notice.command).sort(),
+      [
+        relayAddMemberCommand(AGENT_HEX),
+        relayAddMemberCommand(OTHER_AGENT_HEX),
+      ].sort(),
+    );
+  });
+
+  // The subject is part of the key as well as the hex. A workspace refusal of
+  // an identity and an agent refusal of an agent that happen to share a hex
+  // are two different problems with two different labels and two different
+  // sentences, so they must never land in one card.
+  it("keys the subject, so one hex refused both ways is two cards", () => {
+    const groups = relayMembershipNoticeGroups([
+      { pubkey: AGENT_HEX, relayMembership: refusedByRelay(AGENT_HEX) },
+      {
+        pubkey: AGENT_HEX,
+        relayMembership: { state: "not_member", checkedAt: "t", detail: "no" },
+      },
+    ]);
+    assert.equal(groups.length, 2);
+    assert.deepEqual(groups.map((group) => group.notice.subject).sort(), [
+      "agent",
+      "workspace",
+    ]);
+    assert.equal(
+      new Set(groups.map(({ notice }) => noticeGroupKey(notice))).size,
+      2,
+      "the render key must separate them exactly as the grouping did",
     );
   });
 
@@ -208,7 +265,7 @@ describe("workspace-level relay membership notice", () => {
   it("never merges refusals of two different identities, and drops neither", () => {
     const other =
       "cafebabe00000000000000000000000000000000000000000000000000001234";
-    const groups = workspaceRelayMembershipNotices([
+    const groups = relayMembershipNoticeGroups([
       { pubkey: AGENT_HEX, relayMembership: refusedByRelay(USER_HEX) },
       { pubkey: OTHER_AGENT_HEX, relayMembership: refusedByRelay(USER_HEX) },
       { pubkey: THIRD_AGENT_HEX, relayMembership: refusedByRelay(other) },
@@ -230,7 +287,7 @@ describe("workspace-level relay membership notice", () => {
   // they collapsed into whichever arrived first, so a genuinely blocked agent
   // could be counted into a grey card that offers no way out.
   it("does not collapse two severities on one identity into one card", () => {
-    const groups = workspaceRelayMembershipNotices([
+    const groups = relayMembershipNoticeGroups([
       {
         pubkey: AGENT_HEX,
         relayMembership: {
@@ -257,7 +314,7 @@ describe("workspace-level relay membership notice", () => {
   // `safeNpub` returns null for anything it cannot encode, so grouping on the
   // rendered npub gave every malformed subject the same key.
   it("keys on the subject hex, so two malformed subjects are two cards", () => {
-    const groups = workspaceRelayMembershipNotices([
+    const groups = relayMembershipNoticeGroups([
       { pubkey: AGENT_HEX, relayMembership: refusedByRelay("not-hex-1") },
       { pubkey: OTHER_AGENT_HEX, relayMembership: refusedByRelay("not-hex-2") },
     ]);
@@ -281,7 +338,7 @@ describe("workspace-level relay membership notice", () => {
   // saying the problem holds up N agents, attributing one relay answer to
   // every agent in the group.
   it("renders only the part of the relay's sentence the group shares", () => {
-    const [group] = workspaceRelayMembershipNotices([
+    const [group] = relayMembershipNoticeGroups([
       {
         pubkey: AGENT_HEX,
         relayMembership: refusedByRelay(USER_HEX, "Relay said: alpha failed"),
@@ -298,7 +355,7 @@ describe("workspace-level relay membership notice", () => {
       "a differing sentence is cut back to what is true for both",
     );
 
-    const [same] = workspaceRelayMembershipNotices([
+    const [same] = relayMembershipNoticeGroups([
       {
         pubkey: AGENT_HEX,
         relayMembership: refusedByRelay(USER_HEX, "Relay said: the same"),
@@ -322,15 +379,22 @@ describe("who renders the membership block", () => {
   const OTHER_USER_HEX =
     "cafebabe00000000000000000000000000000000000000000000000000001234";
 
-  // Exactly one owner, always. Both would show the user the same amber block
-  // twice; neither would drop the npub and the operator command entirely,
-  // which is the only way out of the state the block describes.
+  // Exactly one owner, always, and now there is only one renderer to be that
+  // owner. The invariant used to be split across this function and a
+  // `rowRelayMembershipNotice` helper, and the two were asserted to be
+  // complementary here; when the component that called the helper was
+  // deleted, the helper went on satisfying this test with no caller at all
+  // and the agent subject rendered a badge and nothing else. Whether the
+  // groups actually REACH the DOM is not something this file can see, which
+  // is the whole reason `UnifiedAgentsSectionRelayMembership.test.mjs` mounts
+  // the section; what this file pins is that no agent with something to say
+  // is dropped on the way to it.
   //
-  // Checked PER AGENT over a multi-agent, multi-identity, multi-severity set,
-  // because that is the only shape that can see the failure: with one agent
-  // per call, a group renderer that returns just its largest group looks
-  // perfectly complementary while silently dropping every other agent.
-  it("gives every notice exactly one owner: the row or the group", () => {
+  // Checked PER AGENT over a multi-agent, multi-identity, multi-severity,
+  // multi-subject set, because that is the only shape that can see the
+  // failure: with one agent per call, a renderer that returns just its
+  // largest group looks complete while silently dropping every other agent.
+  it("gives every notice exactly one group, and drops no agent", () => {
     const agents = [
       { pubkey: AGENT_HEX, relayMembership: userLevel },
       { pubkey: OTHER_AGENT_HEX, relayMembership: userLevel },
@@ -359,41 +423,72 @@ describe("who renders the membership block", () => {
         relayMembership: null,
       },
     ];
-    const groups = workspaceRelayMembershipNotices(agents);
-    const grouped = new Set(
-      groups.map(({ notice }) => `${notice.subjectHex}|${notice.severity}`),
-    );
+    const groups = relayMembershipNoticeGroups(agents);
+    const grouped = new Set(groups.map(({ notice }) => noticeGroupKey(notice)));
     assert.equal(
-      groups.reduce((sum, group) => sum + group.agentCount, 0) + 0,
-      4,
-      "every workspace-subject agent must be counted into exactly one group",
+      groups.reduce((sum, group) => sum + group.agentCount, 0),
+      5,
+      "every agent with a notice must be counted into exactly one group",
     );
 
     for (const agent of agents) {
       const own = relayMembershipNotice(agent.pubkey, agent.relayMembership);
-      const row = rowRelayMembershipNotice(agent.pubkey, agent.relayMembership);
-      const ownedByGroup =
-        own !== null &&
-        grouped.has(`${own.subjectHex}|${own.severity}`) &&
-        own.subject === "workspace";
-      if (own === null) {
-        assert.equal(row, null, `${agent.pubkey} has nothing to render`);
-        continue;
-      }
-      assert.equal(
-        Number(Boolean(row)) + Number(ownedByGroup),
-        1,
-        `exactly one renderer must own ${agent.pubkey}`,
+      if (own === null) continue;
+      assert.ok(
+        grouped.has(noticeGroupKey(own)),
+        `no group renders ${agent.pubkey}`,
       );
     }
   });
 
-  it("leaves an agent-level refusal on the agent's own row", () => {
-    assert.equal(
-      rowRelayMembershipNotice(AGENT_HEX, agentLevel)?.badge,
-      "Not a relay member",
-    );
-    assert.equal(rowRelayMembershipNotice(AGENT_HEX, userLevel), null);
-    assert.equal(rowRelayMembershipNotice(AGENT_HEX, null), null);
+  // The group is keyed on the normalized hex while the npub and the operator
+  // command used to be derived from the raw one. Two agents refused as the
+  // same identity, one of them carrying it with stray whitespace and in upper
+  // case, grouped together correctly and then rendered whichever of the two
+  // arrived first: with the padded one first the card had no npub and no
+  // command at all, so the remedy for both agents disappeared on nothing more
+  // than agent order.
+  it("derives the npub and the command from the same hex it groups on", () => {
+    const padded = `  ${USER_HEX.toUpperCase()}  `;
+    for (const order of [
+      [padded, USER_HEX],
+      [USER_HEX, padded],
+    ]) {
+      const groups = relayMembershipNoticeGroups([
+        { pubkey: AGENT_HEX, relayMembership: refusedAs(order[0]) },
+        { pubkey: OTHER_AGENT_HEX, relayMembership: refusedAs(order[1]) },
+      ]);
+      assert.equal(groups.length, 1, "one identity is one card, either order");
+      assert.equal(groups[0].agentCount, 2);
+      assert.equal(groups[0].notice.subjectHex, USER_HEX);
+      assert.equal(
+        groups[0].notice.command,
+        relayAddMemberCommand(USER_HEX),
+        "the card must keep the remedy whichever agent arrived first",
+      );
+      assert.ok(groups[0].notice.npub?.startsWith("npub1"));
+    }
   });
+
+  // Presence of a named subject used to be decided twice, by `??` (which
+  // keeps an empty string) and by truthiness (which does not), so an empty
+  // `subject_pubkey` produced an agent-subject notice keyed on an empty hex,
+  // with no npub and no command: a card about nobody.
+  it("treats an empty or blank subject as no subject at all", () => {
+    for (const subjectPubkey of ["", "   "]) {
+      const notice = relayMembershipNotice(AGENT_HEX, {
+        ...agentLevel,
+        subjectPubkey,
+      });
+      assert.ok(notice);
+      assert.equal(notice.subject, "agent");
+      assert.equal(notice.subjectHex, AGENT_HEX);
+      assert.equal(notice.npubLabel, "Agent npub");
+      assert.equal(notice.command, relayAddMemberCommand(AGENT_HEX));
+    }
+  });
+
+  function refusedAs(subjectPubkey) {
+    return { ...agentLevel, subjectPubkey };
+  }
 });

@@ -11,28 +11,43 @@ import { CopyButton } from "./CopyButton";
  *
  * This is the only recovery affordance the feature has, so it lives in its
  * own file and is rendered by `UnifiedAgentsSection`, the component the
- * user actually sees. It previously lived inside `ManagedAgentRow`, which nothing
- * in the app imported: an earlier commit deleted every usage of that row and
- * left the file behind, so the npub, the operator command and the grouped
- * notice were all unreachable in the running app and the badge on the card
- * was the only part of them a user could read.
+ * user actually sees, for BOTH subjects. It previously lived inside
+ * `ManagedAgentRow`, which nothing in the app imported: an earlier commit
+ * deleted every usage of that row and left the file behind, so the npub, the
+ * operator command and the grouped notice were all unreachable in the running
+ * app and the badge on the card was the only part of them a user could read.
+ * The round that fixed that rehomed only the workspace half and deleted the
+ * row, so the AGENT half, the ordinary "you are a relay member but not an
+ * admin" case, went back to a badge and nothing else.
  * `UnifiedAgentsSectionRelayMembership.test.mjs` mounts the live section and
- * asserts the command reaches the DOM, so orphaning it again fails a test
- * rather than shipping.
+ * asserts the command reaches the DOM for each subject, so orphaning either
+ * fails a test rather than shipping.
  *
- * `agentCount` is set only by the group-level render of a user-level
- * refusal, where one block stands in for several agents; the sentence it
- * adds is the only place that number is stated, so the count has one owner
- * like every other label here.
+ * `agentCount` is set only where one block stands in for several agents (a
+ * user-level refusal); the sentence it adds is the only place that number is
+ * stated, so the count has one owner like every other label here.
+ *
+ * `agentNames` is rendered only for an AGENT-subject block, and it is this
+ * component's own rule rather than the caller's. A workspace refusal already
+ * says how many agents it holds up and listing seventeen names under it would
+ * bury the remedy; an agent-subject block is one of possibly many, each with
+ * a different npub and a different `add-member`, so without the name the only
+ * thing distinguishing them is a bech32 string.
  */
 export function RelayMembershipBlock({
   agentCount,
+  agentNames,
   notice,
 }: {
   agentCount?: number;
+  agentNames?: readonly string[];
   notice: NonNullable<ReturnType<typeof relayMembershipNotice>>;
 }) {
   const blocked = notice.severity === "blocked";
+  const named =
+    notice.subject === "agent" && agentNames && agentNames.length > 0
+      ? agentNames.join(", ")
+      : null;
   return (
     <div
       className={cn(
@@ -57,6 +72,9 @@ export function RelayMembershipBlock({
         />
         <span>{notice.badge}</span>
       </div>
+      {named ? (
+        <p className="text-muted-foreground">{`Agent: ${named}`}</p>
+      ) : null}
       {notice.detail ? (
         <p className="text-muted-foreground">{notice.detail}</p>
       ) : null}

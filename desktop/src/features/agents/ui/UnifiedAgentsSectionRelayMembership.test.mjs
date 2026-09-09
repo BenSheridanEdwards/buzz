@@ -11,11 +11,18 @@
  * see was the badge on the card, which names the problem and offers no way
  * out of it.
  *
- * A pure test over `workspaceRelayMembershipNotices` cannot see that: the
- * function was correct the whole time. Only mounting the section the user
- * really sees can, so this renders `UnifiedAgentsSection` with the mock Tauri
- * bridge and asserts the command text reaches the DOM. Deleting the render
- * from `UnifiedAgentsSection` fails here.
+ * A pure test over the notice helpers cannot see that: the helpers were
+ * correct the whole time. Only mounting the section the user really sees can,
+ * so this renders `UnifiedAgentsSection` with the mock Tauri bridge and
+ * asserts the command text reaches the DOM. Deleting the render from
+ * `UnifiedAgentsSection` fails here.
+ *
+ * It covers BOTH subjects, because the first fix rehomed only the workspace
+ * half: the row component that carried the agent half was deleted, its helper
+ * was left with no caller, and an agent-subject refusal, the ordinary "you
+ * are a relay member but not an admin" case, went back to a badge and nothing
+ * else while a pure ownership test went on passing. An assertion that some
+ * helper returns a command proves nothing here; only the DOM does.
  *
  * It also pins the multi-identity case end to end, because that is where the
  * grouped notice was silently dropping agents.
@@ -267,7 +274,11 @@ test("every refused identity gets its own block, not just the largest", async ()
   assert.ok(screen.getByText(relayAddMemberCommand(USER_HEX)));
 });
 
-test("an agent-level refusal renders no workspace block", async () => {
+// The case a non-admin member actually hits: the relay lists the USER as a
+// plain member and does not list the agent, so it answers about the agent and
+// `subject_pubkey` is absent. This rendered a badge and nothing else for a
+// whole round while the helper that knew the remedy sat with no caller.
+test("the operator command for a refused agent reaches the rendered app", async () => {
   installIpc();
 
   await act(async () => {
@@ -286,9 +297,71 @@ test("an agent-level refusal renders no workspace block", async () => {
     );
   });
 
+  assert.ok(
+    screen.getByText(relayAddMemberCommand(AGENT_A)),
+    "the agent's own buzz-admin command must be reachable in the running app",
+  );
+  assert.ok(
+    screen.getByText("Agent npub"),
+    "the npub the operator needs is the agent's, and it must be labelled so",
+  );
+  assert.ok(
+    screen.getByText("the relay does not list this agent"),
+    "the relay's own sentence must reach the card, not just the badge",
+  );
+  assert.ok(
+    screen.getByText(`Agent: ${agent(AGENT_A).name}`),
+    "one block per blocked agent, so each must say which agent it is for",
+  );
+  // The badge alone is the dead end this test exists to prevent.
+  assert.ok(
+    screen.getByTestId(`agent-relay-membership-blocked-${AGENT_A}`),
+    "the card still badges the problem",
+  );
   assert.equal(
-    screen.queryAllByTestId("managed-agent-relay-membership-blocked").length,
-    0,
-    "a refusal about the agent is the agent's own, not a group-wide fact",
+    screen.getAllByTestId("managed-agent-relay-membership-blocked").length,
+    1,
+  );
+});
+
+// The two subjects are two problems with two npubs and two remedies. Mixing
+// them on one screen must produce one block each, never one card speaking for
+// both and never one of them swallowed.
+test("an agent refusal and a user refusal each keep their own remedy", async () => {
+  installIpc();
+
+  await act(async () => {
+    renderSection(
+      baseProps({
+        agents: [
+          agent(AGENT_A, { relayMembership: refusedByRelay(USER_HEX) }),
+          agent(AGENT_B, { relayMembership: refusedByRelay(USER_HEX) }),
+          agent(AGENT_C, {
+            relayMembership: {
+              state: "not_member",
+              checkedAt: "2026-09-09T00:00:00Z",
+              detail: "the relay does not list this agent",
+            },
+          }),
+        ],
+      }),
+    );
+  });
+
+  assert.equal(
+    screen.getAllByTestId("managed-agent-relay-membership-blocked").length,
+    2,
+  );
+  assert.ok(screen.getByText(relayAddMemberCommand(USER_HEX)));
+  assert.ok(screen.getByText(relayAddMemberCommand(AGENT_C)));
+  assert.ok(screen.getByText("Your npub"));
+  assert.ok(screen.getByText("Agent npub"));
+  // The count sentence belongs to the grouped user-level refusal only: the
+  // agent block stands for exactly one agent and must not claim otherwise.
+  assert.equal(
+    screen.getAllByText(
+      "This holds up 2 agents on this relay. Clearing it clears all of them.",
+    ).length,
+    1,
   );
 });

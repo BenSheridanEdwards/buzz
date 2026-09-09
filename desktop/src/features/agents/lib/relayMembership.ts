@@ -34,11 +34,18 @@ export type RelayMembershipNotice = {
   /** The npub for the operator; null only for a malformed pubkey. */
   npub: string | null;
   /**
-   * The identity the relay's answer was about, as the lowercased hex the
-   * backend wrote. Grouping keys on THIS, never on `npub`: `safeNpub` returns
-   * null for anything it cannot encode, so two distinct malformed subjects
-   * shared one key and collapsed into a single card claiming to speak for
-   * both.
+   * The identity the relay's answer was about, trimmed and lowercased.
+   *
+   * This is the ONE form every other derived field is built from. Grouping
+   * keys on it, never on `npub`: `safeNpub` returns null for anything it
+   * cannot encode, so two distinct malformed subjects shared one key and
+   * collapsed into a single card claiming to speak for both. `npub` and
+   * `command` are derived from it too, so a group can never be keyed on the
+   * normalized hex while rendering a remedy built from the raw one: with the
+   * two disagreeing, a subject that arrived with stray whitespace or in
+   * upper case grouped correctly and then rendered `npub: null,
+   * command: null`, losing the remedy for every agent in the group depending
+   * on which one happened to arrive first.
    */
   subjectHex: string;
   /**
@@ -56,6 +63,21 @@ export type RelayMembershipNotice = {
 };
 
 /**
+ * Whether the backend named a subject other than the agent, and what it is.
+ *
+ * One predicate for the whole module. Presence used to be decided twice, by
+ * `??` (which keeps `""`) and by truthiness (which does not), so an empty
+ * `subject_pubkey` produced an agent-subject notice carrying an empty
+ * `subjectHex`: a card keyed on nothing, with no npub and no command. The
+ * backend never writes one, which is exactly why the disagreement could sit
+ * there unnoticed.
+ */
+function namedSubject(membership: ManagedAgentRelayMembership): string | null {
+  const subject = membership.subjectPubkey?.trim() ?? "";
+  return subject.length > 0 ? subject : null;
+}
+
+/**
  * Card copy for a membership record, or `null` when there is nothing to show
  * (open relay, no check yet, or a verified member).
  */
@@ -70,14 +92,17 @@ export function relayMembershipNotice(
   // there, and printing an `add-member` for the agent's hex, sends the user
   // to an operator with a command that may already have been run and that
   // could never clear the card.
-  const subjectHex = membership.subjectPubkey ?? agentPubkeyHex;
-  const normalizedSubjectHex = subjectHex.trim().toLowerCase();
-  const subject = membership.subjectPubkey ? "workspace" : "agent";
-  const npubLabel = membership.subjectPubkey ? "Your npub" : "Agent npub";
+  const named = namedSubject(membership);
+  const subjectHex = (named ?? agentPubkeyHex).trim().toLowerCase();
+  const subject = named ? "workspace" : "agent";
+  const npubLabel = named ? "Your npub" : "Agent npub";
   // A subject that will not encode as an npub is not a pubkey, so no
   // `add-member` built from it could ever run. The block already hides the
   // npub line in that case; printing `--pubkey not-hex` under "ask the relay
   // operator to run" would send the user off with a command that fails.
+  //
+  // Derived from `subjectHex`, the same value the group is keyed on: see the
+  // field's doc comment for what deriving them from the raw string cost.
   const npub = safeNpub(subjectHex);
   if (membership.state === "not_member") {
     return {
@@ -94,7 +119,7 @@ export function relayMembershipNotice(
       severity: "blocked",
       detail: membership.detail,
       npub,
-      subjectHex: normalizedSubjectHex,
+      subjectHex,
       npubLabel,
       command: npub ? relayAddMemberCommand(subjectHex) : null,
     };
@@ -105,62 +130,69 @@ export function relayMembershipNotice(
     severity: "unverified",
     detail: membership.detail,
     npub,
-    subjectHex: normalizedSubjectHex,
+    subjectHex,
     npubLabel,
     command: null,
   };
 }
 
-/**
- * The notice an agent's own ROW should render, or `null` when the group owns
- * it instead.
- *
- * The two renderers are deliberately complementary: exactly one of
- * `rowRelayMembershipNotice` and [`workspaceRelayMembershipNotices`] carries
- * any given notice, never both (the user would read the same amber block
- * twice) and never neither (the npub and the operator command would vanish).
- * Keeping the rule here, rather than as a condition in each component, is
- * what makes that testable without mounting either of them.
- *
- * "Never neither" is a per-AGENT property, not a per-call one: it is only
- * true if the group renderer returns a notice covering EVERY agent it
- * suppressed, which is why `workspaceRelayMembershipNotices` returns all of
- * them rather than the largest.
- */
-export function rowRelayMembershipNotice(
-  agentPubkeyHex: string,
-  membership: ManagedAgentRelayMembership | null | undefined,
-): RelayMembershipNotice | null {
-  const notice = relayMembershipNotice(agentPubkeyHex, membership);
-  return notice?.subject === "workspace" ? null : notice;
-}
-
-/** The shape `workspaceRelayMembershipNotices` needs from an agent. */
+/** The shape `relayMembershipNoticeGroups` needs from an agent. */
 export type RelayMembershipSubject = {
   pubkey: string;
+  /**
+   * The agent's card name. An agent-subject block carries that agent's own
+   * npub and its own `add-member`, so on a fleet there is one block per
+   * blocked agent and the npub is the only thing telling them apart. The
+   * name says which agent the remedy is for.
+   */
+  name?: string | null;
   relayMembership?: ManagedAgentRelayMembership | null;
 };
 
+/** One rendered block: the notice, how many agents it stands for, and which. */
+export type RelayMembershipNoticeGroup = {
+  notice: RelayMembershipNotice;
+  agentCount: number;
+  /** Names of the agents this block speaks for, in the order given. */
+  agentNames: string[];
+};
+
 /**
- * One notice per distinct problem for a whole set of agents, when the relay's
- * answer was about the USER rather than about any agent.
+ * Every relay-membership block the section must render, one per distinct
+ * problem, for a whole set of agents.
  *
- * A roster-read refusal is a single user-level fact: same identity, same
- * npub, same operator command, repeated once per agent. Rendered per row it
- * became seventeen identical amber blocks on a seventeen-agent fleet, each
- * one reading as if that agent were broken. Collapsing it keeps the remedy
- * exactly where it was and states how many agents it holds up.
+ * THIS IS THE ONLY PRODUCTION SEAM. There is exactly one renderer, so there
+ * is no ownership rule to get wrong and no way for a notice to fall between
+ * two of them. There used to be two: this function for the workspace subject
+ * and a `rowRelayMembershipNotice` helper for the agent subject, with a test
+ * asserting they were complementary. When the row component that called the
+ * helper was deleted, the helper kept satisfying the test with no caller at
+ * all, and an agent-subject refusal, the ordinary "you are a relay member but
+ * not an admin" case, rendered a badge and nothing else: no detail, no npub,
+ * no operator command. A card that names a problem and hides its only remedy.
+ * Both subjects come out of here now, and
+ * `UnifiedAgentsSectionRelayMembership.test.mjs` asserts both reach the DOM
+ * of the mounted section, so orphaning either fails a test.
  *
- * EVERY group is returned, not the largest one. Returning only the largest
+ * Grouping is what keeps the workspace subject from shouting. A roster-read
+ * refusal is a single user-level fact: same identity, same npub, same
+ * operator command, repeated once per agent. Rendered per row it became
+ * seventeen identical amber blocks on a seventeen-agent fleet, each one
+ * reading as if that agent were broken. An AGENT-subject refusal groups on
+ * the agent's own pubkey, so it is its own group of one: the relay said
+ * something about that agent specifically and the `add-member` names that
+ * agent's hex, so there is nothing to collapse.
+ *
+ * EVERY group is returned, never just the largest. Returning only the largest
  * meant that with agents refused as two different identities, the smaller
- * group's agents got no notice from anybody: the rows suppress every
- * workspace-subject notice unconditionally, so their npub and their operator
- * command vanished, the "never neither" half of the ownership rule, broken.
- * Ordered largest first, then by key, so the render order is stable across
- * re-renders and does not depend on agent order.
+ * group's agents got no block at all, and their npub and operator command
+ * vanished. Ordered largest first, then by key, so the render order is stable
+ * across re-renders and does not depend on agent order.
  *
- * The key is `subjectHex` AND `severity`, and both halves matter:
+ * The key is `subject`, `subjectHex` AND `severity`, and every part matters:
  *
+ * - `subject`, because the two subjects are different problems even for the
+ *   same hex, and only the workspace one may be collapsed across agents.
  * - `subjectHex` rather than the rendered npub, because `safeNpub` returns
  *   null for anything malformed and every malformed subject then shared one
  *   key.
@@ -171,33 +203,48 @@ export type RelayMembershipSubject = {
  *   blocked agent could be counted into a grey "unverified" card and lose its
  *   command entirely.
  *
- * Returns an empty array when no agent carries a workspace-level notice.
- * Agents whose card state is about themselves are untouched and keep their
- * own block.
+ * Returns an empty array when no agent carries a notice at all.
  */
-export function workspaceRelayMembershipNotices(
+export function relayMembershipNoticeGroups(
   agents: readonly RelayMembershipSubject[],
-): { notice: RelayMembershipNotice; agentCount: number }[] {
-  const groups = new Map<string, RelayMembershipNotice[]>();
+): RelayMembershipNoticeGroup[] {
+  const groups = new Map<
+    string,
+    { notices: RelayMembershipNotice[]; names: string[] }
+  >();
   for (const agent of agents) {
     const notice = relayMembershipNotice(agent.pubkey, agent.relayMembership);
-    if (notice?.subject !== "workspace") continue;
-    const key = `${notice.subjectHex}|${notice.severity}`;
-    const group = groups.get(key);
-    if (group) group.push(notice);
-    else groups.set(key, [notice]);
+    if (!notice) continue;
+    const key = noticeGroupKey(notice);
+    const group = groups.get(key) ?? { notices: [], names: [] };
+    group.notices.push(notice);
+    const name = agent.name?.trim();
+    if (name) group.names.push(name);
+    groups.set(key, group);
   }
   return [...groups.entries()]
     .sort(([keyA, a], [keyB, b]) =>
-      b.length === a.length ? keyA.localeCompare(keyB) : b.length - a.length,
+      b.notices.length === a.notices.length
+        ? keyA.localeCompare(keyB)
+        : b.notices.length - a.notices.length,
     )
     .map(([, group]) => ({
       // Every field but `detail` is identical across a group by construction:
-      // the key pins the identity and the severity, and badge, npub, label and
-      // command are derived from those alone.
-      notice: { ...group[0], detail: sharedDetail(group) },
-      agentCount: group.length,
+      // the key pins the subject, the identity and the severity, and badge,
+      // npub, label and command are derived from `subjectHex` alone, which is
+      // half the key.
+      notice: { ...group.notices[0], detail: sharedDetail(group.notices) },
+      agentCount: group.notices.length,
+      agentNames: group.names,
     }));
+}
+
+/**
+ * The React key and the grouping key, from one place so a re-render can never
+ * split or merge a block the grouping did not.
+ */
+export function noticeGroupKey(notice: RelayMembershipNotice): string {
+  return `${notice.subject}|${notice.subjectHex}|${notice.severity}`;
 }
 
 /**
