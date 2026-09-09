@@ -71,7 +71,8 @@ import { OwnerOnlyAccessField } from "./OwnerOnlyAccessField";
 import type { EnvVarsValue } from "./EnvVarsEditor";
 import { useRequiredCredentialState } from "./useRequiredCredentialState";
 import { RunOnSummarySection } from "./RunOnSummarySection";
-import { PersonaDropdownField } from "./PersonaDropdownField";
+import { EditAgentRuntimeField } from "./EditAgentRuntimeField";
+import { useAgentInstanceHermesProfile } from "./useAgentInstanceHermesProfile";
 import {
   MODEL_DISCOVERY_LOADING_VALUE,
   usePersonaModelDiscovery,
@@ -89,7 +90,6 @@ import { useProviderApiKeyFieldState } from "./providerApiKeyFieldState";
 import { resolveModelFieldStatusMessage } from "./agentConfigControls";
 import { AdvancedRequiredBadge } from "./AdvancedRequiredBadge";
 import { showAgentProfileSyncWarning } from "./agentProfileSyncWarning";
-import { AddCustomHarnessDialog } from "./AddCustomHarnessDialog";
 import {
   ADD_CUSTOM_HARNESS_OPTION,
   runtimeDropdownAction,
@@ -322,6 +322,18 @@ export function AgentInstanceEditDialog({
   const prospectiveRuntime = runtimes.find(
     (r) => r.id === prospectiveRuntimeId,
   );
+  const hermesProfile = useAgentInstanceHermesProfile({
+    command: prospectiveRuntime?.command ?? agentCommand,
+    defaultParallelism: String(agent.parallelism),
+    draft: { envVars, name, parallelism, systemPrompt },
+    inheritedEnvVars,
+    onEditDefinition: onEditLinkedPersona,
+    open,
+    ownsSystemPrompt: linkedPersona == null,
+    runtimeId: prospectiveRuntimeId,
+    setters: { setEnvVars, setName, setParallelism, setSystemPrompt },
+    settled: !runtimesQuery.isLoading && !personasQuery.isLoading,
+  });
   const runtimeCatalogStatus = runtimesQuery.isLoading
     ? ("loading" as const)
     : runtimesQuery.isError
@@ -551,6 +563,8 @@ export function AgentInstanceEditDialog({
       setAgentArgs(newArgs);
     }
 
+    // The profile pin is dropped by the "left Hermes" effect above, which also
+    // covers the custom-command path this handler cannot see.
     applySelection(
       selectionOnRuntimeChange(selection, {
         previousRuntime: previousRuntimeId,
@@ -1010,38 +1024,20 @@ export function AgentInstanceEditDialog({
             />
             <RunOnSummarySection backend={agent.backend} />
 
-            {/* Provider (runtime) */}
-            <div className="space-y-1.5">
-              <label
-                className="text-sm font-medium text-foreground"
-                htmlFor="edit-agent-runtime"
-              >
-                Provider
-              </label>
-              <PersonaDropdownField
-                disabled={isSaving}
-                id="edit-agent-runtime"
-                onValueChange={handleRuntimeDropdownChange}
-                options={runtimeDropdownOptions}
-                placeholder="Choose a provider"
-                value={runtimeDropdownValue}
-              />
-              {selectedRuntime ? (
-                <p className="text-xs text-muted-foreground">
-                  Detected at{" "}
-                  <span className="font-medium">
-                    {selectedRuntime.binaryPath ??
-                      selectedRuntime.command ??
-                      selectedRuntime.id}
-                  </span>
-                </p>
-              ) : null}
-              <AddCustomHarnessDialog
-                onOpenChange={setIsAddHarnessOpen}
-                onSaved={selectSavedHarness}
-                open={isAddHarnessOpen}
-              />
-            </div>
+            <EditAgentRuntimeField
+              disabled={isSaving}
+              // The picker shows the effective env (definition layer plus this
+              // instance's overrides), never the override layer alone.
+              envVars={hermesProfile.effectiveEnvVars}
+              hermes={hermesProfile.fieldProps}
+              isAddHarnessOpen={isAddHarnessOpen}
+              onAddHarnessOpenChange={setIsAddHarnessOpen}
+              onHarnessSaved={selectSavedHarness}
+              onValueChange={handleRuntimeDropdownChange}
+              options={runtimeDropdownOptions}
+              selectedRuntime={selectedRuntime}
+              value={runtimeDropdownValue}
+            />
             {selectedRuntimeId === "custom" && !inheritHarness ? (
               <div className="space-y-1.5">
                 <label

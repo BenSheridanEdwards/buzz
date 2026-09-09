@@ -151,7 +151,11 @@ pub struct AgentSnapshotImportResult {
 /// list.  Only allowlist-mode requires a mode downgrade on Clear, because
 /// `allowlist` without entries is an invalid state.  Non-allowlist modes
 /// remain valid with an empty list.
+///
+/// `harness` is the snapshot's `definition.runtime` (a runtime id, possibly a
+/// custom harness's); it selects the parallelism default that fills a blank.
 pub(crate) fn resolve_snapshot_import_behavior(
+    harness: Option<&str>,
     raw_respond_to: Option<&str>,
     raw_allowlist: &[String],
     parallelism: Option<u32>,
@@ -203,6 +207,7 @@ pub(crate) fn resolve_snapshot_import_behavior(
     };
 
     resolve_mint_behavioral_defaults(
+        harness.unwrap_or_default(),
         resolved_mode,
         resolved_allowlist,
         parallelism,
@@ -480,12 +485,17 @@ pub async fn confirm_agent_snapshot_import(
 
     // ── Resolve behavioral defaults ──────────────────────────────────────────
     let minted = resolve_snapshot_import_behavior(
+        snapshot.definition.runtime.as_deref(),
         snapshot.definition.respond_to.as_deref(),
         &snapshot.definition.respond_to_allowlist,
         snapshot.definition.parallelism,
         input.keep_allowlist,
     )?;
-    let minted_parallelism = minted.parallelism;
+    // The portable "no opinion" value the definition keeps. Named for its
+    // destination, not its source: the record's own field is
+    // `minted.parallelism`, which already folded in the harness default, and
+    // the two must not be confused at the write sites below.
+    let definition_parallelism = minted.definition_parallelism;
 
     // Profile metadata must contain a hosted URL. Inline avatar data can be far
     // larger than the relay's kind:0 content limit, so upload imported pixels
@@ -584,7 +594,7 @@ pub async fn confirm_agent_snapshot_import(
             env_vars: std::collections::BTreeMap::new(),
             respond_to: respond_to_wire.clone(),
             respond_to_allowlist: minted.respond_to_allowlist.clone(),
-            parallelism: minted_parallelism,
+            parallelism: definition_parallelism,
             created_at: now.clone(),
             updated_at: now.clone(),
         };
@@ -620,8 +630,7 @@ pub async fn confirm_agent_snapshot_import(
             turn_timeout_seconds: 0,
             idle_timeout_seconds: snapshot.definition.idle_timeout_seconds,
             max_turn_duration_seconds: snapshot.definition.max_turn_duration_seconds,
-            parallelism: minted_parallelism
-                .unwrap_or(crate::managed_agents::DEFAULT_AGENT_PARALLELISM),
+            parallelism: minted.parallelism,
             system_prompt: snapshot.definition.system_prompt.clone(),
             model: snapshot.definition.model.clone(),
             provider: snapshot.definition.provider.clone(),
@@ -658,7 +667,7 @@ pub async fn confirm_agent_snapshot_import(
             team_catalog_source: None,
             definition_respond_to: respond_to_wire.clone(),
             definition_respond_to_allowlist: minted.respond_to_allowlist.clone(),
-            definition_parallelism: minted_parallelism,
+            definition_parallelism,
             relay_mesh: None,
             effort_level: None,
             runtime: snapshot.definition.runtime.clone(),

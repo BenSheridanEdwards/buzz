@@ -664,6 +664,7 @@ fn test_allowlist_respond_to_is_normalized_to_owner_only_on_adoption() {
     );
     assert!(personas[0].respond_to_allowlist.is_empty());
     let mint = crate::managed_agents::resolve_mint_behavioral_defaults(
+        "",
         personas[0]
             .respond_to
             .as_deref()

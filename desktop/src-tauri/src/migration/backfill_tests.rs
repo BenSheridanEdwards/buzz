@@ -339,3 +339,85 @@ fn backfill_creates_the_backup_owner_only() {
         "the fixture really did carry an inline key"
     );
 }
+
+// ── Backfill: the manufactured definition must not invent an opinion ─────────
+
+/// A standalone agent whose stored parallelism is only the harness default
+/// backfills a definition that still says "no opinion".
+///
+/// `mint_parallelism` folds the harness default into `ManagedAgentRecord.
+/// parallelism` at create, so a blank-created Hermes agent stores 1 nobody
+/// asked for. Copying that up unconditionally would pin `Some(1)` into the
+/// manufactured definition, and a snapshot exported afterwards would claim an
+/// opinion its author never expressed — the exact outcome the
+/// `definition_parallelism` / `parallelism` split is documented to prevent.
+#[test]
+fn backfill_leaves_a_default_valued_parallelism_unpinned() {
+    let dir = tempfile::tempdir().unwrap();
+    let hermes_default = crate::managed_agents::mint_parallelism("hermes-acp", None);
+    let app_default = crate::managed_agents::DEFAULT_AGENT_PARALLELISM;
+    assert_ne!(
+        hermes_default, app_default,
+        "the Hermes default is the point"
+    );
+
+    let blank_hermes = "d".repeat(64);
+    let opinionated_hermes = "e".repeat(64);
+    let blank_default = "f".repeat(64);
+
+    let mut hermes_blank = standalone_agent_json("HermesBlank", &blank_hermes, Some("p"));
+    hermes_blank["runtime"] = serde_json::json!("hermes");
+    hermes_blank["parallelism"] = serde_json::json!(hermes_default);
+
+    let mut hermes_opinion = standalone_agent_json("HermesPinned", &opinionated_hermes, Some("p"));
+    hermes_opinion["runtime"] = serde_json::json!("hermes");
+    hermes_opinion["parallelism"] = serde_json::json!(6);
+
+    // No runtime id: resolves to the default harness, whose default is the
+    // app-wide value.
+    let mut plain_blank = standalone_agent_json("PlainBlank", &blank_default, Some("p"));
+    plain_blank["parallelism"] = serde_json::json!(app_default);
+
+    write_agents_json(
+        dir.path(),
+        &serde_json::json!([hermes_blank, hermes_opinion, plain_blank]),
+    );
+
+    assert_eq!(
+        backfill_standalone_agents_in_dir(&base(dir.path())).unwrap(),
+        3
+    );
+
+    let records = load_typed(dir.path());
+    let definition_for = |slug: &str| {
+        records
+            .iter()
+            .find(|r| r.pubkey.is_empty() && r.slug.as_deref() == Some(slug))
+            .unwrap_or_else(|| panic!("manufactured definition for {slug} must exist"))
+            .definition_parallelism
+    };
+
+    assert_eq!(
+        definition_for(&blank_hermes),
+        None,
+        "a Hermes agent left at the harness default must stay unpinned"
+    );
+    assert_eq!(
+        definition_for(&blank_default),
+        None,
+        "and so must an agent left at the app default"
+    );
+    assert_eq!(
+        definition_for(&opinionated_hermes),
+        Some(6),
+        "a value the author actually chose must survive the backfill"
+    );
+
+    // The instance keeps its own stored value either way — this changes what
+    // the definition claims, never what the agent runs.
+    let instance = records
+        .iter()
+        .find(|r| r.pubkey == blank_hermes)
+        .expect("instance must survive");
+    assert_eq!(instance.parallelism, hermes_default);
+}

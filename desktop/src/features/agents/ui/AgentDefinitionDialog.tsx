@@ -72,6 +72,14 @@ import { useAgentDialogDefaults } from "./useAgentDialogDefaults";
 import { AgentDefaultsDialog } from "./AgentDefaultsDialog";
 import { AgentHarnessField } from "./AgentHarnessField";
 import {
+  HermesProfileField,
+  useHermesProfilePicker,
+} from "./HermesProfileField";
+import {
+  hermesDraftOnHarnessChange,
+  isHermesHarness,
+} from "./hermesProfileSelection";
+import {
   AgentAiConfigurationModeField,
   AgentCreateAiDefaultsSummary,
   type AgentAiConfigurationMode,
@@ -398,6 +406,30 @@ export function AgentDefinitionDialog({
   }
 
   const selectedRuntime = runtimes.find((p) => p.id === runtime);
+  const isHermesSelected = isHermesHarness(runtime, selectedRuntime?.command);
+  const hermesPicker = useHermesProfilePicker({
+    // A definition with no profile has no parallelism preference either; the
+    // blank field means "use the harness default".
+    defaultParallelism: "",
+    draft: {
+      displayName,
+      description: descriptionDraft,
+      avatarUrl,
+      systemPrompt,
+      envVars,
+      parallelism: behaviorDraft.parallelism,
+    },
+    enabled: open && isHermesSelected,
+    onApply: (next) => {
+      setHasUserChanges(true);
+      setDisplayName(next.displayName);
+      setDescriptionDraft(next.description);
+      setAvatarUrl(next.avatarUrl);
+      setSystemPrompt(next.systemPrompt);
+      setEnvVars(next.envVars);
+      setBehaviorDraft({ ...behaviorDraft, parallelism: next.parallelism });
+    },
+  });
   const blankRuntimeModelProviderEditable =
     initialModelProviderEditableWithoutRuntime && runtime.trim().length === 0;
   const runtimeCanChooseLlmProvider =
@@ -681,15 +713,39 @@ export function AgentDefinitionDialog({
     // The user made an explicit choice — no longer auto-seeded.
     isRuntimeAutoSeededRef.current = false;
     setRuntime(nextRuntime);
+    const nextRuntimeEntry = runtimes.find((p) => p.id === nextRuntime);
+    // Leaving Hermes drops the profile pin and everything the pick seeded but
+    // the user never made their own; it all means nothing to another harness.
+    const afterHarnessChange = hermesDraftOnHarnessChange(
+      {
+        displayName,
+        description: descriptionDraft,
+        avatarUrl,
+        systemPrompt,
+        envVars: selection.envVars,
+        parallelism: behaviorDraft.parallelism,
+      },
+      { runtimeId: runtime, command: selectedRuntime?.command },
+      { runtimeId: nextRuntime, command: nextRuntimeEntry?.command },
+      { parallelism: "" },
+    );
+    setSystemPrompt(afterHarnessChange.systemPrompt);
+    setBehaviorDraft({
+      ...behaviorDraft,
+      parallelism: afterHarnessChange.parallelism,
+    });
     applySelection(
-      selectionOnRuntimeChange(selection, {
-        previousRuntime: runtime,
-        nextRuntime,
-        nextRuntimeCanChooseProvider:
-          nextRuntime.trim().length > 0 &&
-          runtimeSupportsLlmProviderSelection(nextRuntime),
-        lockedRuntimeReset: "full",
-      }),
+      selectionOnRuntimeChange(
+        { ...selection, envVars: afterHarnessChange.envVars },
+        {
+          previousRuntime: runtime,
+          nextRuntime,
+          nextRuntimeCanChooseProvider:
+            nextRuntime.trim().length > 0 &&
+            runtimeSupportsLlmProviderSelection(nextRuntime),
+          lockedRuntimeReset: "full",
+        },
+      ),
     );
   }
 
@@ -815,6 +871,15 @@ export function AgentDefinitionDialog({
               placeholder={blankRuntimeOptionLabel}
               value={runtimeDropdownValue}
               warning={runtimeWarning}
+            />
+          ) : null}
+          {isHermesSelected ? (
+            <HermesProfileField
+              disabled={isPending}
+              envVars={envVars}
+              onProfileChange={hermesPicker.handleProfileChange}
+              profiles={hermesPicker.profiles}
+              status={hermesPicker.status}
             />
           ) : null}
           {llmProviderFieldVisible && aiConfigurationMode === "custom" ? (

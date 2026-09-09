@@ -738,6 +738,7 @@ pub fn run() {
             channel_head_cache::channel_head_cache_load,
             channel_head_cache::channel_head_cache_store,
             channel_head_cache::channel_head_cache_clear,
+            list_hermes_profiles,
             list_personas,
             create_persona,
             update_persona,

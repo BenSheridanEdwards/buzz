@@ -10,6 +10,49 @@ export const AGENT_PARALLELISM_HELP = `Leave blank to use the app default (curre
 export const EDIT_AGENT_PARALLELISM_HELP =
   "Current value for this agent. Custom values may be 1–32.";
 
+/** The catalog facts the blank-field copy depends on. */
+export type ParallelismDefaultSource = {
+  label: string;
+  defaultParallelism: number;
+};
+
+/**
+ * Return the harness-specific default when the selected runtime overrides
+ * the app default (Hermes mints at 1), or `null` when the app default applies
+ * (or no runtime is selected yet).
+ */
+export function harnessParallelismDefault(
+  runtime: ParallelismDefaultSource | undefined,
+): { label: string; value: number } | null {
+  if (runtime === undefined) return null;
+  if (runtime.defaultParallelism === DEFAULT_AGENT_PARALLELISM) return null;
+  return { label: runtime.label, value: runtime.defaultParallelism };
+}
+
+/**
+ * Placeholder for the blank persona parallelism field. Names the harness
+ * whose default will be stored when it differs from the app default, so
+ * "leave blank" never silently means 10 for a harness that mints at 1.
+ */
+export function agentParallelismPlaceholder(
+  runtime: ParallelismDefaultSource | undefined,
+): string {
+  const harness = harnessParallelismDefault(runtime);
+  return harness === null
+    ? AGENT_PARALLELISM_PLACEHOLDER
+    : `${harness.label} default (${harness.value})`;
+}
+
+/** Help copy beneath the persona parallelism field; see `agentParallelismPlaceholder`. */
+export function agentParallelismHelp(
+  runtime: ParallelismDefaultSource | undefined,
+): string {
+  const harness = harnessParallelismDefault(runtime);
+  return harness === null
+    ? AGENT_PARALLELISM_HELP
+    : `Leave blank to use the ${harness.label} default (currently ${harness.value}). Custom values may be 1–32.`;
+}
+
 export function resolveAgentParallelism(
   input: number | undefined,
   definition: number | null | undefined,

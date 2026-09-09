@@ -796,6 +796,15 @@ fn default_agent_args(command: &str) -> Option<Vec<String>> {
     }
 }
 
+/// Hermes profile directory. When the agent's environment carries it, the
+/// record was deliberately pointed at a Hermes profile (its own config,
+/// memory, skills, and MCP servers) rather than a throwaway default.
+pub(crate) const HERMES_HOME_ENV: &str = "HERMES_HOME";
+
+/// Hermes switch for the profile-configured MCP servers it would otherwise
+/// start before answering `initialize`.
+pub(crate) const HERMES_SKIP_CONFIGURED_MCP_ENV: &str = "HERMES_ACP_SKIP_CONFIGURED_MCP";
+
 /// Per-runtime environment defaults applied when Buzz owns the agent process.
 ///
 /// Mirrors [`default_agent_args`]: keyed on the normalized command identity,
@@ -808,11 +817,72 @@ fn default_agent_args(command: &str) -> Option<Vec<String>> {
 /// startup budget (see block/buzz#3355). Skip that unrelated global startup
 /// by default; an operator or persona can still opt back in by setting the
 /// variable explicitly.
-pub(crate) fn default_agent_env(command: &str) -> &'static [(&'static str, &'static str)] {
+///
+/// `hermes_profile_backed` flips that default: a record that carries
+/// [`HERMES_HOME_ENV`] was pointed at a specific Hermes profile on purpose,
+/// and that profile's MCP servers are the agent's own tools (the reason the
+/// profile exists), not unrelated global startup. Skipping them would hand
+/// the agent a profile with its tools silently removed, so profile-backed
+/// spawns default to `0`. The explicit-override rule is unchanged in both
+/// directions: a persona entry or inherited parent value for
+/// [`HERMES_SKIP_CONFIGURED_MCP_ENV`] still wins over either default. See
+/// [`hermes_profile_backed`] for how the flag is derived.
+///
+/// Hermes reads only `1` as "skip", so the profile-backed `0` is behaviorally
+/// identical to leaving the variable unset. It is written anyway so the
+/// child's environment states which branch was taken instead of leaving it to
+/// be inferred from an absent key.
+pub(crate) fn default_agent_env(
+    command: &str,
+    hermes_profile_backed: bool,
+) -> &'static [(&'static str, &'static str)] {
     match normalize_agent_command_identity(command).as_str() {
-        "hermes" | "hermes-agent" | "hermes-acp" => &[("HERMES_ACP_SKIP_CONFIGURED_MCP", "1")],
+        "hermes" | "hermes-agent" | "hermes-acp" => {
+            if hermes_profile_backed {
+                &[(HERMES_SKIP_CONFIGURED_MCP_ENV, "0")]
+            } else {
+                &[(HERMES_SKIP_CONFIGURED_MCP_ENV, "1")]
+            }
+        }
         _ => &[],
     }
+}
+
+/// Whether the agent process will see a `HERMES_HOME`, i.e. the record is
+/// backed by a specific Hermes profile.
+///
+/// Both layers the child inherits are consulted: the persona/record
+/// `extra_env` (set on the child directly) and the harness's own process
+/// environment (the Desktop writes record env vars onto the buzz-acp
+/// process, which the child inherits). `parent_has_hermes_home` is passed in
+/// rather than read here so the decision table is testable without touching
+/// process-global state.
+///
+/// An *ambient* `HERMES_HOME` (a harness launched from a shell that exports
+/// one) therefore marks every Hermes spawn under it profile-backed, whatever
+/// the record says. That is deliberate: the child inherits that variable, so
+/// it is the profile Hermes will load either way, and skipping its MCP
+/// servers would hand the agent that profile with its tools removed.
+pub(crate) fn hermes_profile_backed(
+    extra_env: &[(String, String)],
+    parent_has_hermes_home: bool,
+) -> bool {
+    parent_has_hermes_home
+        || extra_env
+            .iter()
+            .any(|(key, value)| key == HERMES_HOME_ENV && !value.trim().is_empty())
+}
+
+/// Whether an *inherited* `HERMES_HOME` counts as profile-backing, i.e. the
+/// `parent_has_hermes_home` argument to [`hermes_profile_backed`].
+///
+/// Kept here, next to the record-layer test it must match, because the two
+/// layers describe the same variable: if the spawn site rolled its own
+/// emptiness check, a parent `HERMES_HOME="   "` could be profile-backed while
+/// the identical value in the record was not. Set-but-blank means "no profile"
+/// in both.
+pub(crate) fn hermes_home_is_profile_backing(value: Option<&std::ffi::OsStr>) -> bool {
+    value.is_some_and(|value| !value.to_string_lossy().trim().is_empty())
 }
 
 /// Build the `CODEX_CONFIG` environment variable that enables full outbound
@@ -1750,17 +1820,83 @@ mod tests {
             r"C:\Users\test\AppData\Roaming\npm\hermes-acp.cmd",
         ] {
             assert_eq!(
-                default_agent_env(command),
+                default_agent_env(command, false),
                 &[("HERMES_ACP_SKIP_CONFIGURED_MCP", "1")],
                 "unexpected env defaults for {command}"
             );
-        }
-        for command in ["goose", "codex-acp", "claude-agent-acp", "buzz-agent", ""] {
-            assert!(
-                default_agent_env(command).is_empty(),
-                "non-Hermes command must have no env defaults: {command}"
+            assert_eq!(
+                default_agent_env(command, true),
+                &[("HERMES_ACP_SKIP_CONFIGURED_MCP", "0")],
+                "profile-backed Hermes must keep its configured MCP servers: {command}"
             );
         }
+        for command in ["goose", "codex-acp", "claude-agent-acp", "buzz-agent", ""] {
+            for profile_backed in [false, true] {
+                assert!(
+                    default_agent_env(command, profile_backed).is_empty(),
+                    "non-Hermes command must have no env defaults: {command} (profile_backed={profile_backed})"
+                );
+            }
+        }
+    }
+
+    /// Full decision table for the profile-backed flag: either layer the child
+    /// inherits can carry `HERMES_HOME`; a blank value in `extra_env` does not
+    /// count; unrelated keys never do.
+    #[test]
+    fn hermes_profile_backed_decision_table() {
+        let env = |pairs: &[(&str, &str)]| -> Vec<(String, String)> {
+            pairs
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect()
+        };
+        assert!(!hermes_profile_backed(&[], false));
+        assert!(hermes_profile_backed(&[], true));
+        assert!(hermes_profile_backed(
+            &env(&[("HERMES_HOME", "/Users/me/.hermes/profiles/buzz")]),
+            false
+        ));
+        assert!(hermes_profile_backed(
+            &env(&[("OTHER", "x"), ("HERMES_HOME", r"C:\Users\me\hermes")]),
+            false
+        ));
+        assert!(!hermes_profile_backed(&env(&[("HERMES_HOME", "")]), false));
+        assert!(!hermes_profile_backed(
+            &env(&[("HERMES_HOME", "   ")]),
+            false
+        ));
+        assert!(!hermes_profile_backed(
+            &env(&[("HERMES_HOMEDIR", "/x"), ("hermes_home", "/y")]),
+            false
+        ));
+        assert!(hermes_profile_backed(&env(&[("HERMES_HOME", "")]), true));
+
+        // The two layers must apply the SAME emptiness test to the same
+        // string: an inherited `HERMES_HOME` and a record one that read
+        // differently would make the profile-backed decision depend on which
+        // layer happened to carry the value.
+        for value in ["", "   ", "\t\n"] {
+            assert_eq!(
+                hermes_home_is_profile_backing(Some(std::ffi::OsStr::new(value))),
+                hermes_profile_backed(&env(&[("HERMES_HOME", value)]), false),
+                "parent and record layers must agree on {value:?}"
+            );
+            assert!(!hermes_home_is_profile_backing(Some(std::ffi::OsStr::new(
+                value
+            ))));
+        }
+        for value in ["/Users/me/.hermes", r"C:\Users\me\hermes", " /x "] {
+            assert_eq!(
+                hermes_home_is_profile_backing(Some(std::ffi::OsStr::new(value))),
+                hermes_profile_backed(&env(&[("HERMES_HOME", value)]), false),
+                "parent and record layers must agree on {value:?}"
+            );
+            assert!(hermes_home_is_profile_backing(Some(std::ffi::OsStr::new(
+                value
+            ))));
+        }
+        assert!(!hermes_home_is_profile_backing(None));
     }
 
     #[test]

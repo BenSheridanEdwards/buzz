@@ -106,7 +106,19 @@ fn backfill_standalone_agents_in_dir(base_dir: &Path) -> Result<usize, String> {
         // fields are the author's intent; copy them up.
         view_source.definition_respond_to = Some(record.respond_to.as_str().to_string());
         view_source.definition_respond_to_allowlist = record.respond_to_allowlist.clone();
-        view_source.definition_parallelism = Some(record.parallelism);
+        // Parallelism is the one member of the quad the record cannot state an
+        // opinion about on its own: `mint_parallelism` already folded the
+        // harness default into it, so a blank-created Hermes agent stores 1
+        // that its author never asked for. Copying that up would pin `Some(1)`
+        // into the manufactured definition and make a later export claim an
+        // opinion, which is precisely what `definition_parallelism` exists to
+        // avoid (see the field doc on `MintBehavioralDefaults`). Snapshot the
+        // value only when it differs from what a blank mint would produce for
+        // this record's harness.
+        let harness = crate::managed_agents::record_agent_command(record, &[]);
+        view_source.definition_parallelism = (record.parallelism
+            != crate::managed_agents::mint_parallelism(&harness, None))
+        .then_some(record.parallelism);
         let Some(persona_view) = view_source.to_definition_view() else {
             eprintln!(
                 "buzz-desktop: standalone-backfill: agent {} produced no persona view — skipped",

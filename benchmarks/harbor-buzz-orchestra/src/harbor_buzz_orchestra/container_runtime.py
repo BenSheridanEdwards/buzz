@@ -466,11 +466,12 @@ class BuzzContainerRuntime:
 
     @staticmethod
     def _rust_log(configured: str | None) -> str:
-        # ``buzz_acp=info`` carries the subscription-readiness line; the turn
-        # target lets a solo trial stop when its only turn ends. Keep both:
-        # replacing the former with only the latter makes a healthy process
-        # look permanently unready.
-        required = "buzz_acp=info,pool::prompt=info"
+        # ``buzz_acp=info`` carries both signals this runtime reads: the
+        # subscription-readiness line and the turn-completion lines (target
+        # ``buzz_acp::pool::prompt``, admitted by the crate-prefix directive).
+        # Keep it on every launch: without it a healthy process looks
+        # permanently unready and a solo trial never sees its turn end.
+        required = "buzz_acp=info"
         return f"{configured},{required}" if configured else required
 
     # -- lifecycle -------------------------------------------------------------

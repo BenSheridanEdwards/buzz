@@ -23,7 +23,10 @@ import {
   resetMockCustomHarnesses,
   handleSaveCustomHarness,
   handleDeleteCustomHarness,
+  mockHarnessDefaultParallelismForCommand,
+  mockHarnessDefaultParallelismFrom,
 } from "./e2eBridgeCustomHarnesses.ts";
+import { DEFAULT_AGENT_PARALLELISM } from "../features/agents/lib/agentParallelism.ts";
 
 function makeArgs(overrides = {}) {
   return {
@@ -242,5 +245,99 @@ describe("mockCustomHarnesses Map reference", () => {
     const [entry] = Array.from(mockCustomHarnesses.values());
     assert.equal(entry.id, "visible");
     assert.equal(entry.source, "custom");
+  });
+});
+
+// ── Per-harness default parallelism: the mock must key it like the backend ────
+
+describe("mockHarnessDefaultParallelismForCommand", () => {
+  it("returns 1 for every Hermes launcher spelling", () => {
+    for (const command of [
+      "hermes",
+      "hermes-acp",
+      "hermes-acp.exe",
+      "hermes-acp.cmd",
+      "hermes-acp.bat",
+      "/opt/hermes/bin/hermes-acp",
+      "C:\\Users\\me\\AppData\\Roaming\\npm\\hermes-acp.cmd",
+      "C:\\Tools\\Hermes\\HERMES-ACP.EXE",
+      "hermes_acp",
+    ]) {
+      assert.equal(
+        mockHarnessDefaultParallelismForCommand(command),
+        1,
+        `default parallelism for ${command}`,
+      );
+    }
+  });
+
+  it("returns the app default for everything else", () => {
+    for (const command of [
+      "goose",
+      "codex-acp",
+      "buzz-agent",
+      "/usr/local/bin/hermes-wrapper.sh",
+      "",
+      null,
+      undefined,
+    ]) {
+      assert.equal(
+        mockHarnessDefaultParallelismForCommand(command),
+        DEFAULT_AGENT_PARALLELISM,
+        `default parallelism for ${command}`,
+      );
+    }
+  });
+});
+
+describe("handleSaveCustomHarness default_parallelism", () => {
+  it("advertises 1 for a custom harness wrapping hermes-acp, like the backend", () => {
+    const entry = handleSaveCustomHarness(
+      makeArgs({ id: "my-hermes", command: "hermes-acp" }),
+    );
+    assert.equal(entry.default_parallelism, 1);
+  });
+
+  it("advertises 1 for the npm shim spelling too", () => {
+    const entry = handleSaveCustomHarness(
+      makeArgs({
+        id: "npm-hermes",
+        command: "C:\\Users\\me\\AppData\\Roaming\\npm\\hermes-acp.cmd",
+      }),
+    );
+    assert.equal(entry.default_parallelism, 1);
+  });
+
+  it("advertises the app default for an unrelated command", () => {
+    const entry = handleSaveCustomHarness(
+      makeArgs({ id: "my-goose", command: "goose" }),
+    );
+    assert.equal(entry.default_parallelism, DEFAULT_AGENT_PARALLELISM);
+  });
+});
+
+describe("mockHarnessDefaultParallelismFrom", () => {
+  it("prefers the spec's declared catalog", () => {
+    const declared = [
+      { id: "hermes", command: "hermes-acp", default_parallelism: 1 },
+    ];
+    assert.equal(mockHarnessDefaultParallelismFrom("hermes-acp", declared), 1);
+    assert.equal(mockHarnessDefaultParallelismFrom("hermes", declared), 1);
+  });
+
+  it("falls back to a harness the spec saved through the handler", () => {
+    handleSaveCustomHarness(
+      makeArgs({ id: "saved-hermes", command: "hermes-acp" }),
+    );
+    // Nothing declared: only the mutation store knows this harness.
+    assert.equal(mockHarnessDefaultParallelismFrom("saved-hermes", []), 1);
+    assert.equal(mockHarnessDefaultParallelismFrom("hermes-acp", []), 1);
+  });
+
+  it("returns the app default when neither source knows the command", () => {
+    assert.equal(
+      mockHarnessDefaultParallelismFrom("nobody-knows-me", []),
+      DEFAULT_AGENT_PARALLELISM,
+    );
   });
 });

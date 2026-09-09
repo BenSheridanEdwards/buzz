@@ -2,10 +2,61 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+  AGENT_PARALLELISM_HELP,
+  AGENT_PARALLELISM_PLACEHOLDER,
   DEFAULT_AGENT_PARALLELISM,
+  agentParallelismHelp,
+  agentParallelismPlaceholder,
+  harnessParallelismDefault,
   resolveAgentParallelism,
   parallelismCapHint,
 } from "./agentParallelism.ts";
+
+// ── Blank-field copy: harness default vs app default ─────────────────────────
+
+test("blank-field copy falls back to the app default with no runtime selected", () => {
+  assert.equal(harnessParallelismDefault(undefined), null);
+  assert.equal(
+    agentParallelismPlaceholder(undefined),
+    AGENT_PARALLELISM_PLACEHOLDER,
+  );
+  assert.equal(agentParallelismHelp(undefined), AGENT_PARALLELISM_HELP);
+});
+
+test("blank-field copy stays on the app default when the harness matches it", () => {
+  const goose = {
+    label: "Goose",
+    defaultParallelism: DEFAULT_AGENT_PARALLELISM,
+  };
+  assert.equal(harnessParallelismDefault(goose), null);
+  assert.equal(
+    agentParallelismPlaceholder(goose),
+    AGENT_PARALLELISM_PLACEHOLDER,
+  );
+  assert.equal(agentParallelismHelp(goose), AGENT_PARALLELISM_HELP);
+});
+
+test("blank-field copy names the harness whose default differs from the app default", () => {
+  const hermes = { label: "Hermes", defaultParallelism: 1 };
+  assert.deepEqual(harnessParallelismDefault(hermes), {
+    label: "Hermes",
+    value: 1,
+  });
+  const placeholder = agentParallelismPlaceholder(hermes);
+  assert.equal(placeholder, "Hermes default (1)");
+  assert.notEqual(placeholder, AGENT_PARALLELISM_PLACEHOLDER);
+  const help = agentParallelismHelp(hermes);
+  assert.ok(help.includes("Hermes"), "help must name the harness");
+  assert.ok(
+    help.includes("(currently 1)"),
+    "help must carry the harness default",
+  );
+  assert.ok(
+    !help.includes(`(currently ${DEFAULT_AGENT_PARALLELISM})`),
+    "help must not still advertise the app default",
+  );
+  assert.ok(help.includes("1–32"), "range guidance is unchanged");
+});
 
 test("parallelism uses the app default only when input and definition omit it", () => {
   assert.equal(

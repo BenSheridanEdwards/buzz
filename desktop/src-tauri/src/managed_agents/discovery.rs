@@ -24,8 +24,8 @@ pub(crate) use login_shell::{
     is_login_shell_path_uninit, is_safe_nvm_tag, login_shell_candidates, parse_semver_tag,
 };
 pub(crate) use presets::{
-    canonical_harness_command, command_for_runtime_id, preset_harness_definitions,
-    preset_harness_ids,
+    canonical_harness_command, command_for_runtime_id, preset_default_parallelism,
+    preset_harness_definitions, preset_harness_ids,
 };
 use presets::{preset_catalog_entry, PRESET_HARNESSES};
 pub(crate) use runtime_metadata::EffortNormalization;
@@ -111,9 +111,23 @@ fn executable_basename(command: &str) -> String {
     }
 }
 
+/// Reduce a harness command to the identity every harness-keyed table is keyed
+/// on: basename, lowercased, `_`/space folded to `-`, launcher suffix removed.
+///
+/// The stripped suffixes are `.exe`, `.cmd` and `.bat`. Windows resolves a
+/// command through an `.exe` binary or through npm's `.cmd`/`.bat` shims, and
+/// all three name the same runtime — a harness whose documented Windows install
+/// is npm is reached as `hermes-acp.cmd`, never as a bare `hermes-acp`.
+///
+/// This deliberately mirrors `buzz_acp::config::normalize_agent_command_identity`.
+/// The two must agree: the harness applies the Hermes environment branch on its
+/// identity while the desktop sizes the worker pool on this one, so a spelling
+/// only one of them recognises mints a full pool of Hermes processes while the
+/// harness treats the same command as Hermes. Keep the suffix lists in step.
 pub(crate) fn normalize_command_identity(command: &str) -> String {
     let normalized = command.trim().replace('\\', "/");
-    let basename = normalized.rsplit('/').next().unwrap_or(normalized.as_str());
+    let trimmed = normalized.trim_end_matches('/');
+    let basename = trimmed.rsplit('/').next().unwrap_or(trimmed);
     let lower = basename
         .chars()
         .map(|character| match character {
@@ -121,20 +135,20 @@ pub(crate) fn normalize_command_identity(command: &str) -> String {
             _ => character.to_ascii_lowercase(),
         })
         .collect::<String>();
-    let lower = lower.strip_suffix(".exe").unwrap_or(&lower).to_string();
 
-    if let Some(suffix) = std::env::consts::EXE_SUFFIX.strip_prefix('.') {
-        return lower
-            .strip_suffix(&format!(".{suffix}"))
-            .unwrap_or(&lower)
-            .to_string();
+    if let Some(stem) = [".exe", ".cmd", ".bat"]
+        .iter()
+        .find_map(|extension| lower.strip_suffix(extension))
+    {
+        return stem.to_string();
     }
 
-    if !std::env::consts::EXE_SUFFIX.is_empty() {
-        return lower
-            .strip_suffix(std::env::consts::EXE_SUFFIX)
-            .unwrap_or(&lower)
-            .to_string();
+    // Non-Windows targets whose executables carry a suffix of their own (wasm).
+    let platform_suffix = std::env::consts::EXE_SUFFIX.to_ascii_lowercase();
+    if !platform_suffix.is_empty() {
+        if let Some(stem) = lower.strip_suffix(&platform_suffix) {
+            return stem.to_string();
+        }
     }
 
     lower
@@ -155,6 +169,128 @@ pub(crate) fn known_acp_runtime(command: &str) -> Option<&'static KnownAcpRuntim
 
 pub(crate) fn known_acp_runtime_exact(id: &str) -> Option<&'static KnownAcpRuntime> {
     KNOWN_ACP_RUNTIMES.iter().find(|p| p.id == id)
+}
+
+/// The bundled MCP sidecar a harness command is configured for, paired with
+/// the path it resolves to on this machine.
+///
+/// - `Some((name, Some(path)))`: configured, and launchable here.
+/// - `Some((name, None))`: configured, but the binary is missing or not
+///   executable, so the spawn starts the agent without it.
+/// - `None`: this harness gets no sidecar at all.
+///
+/// The resolver is injected so the "configured but absent" branch is
+/// exercisable without a filesystem. Production callers reach it through
+/// [`sidecar_resolver`], never a bare `resolve_command*`.
+pub(crate) fn mcp_sidecar_with(
+    command: &str,
+    resolve: impl FnOnce(&'static str) -> Option<PathBuf>,
+) -> Option<(&'static str, Option<PathBuf>)> {
+    let configured = known_acp_runtime(command)
+        .and_then(|runtime| runtime.mcp_command)
+        .filter(|name| !name.is_empty())?;
+    Some((configured, resolve(configured)))
+}
+
+/// Sticky resolutions for bundled MCP sidecars, held *outside* the
+/// `resolve_command` cache on purpose.
+///
+/// `mcp_command` is a restart-diff field: the running process stamped one value
+/// and the summary recomputes another, and any disagreement raises the
+/// "restart required" badge. `clear_resolve_cache()` empties the resolve cache
+/// on every forced discovery, and `resolve_command_cached` only knows the
+/// managed shim dir, `target/{debug,release}`, and `current_exe()`'s parent —
+/// so a sidecar reachable only through PATH or the login shell would stamp
+/// `buzz-dev-mcp` at spawn (the full resolver found it) and read back `""`
+/// afterwards, badging every running codex and buzz-agent agent for a restart
+/// that changes nothing. Remembering the resolved path here keeps the two
+/// sides agreeing across a cache clear.
+///
+/// Only *successful* resolutions are remembered, and each is re-checked with
+/// `is_executable_file` before reuse. A sidecar that is genuinely absent is
+/// therefore re-probed after every clear (so the badge still fires on the day
+/// it is installed, which is the behaviour this field was changed for), and a
+/// remembered one that later disappears is evicted rather than handed to a
+/// spawn as a dead path.
+///
+/// That asymmetry is deliberate and it bounds what the memo saves. Once a
+/// sidecar resolves, a summary build costs a `HashMap` hit plus one
+/// `is_executable_file` stat. Where the sidecar is genuinely absent there is no
+/// negative memo to hit — and `resolve_command_cached` does not remember misses
+/// either, since `resolve_buzz_managed_command` and `resolve_workspace_command`
+/// both run ahead of the cache lookup — so every summary build still pays the
+/// full search-dir walk for that record. This is not a cache for the absent
+/// case; correctness (the badge firing on install day) is what it buys there.
+fn sidecar_path_memo() -> &'static std::sync::Mutex<std::collections::HashMap<&'static str, PathBuf>>
+{
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+    static MEMO: OnceLock<Mutex<HashMap<&'static str, PathBuf>>> = OnceLock::new();
+    MEMO.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Resolve one sidecar name through [`sidecar_path_memo`], falling back to
+/// `resolve` on a miss or a stale entry.
+pub(crate) fn sticky_sidecar_path(
+    name: &'static str,
+    resolve: impl FnOnce(&'static str) -> Option<PathBuf>,
+) -> Option<PathBuf> {
+    let remembered = sidecar_path_memo()
+        .lock()
+        .ok()
+        .and_then(|guard| guard.get(name).cloned());
+    if let Some(path) = remembered {
+        if is_executable_file(&path) {
+            return Some(path);
+        }
+        if let Ok(mut guard) = sidecar_path_memo().lock() {
+            guard.remove(name);
+        }
+    }
+
+    let resolved = resolve(name);
+    if let Some(path) = resolved.as_ref() {
+        if let Ok(mut guard) = sidecar_path_memo().lock() {
+            guard.insert(name, path.clone());
+        }
+    }
+    resolved
+}
+
+/// Forget every remembered sidecar path. Test-only: the memo is process-global
+/// and deliberately survives `clear_resolve_cache`, so a test that injects a
+/// resolver must not leave its answer behind for the next one.
+#[cfg(test)]
+pub(crate) fn clear_sidecar_path_memo() {
+    if let Ok(mut guard) = sidecar_path_memo().lock() {
+        guard.clear();
+    }
+}
+
+/// The production sidecar resolver for the read-only paths (summary, restart
+/// snapshot): the sticky memo over `resolve_command_cached`.
+///
+/// Cache-only, never a login-shell probe, because these callers sit on the
+/// cheap read path. The spawn passes the full `resolve_command` through the
+/// same memo, so a sidecar only the spawn could find is still visible here.
+pub(crate) fn sidecar_resolver(name: &'static str) -> Option<PathBuf> {
+    sticky_sidecar_path(name, resolve_command_cached)
+}
+
+/// The MCP sidecar a summary or restart snapshot may report: the catalog name
+/// only when the binary behind it actually resolves, else `""`.
+///
+/// A sidecar the spawn silently skipped must not be reported as attached: the
+/// UI would claim tools the agent does not have, and the restart diff would
+/// see no drift on the day the binary appears.
+pub(crate) fn attached_mcp_command_with(
+    command: &str,
+    resolve: impl FnOnce(&'static str) -> Option<PathBuf>,
+) -> &'static str {
+    match mcp_sidecar_with(command, resolve) {
+        Some((name, Some(_))) => name,
+        _ => "",
+    }
 }
 
 /// The agent command a freshly-created agent defaults to when the create
@@ -1057,6 +1193,7 @@ fn discover_acp_runtime_phase1(runtime: &'static KnownAcpRuntime, force: bool) -
             source: HarnessSource::Builtin,
             definition_env: Default::default(),
             max_parallelism: super::parallelism::harness_max_parallelism(runtime.id),
+            default_parallelism: super::parallelism::harness_default_parallelism(runtime.id),
         },
     }
 }
@@ -1198,6 +1335,7 @@ pub fn discover_acp_runtimes_from(
                 source: HarnessSource::Custom,
                 definition_env: def.env.clone(), // preserve for edit round-trip
                 max_parallelism: super::parallelism::harness_max_parallelism(&def.command),
+                default_parallelism: super::parallelism::harness_default_parallelism(&def.command),
             });
         }
     }

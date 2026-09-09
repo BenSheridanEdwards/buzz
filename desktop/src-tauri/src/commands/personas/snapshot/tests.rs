@@ -600,6 +600,7 @@ fn import_allowlist_uppercase_is_normalized_and_deduplicated() {
     let lower = upper.to_ascii_lowercase();
     // allowlist-mode source + keep=true: normalization applies.
     let minted = resolve_snapshot_import_behavior(
+        None,
         Some("allowlist"),
         &[upper.clone(), upper.clone()], // uppercase + duplicate
         None,
@@ -618,7 +619,8 @@ fn import_allowlist_uppercase_is_normalized_and_deduplicated() {
 #[test]
 fn import_allowlist_malformed_pubkey_is_rejected() {
     let bad = "notahexpubkey".to_string();
-    let err = resolve_snapshot_import_behavior(Some("allowlist"), &[bad], None, true).unwrap_err();
+    let err =
+        resolve_snapshot_import_behavior(None, Some("allowlist"), &[bad], None, true).unwrap_err();
     assert!(
         err.contains("invalid pubkey"),
         "malformed pubkey must be rejected before key generation: {err}"
@@ -632,6 +634,7 @@ fn import_allowlist_malformed_pubkey_is_rejected() {
 fn import_non_allowlist_mode_preserved_when_keep_false() {
     use crate::managed_agents::RespondTo;
     let minted = resolve_snapshot_import_behavior(
+        None,
         Some("anyone"),
         &[], // no allowlist — toggle never shown
         None,
@@ -651,7 +654,8 @@ fn import_non_allowlist_mode_preserved_when_keep_false() {
 
 #[test]
 fn import_catalog_owner_only_without_allowlist_succeeds() {
-    let minted = resolve_snapshot_import_behavior(Some("owner-only"), &[], None, false).unwrap();
+    let minted =
+        resolve_snapshot_import_behavior(None, Some("owner-only"), &[], None, false).unwrap();
 
     assert_eq!(minted.respond_to, RespondTo::OwnerOnly);
     assert!(minted.respond_to_allowlist.is_empty());
@@ -664,6 +668,7 @@ fn import_non_allowlist_mode_with_nonempty_list_keep_preserves_mode_and_list() {
     use crate::managed_agents::RespondTo;
     let raw = "aabbcc".repeat(11)[..64].to_string();
     let minted = resolve_snapshot_import_behavior(
+        None,
         Some("anyone"),
         std::slice::from_ref(&raw),
         None,
@@ -690,6 +695,7 @@ fn import_non_allowlist_mode_with_nonempty_list_clear_preserves_mode_empties_lis
     use crate::managed_agents::RespondTo;
     let raw = "aabbcc".repeat(11)[..64].to_string();
     let minted = resolve_snapshot_import_behavior(
+        None,
         Some("anyone"),
         &[raw],
         None,
@@ -714,6 +720,7 @@ fn import_allowlist_keep_with_valid_list_succeeds() {
     use crate::managed_agents::RespondTo;
     let raw = "aabbcc".repeat(11)[..64].to_string();
     let minted = resolve_snapshot_import_behavior(
+        None,
         Some("allowlist"),
         std::slice::from_ref(&raw),
         None,
@@ -731,6 +738,7 @@ fn import_allowlist_clear_downgrades_to_owner_only() {
     use crate::managed_agents::RespondTo;
     let raw = "aabbcc".repeat(11)[..64].to_string();
     let minted = resolve_snapshot_import_behavior(
+        None,
         Some("allowlist"),
         &[raw],
         None,
@@ -754,6 +762,7 @@ fn import_allowlist_clear_downgrades_to_owner_only() {
 #[test]
 fn import_empty_allowlist_mode_rejected_with_keep_false() {
     let err = resolve_snapshot_import_behavior(
+        None,
         Some("allowlist"),
         &[], // empty — no entries to keep or clear
         None,
@@ -771,6 +780,7 @@ fn import_empty_allowlist_mode_rejected_with_keep_false() {
 #[test]
 fn import_empty_allowlist_mode_rejected_with_keep_true() {
     let err = resolve_snapshot_import_behavior(
+        None,
         Some("allowlist"),
         &[], // empty
         None,
@@ -788,6 +798,7 @@ fn import_empty_allowlist_mode_rejected_with_keep_true() {
 fn import_out_of_range_parallelism_is_rejected() {
     for bad_par in [0u32, 33u32] {
         let err = resolve_snapshot_import_behavior(
+            None,
             None, // no respond_to (defaults to owner-only)
             &[],
             Some(bad_par),
@@ -970,6 +981,43 @@ mod memory_entries;
 
 #[path = "tests_encode_size.rs"]
 mod encode_size;
+
+// ── Import: the parallelism the persona-snapshot mint site stores ───────────
+//
+// `confirm_agent_snapshot_import` writes `minted.parallelism` straight onto the
+// new `ManagedAgentRecord`; this is the derivation behind that field. Removing
+// the harness fold turns an imported Hermes agent back into 10 workers.
+
+/// A snapshot that names no parallelism imports at the harness default: 1 for
+/// Hermes, the app default for everything else. `definition_parallelism` stays
+/// `None` either way, so re-exporting the imported agent still says "no
+/// opinion" rather than pinning this machine's default.
+#[test]
+fn import_fills_a_blank_parallelism_with_the_harness_default() {
+    let app_default = crate::managed_agents::DEFAULT_AGENT_PARALLELISM;
+    for harness in ["hermes", "hermes-acp"] {
+        let minted =
+            resolve_snapshot_import_behavior(Some(harness), None, &[], None, false).unwrap();
+        assert_eq!(minted.parallelism, 1, "record parallelism for {harness:?}");
+        assert_eq!(minted.definition_parallelism, None);
+    }
+    for harness in [Some("goose"), Some("codex"), None] {
+        let minted = resolve_snapshot_import_behavior(harness, None, &[], None, false).unwrap();
+        assert_eq!(
+            minted.parallelism, app_default,
+            "record parallelism for {harness:?}"
+        );
+    }
+}
+
+/// A snapshot that does name a parallelism keeps it, Hermes included.
+#[test]
+fn import_keeps_a_parallelism_the_snapshot_named() {
+    let minted =
+        resolve_snapshot_import_behavior(Some("hermes"), None, &[], Some(6), false).unwrap();
+    assert_eq!(minted.parallelism, 6);
+    assert_eq!(minted.definition_parallelism, Some(6));
+}
 
 // ── Import: decode_snapshot_for_import (locked cards) ─────────────────────
 

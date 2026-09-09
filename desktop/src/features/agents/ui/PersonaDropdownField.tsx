@@ -17,33 +17,77 @@ import {
 
 export function PersonaDropdownField({
   contentClassName,
+  describedBy,
   disabled,
   id,
   onValueChange,
   options,
   placeholder,
+  readOnly,
   value,
 }: {
   contentClassName?: string;
+  /** Space-separated ids of the help/error text describing this control. */
+  describedBy?: string;
   disabled?: boolean;
   id: string;
   onValueChange: (value: string) => void;
   options: readonly PersonaDropdownOption[];
   placeholder: string;
+  /**
+   * Inert, but still focusable, so a screen reader reaches the control and the
+   * text explaining why it cannot be changed. Prefer this over `disabled` for
+   * a value another surface owns: a `disabled` button is skipped by the tab
+   * order and its `aria-describedby` is never announced.
+   *
+   * Focusable means the tab order, not the mouse. Radix cancels its own
+   * pointerdown on the trigger whenever the menu is closed
+   * (`react-dropdown-menu`: `if (!context.open) event.preventDefault()`), which
+   * for an inert pin is every click, so clicking never lands focus here. Tab
+   * focus is what carries the announcement and it is unaffected; a sighted
+   * mouse user has the same explanation rendered beneath the field.
+   *
+   * Inert here means inert on every modality, not just the keyboard: see the
+   * `onOpenChange` guard below.
+   */
+  readOnly?: boolean;
   value: string;
 }) {
   const [open, setOpen] = React.useState(false);
+  const isInert = disabled === true || readOnly === true;
   const selectedOption = options.find((option) => option.value === value);
 
   return (
     <div className={PERSONA_FIELD_SHELL_CLASS}>
-      <DropdownMenu modal={false} onOpenChange={setOpen} open={open}>
+      <DropdownMenu
+        modal={false}
+        onOpenChange={(next) => {
+          // Guard the state transition, not the events that cause it. Radix
+          // opens this menu from four places on the trigger (pointerdown,
+          // ArrowDown, Enter and Space) and every one of them funnels through
+          // this controlled setter, so one check covers every modality and a
+          // modality added later cannot slip past an event allowlist. An
+          // `onClick` guard in particular never worked: Radix has already
+          // toggled on pointerdown by the time click fires.
+          //
+          // Closing is never blocked, so a menu opened before the field turned
+          // inert stays dismissable (AGENTS.md rule 6). That leaves the items
+          // of an already-open menu alive after `isInert` flips, so this is
+          // not the only route to `onValueChange`: the pick handler below
+          // carries its own guard for exactly that window.
+          if (next && isInert) return;
+          setOpen(next);
+        }}
+        open={open}
+      >
         <DropdownMenuTrigger asChild>
           <button
+            aria-describedby={describedBy}
+            aria-disabled={isInert || undefined}
             className={cn(
               "flex h-11 w-full items-center justify-between gap-3 px-3 py-2 text-left text-sm leading-6",
               PERSONA_FIELD_CONTROL_CLASS,
-              disabled && "cursor-default opacity-60",
+              isInert && "cursor-default opacity-60",
             )}
             disabled={disabled}
             id={id}
@@ -77,8 +121,14 @@ export function PersonaDropdownField({
           >
             <DropdownMenuRadioGroup
               onValueChange={(nextValue) => {
-                onValueChange(nextValue);
                 setOpen(false);
+                // The field can turn inert while this menu is open: on an
+                // instance form the pin becomes inherited the moment the
+                // persona query settles, and the open guard above
+                // deliberately leaves the open menu alone. Dismissing still
+                // works; the write does not.
+                if (isInert) return;
+                onValueChange(nextValue);
               }}
               value={value}
             >

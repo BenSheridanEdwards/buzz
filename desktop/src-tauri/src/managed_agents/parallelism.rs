@@ -26,12 +26,51 @@ pub const OPENCLAW_MAX_PARALLELISM: u32 = 5;
 /// `None` when the harness has no cap.
 ///
 /// Keyed on [`super::discovery::normalize_command_identity`] so path prefixes,
-/// the `.exe` suffix on Windows, and other cosmetic differences are ignored.
+/// the Windows launcher suffixes (`.exe` and npm's `.cmd`/`.bat` shims), and
+/// other cosmetic differences are ignored.
 pub fn harness_max_parallelism(command: &str) -> Option<u32> {
     match super::discovery::normalize_command_identity(command).as_str() {
         "openclaw" => Some(OPENCLAW_MAX_PARALLELISM),
         _ => None,
     }
+}
+
+/// Return the parallelism a freshly minted record stores when neither the
+/// create input nor the linked definition sets one.
+///
+/// The app-wide default is [`super::DEFAULT_AGENT_PARALLELISM`]; a preset can
+/// carry its own (`PresetHarness::default_parallelism`), e.g. Hermes, where
+/// every worker is a full Hermes process loading the profile's MCP servers.
+/// Accepts a runtime id ("hermes") or a command ("hermes-acp", path-prefixed,
+/// `.exe`-suffixed, or an npm `.cmd`/`.bat` shim) and reads static data only,
+/// so it is safe inside discovery and at the mint sites alike.
+pub fn harness_default_parallelism(harness: &str) -> u32 {
+    super::discovery::preset_default_parallelism(harness)
+        .unwrap_or(super::DEFAULT_AGENT_PARALLELISM)
+}
+
+/// Resolve the parallelism to persist on a new record: the explicit or
+/// definition-provided value when present, else the harness default.
+///
+/// Shared by every mint site (create, team snapshot adopt, persona snapshot
+/// import) so they cannot drift on which default applies. The sites do not
+/// hold the same key: create resolves a command, the two snapshot importers
+/// hold a `definition.runtime` id, and either can name a *custom* harness that
+/// only the loaded registry knows. Both are funnelled through
+/// [`canonical_harness_command`](super::discovery::canonical_harness_command)
+/// first — the same three-tier lookup (builtins, static presets, loaded
+/// registry) the harness selector uses — so a custom harness wrapping
+/// `hermes-acp` mints 1 everywhere, matching the 1 its catalog entry
+/// advertises, instead of 1 on create and 10 on import.
+///
+/// Unresolvable input falls through to the raw string, which the static preset
+/// table then rejects, so an unknown harness still gets the app default.
+pub fn mint_parallelism(harness: &str, requested: Option<u32>) -> u32 {
+    if let Some(value) = requested {
+        return value;
+    }
+    let canonical = super::discovery::canonical_harness_command(harness);
+    harness_default_parallelism(canonical.as_deref().unwrap_or(harness))
 }
 
 /// Return the effective parallelism for the given harness command and
@@ -172,6 +211,10 @@ mod tests {
             super::harness_max_parallelism(r"C:\Tools\openclaw.exe"),
             Some(cap)
         );
+        // npm shim spellings key the cap table too, or a Windows npm install
+        // would run the OpenClaw gateway uncapped.
+        assert_eq!(super::harness_max_parallelism("openclaw.cmd"), Some(cap));
+        assert_eq!(super::harness_max_parallelism("openclaw.bat"), Some(cap));
         assert_eq!(super::harness_max_parallelism("goose"), None);
         assert_eq!(super::harness_max_parallelism("buzz-agent"), None);
         assert_eq!(super::harness_max_parallelism(""), None);
@@ -182,6 +225,227 @@ mod tests {
         assert_eq!(super::effective_parallelism("openclaw", cap - 2), cap - 2);
         assert_eq!(super::effective_parallelism("goose", 99), 99);
         assert_eq!(super::effective_parallelism("buzz-agent", 32), 32);
+    }
+
+    // ── Policy table: harness_default_parallelism / mint_parallelism ──────────
+
+    /// Hermes (by id, command, path, or `.exe`) defaults to 1; every other
+    /// harness, including unknown and empty commands, uses the app default.
+    #[test]
+    fn default_parallelism_table() {
+        let app_default = crate::managed_agents::DEFAULT_AGENT_PARALLELISM;
+        for hermes in [
+            "hermes",
+            "hermes-acp",
+            "/opt/hermes/bin/hermes-acp",
+            "hermes-acp.exe",
+            r"C:\Tools\Hermes\HERMES-ACP.EXE",
+            "hermes-acp.cmd",
+            "hermes-acp.bat",
+            r"C:\Users\me\AppData\Roaming\npm\hermes-acp.cmd",
+        ] {
+            assert_eq!(
+                super::harness_default_parallelism(hermes),
+                1,
+                "Hermes default parallelism for {hermes:?}"
+            );
+        }
+        for other in [
+            "goose",
+            "claude-agent-acp",
+            "codex-acp",
+            "buzz-agent",
+            "openclaw",
+            "devin",
+            "/opt/custom/my-agent",
+            "",
+        ] {
+            assert_eq!(
+                super::harness_default_parallelism(other),
+                app_default,
+                "non-Hermes default parallelism for {other:?}"
+            );
+        }
+        assert_ne!(app_default, 1, "the Hermes default must be observable");
+    }
+
+    /// Every Windows launcher spelling of the Hermes command is the same
+    /// identity to the desktop as it is to the harness.
+    ///
+    /// `buzz_acp::config::normalize_agent_command_identity` strips `.exe`,
+    /// `.cmd` and `.bat`, so buzz-acp treats an npm shim as Hermes and applies
+    /// `HERMES_ACP_SKIP_CONFIGURED_MCP`. While
+    /// [`super::discovery::normalize_command_identity`] stripped only `.exe`,
+    /// the desktop did not recognise the same command: a user-typed custom
+    /// harness or `agent_command_override` pointing at
+    /// `…\npm\hermes-acp.cmd` minted the app default and started ten full
+    /// Hermes processes, self-consistently (the catalog entry advertised 10
+    /// too) and therefore silently. This pins the spellings on both sides of
+    /// that gap.
+    #[test]
+    fn hermes_launcher_spellings_share_one_identity_with_the_harness() {
+        use crate::managed_agents::discovery::normalize_command_identity;
+        let app_default = crate::managed_agents::DEFAULT_AGENT_PARALLELISM;
+
+        for spelling in [
+            "hermes-acp",
+            "hermes-acp.exe",
+            "hermes-acp.cmd",
+            "hermes-acp.bat",
+            "/opt/hermes/bin/hermes-acp",
+            r"C:\Users\me\AppData\Roaming\npm\hermes-acp.cmd",
+            r"C:\Tools\Hermes\HERMES-ACP.EXE",
+        ] {
+            assert_eq!(
+                normalize_command_identity(spelling),
+                "hermes-acp",
+                "identity for {spelling:?}"
+            );
+            // The number the catalog entry advertises (agent_discovery emits
+            // `harness_default_parallelism`) and the number the create site
+            // mints must be the same 1.
+            assert_eq!(
+                super::harness_default_parallelism(spelling),
+                1,
+                "catalog default for {spelling:?}"
+            );
+            assert_eq!(
+                super::mint_parallelism(spelling, None),
+                1,
+                "minted parallelism for {spelling:?}"
+            );
+        }
+
+        // A wrapper script is not a launcher shim: nothing short of executing
+        // it could say what it wraps, so it keeps the app default.
+        for opaque in [
+            "hermes-acp.sh",
+            "/usr/local/bin/hermes-wrapper.sh",
+            "/usr/local/bin/my-hermes",
+        ] {
+            assert_eq!(
+                super::mint_parallelism(opaque, None),
+                app_default,
+                "minted parallelism for {opaque:?}"
+            );
+        }
+    }
+
+    /// The registry key space agrees with the command key space on the shim
+    /// spelling too: a custom harness whose command is the npm shim mints 1
+    /// from its id at the two snapshot importers, not just from its command at
+    /// create.
+    #[test]
+    fn mint_parallelism_resolves_a_shim_spelled_custom_harness() {
+        use crate::managed_agents::custom_harnesses::{
+            registry_test_lock, update_loaded_harness_registry, HarnessDefinition,
+        };
+        let _lock = registry_test_lock();
+        update_loaded_harness_registry(vec![HarnessDefinition {
+            id: "npm-hermes".to_string(),
+            label: "Hermes via npm".to_string(),
+            command: r"C:\Users\me\AppData\Roaming\npm\hermes-acp.cmd".to_string(),
+            args: vec![],
+            env: std::collections::BTreeMap::new(),
+            install_instructions_url: String::new(),
+            install_hint: String::new(),
+        }]);
+
+        assert_eq!(
+            super::mint_parallelism("npm-hermes", None),
+            1,
+            "a custom harness id wrapping the npm shim must mint 1"
+        );
+        assert_eq!(
+            super::mint_parallelism(r"C:\Users\me\AppData\Roaming\npm\hermes-acp.cmd", None),
+            1,
+            "and so must the command it wraps"
+        );
+
+        update_loaded_harness_registry(vec![]);
+    }
+
+    /// A custom harness wrapping the Hermes command mints 1 from *either* key
+    /// space, so the three mint sites agree with each other and with the
+    /// number the harness's own catalog entry advertises.
+    ///
+    /// Create resolves a command before minting; the two snapshot importers
+    /// hold `definition.runtime`, a runtime id that only the loaded registry
+    /// can map. Before the canonicalization in `mint_parallelism`, the id
+    /// missed the preset table entirely and the same harness minted 1 on
+    /// create and 10 on import.
+    #[test]
+    fn mint_parallelism_resolves_a_custom_harness_through_the_registry() {
+        use crate::managed_agents::custom_harnesses::{
+            registry_test_lock, update_loaded_harness_registry, HarnessDefinition,
+        };
+        let _lock = registry_test_lock();
+        update_loaded_harness_registry(vec![HarnessDefinition {
+            id: "my-hermes".to_string(),
+            label: "My Hermes".to_string(),
+            command: "hermes-acp".to_string(),
+            args: vec![],
+            env: std::collections::BTreeMap::new(),
+            install_instructions_url: String::new(),
+            install_hint: String::new(),
+        }]);
+
+        // The create site's key space (command) and the snapshot importers'
+        // (runtime id) must land on the same number.
+        assert_eq!(super::mint_parallelism("hermes-acp", None), 1);
+        assert_eq!(
+            super::mint_parallelism("my-hermes", None),
+            1,
+            "a custom harness id wrapping hermes-acp must mint 1, not the app default"
+        );
+        // And that number is what the harness's catalog entry advertises.
+        assert_eq!(super::harness_default_parallelism("hermes-acp"), 1);
+
+        // An id the registry does not know still falls through to the app default.
+        assert_eq!(
+            super::mint_parallelism("not-registered", None),
+            crate::managed_agents::DEFAULT_AGENT_PARALLELISM
+        );
+
+        update_loaded_harness_registry(vec![]);
+    }
+
+    /// A custom harness that wraps a non-Hermes command keeps the app default,
+    /// so the canonicalization cannot leak Hermes's 1 into unrelated harnesses.
+    #[test]
+    fn mint_parallelism_leaves_unrelated_custom_harnesses_on_the_app_default() {
+        use crate::managed_agents::custom_harnesses::{
+            registry_test_lock, update_loaded_harness_registry, HarnessDefinition,
+        };
+        let _lock = registry_test_lock();
+        update_loaded_harness_registry(vec![HarnessDefinition {
+            id: "my-goose".to_string(),
+            label: "My Goose".to_string(),
+            command: "goose".to_string(),
+            args: vec![],
+            env: std::collections::BTreeMap::new(),
+            install_instructions_url: String::new(),
+            install_hint: String::new(),
+        }]);
+        assert_eq!(
+            super::mint_parallelism("my-goose", None),
+            crate::managed_agents::DEFAULT_AGENT_PARALLELISM
+        );
+        update_loaded_harness_registry(vec![]);
+    }
+
+    /// Explicit or definition-provided values always win over the harness
+    /// default; the default fills in only when nothing was requested.
+    #[test]
+    fn mint_parallelism_prefers_requested_value() {
+        assert_eq!(super::mint_parallelism("hermes-acp", None), 1);
+        assert_eq!(super::mint_parallelism("hermes", None), 1);
+        assert_eq!(super::mint_parallelism("hermes-acp", Some(4)), 4);
+        assert_eq!(
+            super::mint_parallelism("goose", None),
+            crate::managed_agents::DEFAULT_AGENT_PARALLELISM
+        );
+        assert_eq!(super::mint_parallelism("goose", Some(2)), 2);
     }
 
     // ── acp_agents_value: spawn-env seam ──────────────────────────────────────
