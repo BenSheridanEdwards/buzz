@@ -13,6 +13,21 @@
 //! Nothing is dropped silently: every rejected tag, failed download, and
 //! over-cap attachment is named in the section with its reason (rule 1).
 //!
+//! # Remote input is where this module has a boundary
+//!
+//! Unlike the outbound side (see `crate::media_publish`'s module doc: the
+//! engine shares the harness's uid and has a shell, so the rules there are
+//! defence in depth rather than a privilege boundary), everything this module
+//! consumes comes from another relay member: the URL, the hash, the size,
+//! the declared type, the `filename`, and the bytes themselves. That member
+//! has no account on the host. So the one thing the harness must not do is
+//! turn their input into a write of their bytes at a path they chose: the
+//! name is `<index>-<their own filename>`, fully predictable, in a directory
+//! the engine can write, and a plain `fs::write` there follows a symlink at
+//! the last component. Every blob therefore goes through [`DirHandle`],
+//! `openat`-relative to a descriptor taken once when the turn directory was
+//! opened, with `O_CREAT | O_EXCL | O_NOFOLLOW`.
+//!
 //! Storage is bounded two ways: the whole inbound phase runs under
 //! [`INBOUND_DEADLINE`], and the attachment root keeps at most
 //! [`KEEP_TURN_DIRS`] turn directories, never pruning one whose turn is
@@ -1033,24 +1048,35 @@ impl Drop for PublishScratch {
 /// its last component, and decide on the open handle whether it is eligible
 /// to be published. Returns the handle and its length.
 ///
-/// This is the last of the three containment primitives and the only one
-/// that looks at the file itself rather than at a path. `confine` decides
-/// where a name is allowed to resolve to; this decides whether the thing it
-/// resolved to may leave the host, and it decides it on the handle the bytes
-/// will actually be read from, so a path that resolved to a regular file
-/// cannot be swapped for a link (or for different content) in between.
+/// This is the last of the three outbound primitives and the only one that
+/// looks at the file itself rather than at a path. `confine` decides where a
+/// name is allowed to resolve to; this decides whether the thing it resolved
+/// to may leave the host, and it decides it on the handle the bytes will
+/// actually be read from, so a path that resolved to a regular file cannot be
+/// swapped for a link (or for different content) in between.
 ///
-/// A file with more than one link is refused. Containment is decided with
-/// `canonicalize`, which resolves symlinks and has nothing to resolve for a
-/// hard link: a second name for an inode is its own canonical path, so
-/// `ln ~/Documents/passport.pdf <turn dir>/note.pdf` puts a file that is
-/// nowhere near a root under one, and every path-shaped guard agrees that it
-/// belongs there. Both roots are engine-writable, so the engine can always
-/// make that second name. `nlink == 1` is the property that says a file has
-/// no other name, and it is only readable from the inode. The cost is that a
-/// legitimately hard-linked file (a package store, a de-duplicated backup)
-/// cannot be published from a root; it earns a note, and copying it into the
-/// root makes it publishable.
+/// A file with more than one link is refused. `canonicalize` resolves
+/// symlinks and has nothing to resolve for a hard link: a second name for an
+/// inode is its own canonical path, so `ln ~/Documents/passport.pdf <turn
+/// dir>/note.pdf` puts a file that is nowhere near a root under one, and
+/// every path-shaped guard agrees that it belongs there. `nlink == 1` is the
+/// property that says a file has no *other* name, and it is only readable
+/// from the inode.
+///
+/// **What that does not establish is provenance.** A hard link is not the
+/// only way to give a host file a name inside a root: `mv
+/// ~/Documents/passport.pdf <turn dir>/note.pdf` leaves the link count at
+/// one, needs no read permission on the file, and publishes. Nothing here can
+/// fix that, because the roots are writable by the engine and the engine
+/// decides which inodes live in them. This check is worth its two lines
+/// because a stray hard link is a thing that happens by accident (package
+/// stores, de-duplicated backups, copy tools) and a `mv` into the turn
+/// directory is not; it is not worth the sentence the module doc used to
+/// carry, which said this was the thing a hostile engine could not fake. See
+/// `crate::media_publish`'s module doc for what the outbound rules do and do
+/// not claim. The cost is that a legitimately hard-linked file cannot be
+/// published from a root; it earns a note, and copying it in makes it
+/// publishable.
 pub fn open_verified(
     path: &Path,
     expected_len: Option<u64>,

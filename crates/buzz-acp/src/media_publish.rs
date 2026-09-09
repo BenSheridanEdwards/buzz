@@ -16,7 +16,49 @@
 //! the relay refuses audio and ffmpeg is available, and as a generic file
 //! otherwise; the log says which.
 //!
-//! # The containment model
+//! # What the outbound rules are, and what they are not
+//!
+//! **They are not a privilege boundary, because there is none to enforce.**
+//! The engine is a child process at the same uid as the harness, and
+//! `AcpClient::handle_permission_request` in [`crate::acp`] answers every
+//! `session/request_permission` by selecting the request's own allow-once
+//! option, whatever the request was for; the only path that does not approve
+//! is one where the engine offered no allow-once option at all. The base
+//! prompt then tells the engine to do its publishing itself, by running the
+//! `buzz` CLI (`buzz upload file`, `buzz messages send`) through its own
+//! shell, with the relay URL, the agent key and the auth tag already in its
+//! environment. An engine that wants to put the user's passport in a channel
+//! can read the bytes and upload them without involving this module at all.
+//! Naming a path to the harness buys it nothing it does not already have.
+//!
+//! **What they are is defence in depth against the harness reading a file it
+//! was merely told about.** The reply stream is not only the engine's
+//! intent: it carries text the engine copied out of a document, a path a
+//! channel member asked it to echo, a mistake about which of two similar
+//! paths it meant. Refusing to read outside the turn directory means those
+//! turn into a note in the thread and a line in the log instead of an upload.
+//! It lowers the rate of accidental disclosure and makes deliberate
+//! disclosure explicit: the CLI route is the engine's own signed action,
+//! visible as such, rather than the harness quietly acting as a more
+//! privileged reader on its behalf.
+//!
+//! **Two things would make it a real boundary, and neither is in scope
+//! here.** Give the engine a different uid (or a sandbox) so the file system
+//! is not shared, or stop auto-approving permissions so that reading a file
+//! is a decision rather than a default. Until one of those happens, every
+//! rule below is a guard against accident and confusion, and the model
+//! claims nothing more.
+//!
+//! Two consequences follow, and both are accepted rather than patched. The
+//! turn directory's own name is not checked against the descriptor that made
+//! it, so an engine that replaces `<root>/<turn id>` with a symlink to
+//! `$HOME` makes `$HOME` a root; and a host file *moved* into a root
+//! (`mv ~/Documents/passport.pdf <turn dir>/note.pdf`) has one link, is its
+//! own canonical path under a root, and publishes. Both are the engine using
+//! write access to a directory it owns, which is the same access it uses to
+//! run the CLI. Closing them would move the guard, not the outcome.
+//!
+//! # The rules themselves
 //!
 //! A reply names a path; it does not get to read one. Two directories are
 //! outbound roots: this turn's own directory under the attachment root,
@@ -27,27 +69,31 @@
 //! directory). Otherwise the turn directory is the only root and the reply
 //! notes say so. A file is eligible when the reply names it absolutely,
 //! without `..`, it canonicalises to a path under a root, and the handle
-//! opened `O_NOFOLLOW` at that path reports a regular file, of the length
-//! recorded a moment earlier, with exactly one link. Three primitives
-//! enforce that and nothing else is trusted to:
-//! [`OutboundRoots::confine`] resolves the name and tests it against the
-//! roots, [`crate::attachments::open_verified`] decides eligibility on the
-//! open handle (`nlink == 1` is what a hard link into a root cannot fake),
-//! and [`crate::attachments::PublishScratch`] holds an open descriptor on a
+//! opened `O_NOFOLLOW | O_NONBLOCK` at that path reports a regular file, of
+//! the length recorded a moment earlier, with exactly one link. Three
+//! primitives carry that: [`OutboundRoots::confine`] resolves the name and
+//! tests it against the roots, [`crate::attachments::open_verified`] decides
+//! on the open handle rather than on the name, and
+//! [`crate::attachments::PublishScratch`] holds an open descriptor on a
 //! private directory into which every accepted file is copied through that
 //! handle, so from staging onwards the upload reads only harness-owned
 //! snapshots, `openat`-relative, and resolves no path a second time.
 //!
-//! Both roots are writable by the engine, and an accepted workspace is a
-//! read primitive over its whole tree for anyone who can talk to the agent
-//! (see `docs/remote-agents.md`); that is the trade the workspace rule
-//! exists to bound.
+//! The scratch and the descriptor-relative upload are the part of this that
+//! would still hold if the engine were sandboxed tomorrow, because they are
+//! built on an inode the harness holds open rather than on a name. The root
+//! rules are not, and are not claimed to be.
+//!
+//! An accepted workspace is a read primitive over its whole tree for anyone
+//! who can talk to the agent (see `docs/remote-agents.md`); that is the trade
+//! the workspace rule exists to bound, for the accident case above.
 //!
 //! Every refusal reason that can reach [`failure_notice`] is a *reason*, not
-//! a path: the notice is posted into the channel, and the canonical path a
-//! name resolved to is the host's `HOME`, attachment root or scratch. The
-//! caller prefixes the reply's own basename for the file; the absolute path
-//! goes to `tracing` instead.
+//! a path: the notice is posted into the channel, so it would otherwise tell
+//! every member of that channel the host's `HOME`, temp directory and agent
+//! pubkey directory, and the engine can make one fire on demand. The caller
+//! prefixes the reply's own basename for the file; the absolute path goes to
+//! `tracing` instead.
 
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
