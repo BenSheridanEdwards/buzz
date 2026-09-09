@@ -9,8 +9,14 @@ import {
 } from "@/features/messages/lib/audioAttachment";
 import type { MediaUploadController } from "@/features/messages/lib/useMediaUpload";
 import { useVoiceNoteRecorder } from "@/features/messages/lib/useVoiceNoteRecorder";
+import {
+  claimVoiceNoteRecording,
+  discardActiveVoiceNoteRecording,
+  getVoiceNoteRecordingOwner,
+  subscribeVoiceNoteRecording,
+} from "@/features/messages/lib/voiceNoteRecordingRegistry";
 import { useVoiceNoteReviewEnabled } from "@/features/messages/lib/voiceNoteReviewPreference";
-import { useEscapeKey } from "@/shared/hooks/useEscapeKey";
+import { acquireEscapeSurface } from "@/shared/hooks/escapeSurfaces";
 import { Button } from "@/shared/ui/button";
 import { VoiceNoteRecorder } from "./VoiceNoteRecorder";
 
@@ -90,6 +96,17 @@ export function useComposerVoiceNote({
   submit: () => void;
 }) {
   const recorder = useVoiceNoteRecorder();
+  // Identity for the recording claim: composers are siblings with no shared
+  // owner, so the registry keys on this instead of on a React tree position.
+  const composerId = React.useId();
+  const recordingOwner = React.useSyncExternalStore(
+    subscribeVoiceNoteRecording,
+    getVoiceNoteRecordingOwner,
+    getVoiceNoteRecordingOwner,
+  );
+  const otherComposerIsRecording =
+    recordingOwner !== null && recordingOwner !== composerId;
+  const releaseRecordingRef = React.useRef<(() => void) | null>(null);
   const reviewEnabled = useVoiceNoteReviewEnabled();
   const reviewEnabledRef = React.useRef(reviewEnabled);
   reviewEnabledRef.current = reviewEnabled;
@@ -150,6 +167,22 @@ export function useComposerVoiceNote({
     if (statusRef.current !== "idle") outcomeRef.current = "discarded";
     recorder.cancel();
   }, [recorder.cancel, releaseHold]);
+  const discardRef = React.useRef(discard);
+  discardRef.current = discard;
+
+  /**
+   * Escape's discard. Once Send has been pressed the note is on its way out,
+   * and an ambient key must not cancel an upload the user just committed to:
+   * the row says "Preparing voice note" and finishes. The trash keeps working
+   * throughout, because pressing it is a deliberate "throw this away" and it
+   * is the only way back once the encode has started.
+   */
+  const requestDiscard = React.useCallback(() => {
+    if (outcomeRef.current === "finished") return;
+    discard();
+  }, [discard]);
+  const requestDiscardRef = React.useRef(requestDiscard);
+  requestDiscardRef.current = requestDiscard;
 
   // biome-ignore lint/correctness/useExhaustiveDependencies: composer identity fields are the cancellation triggers
   React.useEffect(() => {
@@ -206,20 +239,35 @@ export function useComposerVoiceNote({
     }
   }, [send, recorder.elapsedSeconds, recorder.status]);
 
-  /** A voice note must be the only attachment. */
+  /**
+   * A voice note must be the only attachment, and only one composer in the
+   * window may hold the microphone.
+   */
   const canStart = React.useCallback(() => {
+    if (getVoiceNoteRecordingOwner() !== null) return false;
     const attachments = getAttachmentsRef.current();
     return attachments.pending.length === 0 && attachments.queued.length === 0;
   }, []);
 
   const acceptsStart = React.useCallback(() => {
     if (canStart()) return true;
-    toast.error("A voice note must be the only attachment.");
+    toast.error(
+      getVoiceNoteRecordingOwner() !== null
+        ? "Finish or discard the other voice note first."
+        : "A voice note must be the only attachment.",
+    );
     return false;
   }, [canStart]);
 
   const beginRecording = React.useCallback(
     ({ locked }: { locked: boolean }) => {
+      // Claim before the microphone opens: a second composer that gets here
+      // in the same tick is refused rather than opening a rival recorder.
+      releaseRecordingRef.current?.();
+      releaseRecordingRef.current = claimVoiceNoteRecording(composerId, () =>
+        discardRef.current(),
+      );
+      if (releaseRecordingRef.current === null) return;
       recordingContextRef.current = currentContextRef.current;
       outcomeRef.current = null;
       onBeforeStartRef.current();
@@ -227,8 +275,16 @@ export function useComposerVoiceNote({
       void startRef.current();
       if (locked) recorder.lock();
     },
-    [recorder.lock],
+    [composerId, recorder.lock],
   );
+
+  // The claim outlives the row only as long as the recorder is busy: a
+  // discard, a send, or a failed start all return the microphone.
+  React.useEffect(() => {
+    if (recorder.status !== "idle") return;
+    releaseRecordingRef.current?.();
+    releaseRecordingRef.current = null;
+  }, [recorder.status]);
 
   const lock = React.useCallback(() => {
     const status = statusRef.current;
@@ -263,6 +319,11 @@ export function useComposerVoiceNote({
   const endHoldRef = React.useRef(endHold);
   endHoldRef.current = endHold;
   const endPointerHold = React.useCallback(() => endHold("release"), [endHold]);
+  /** The mic's own `pointercancel`, which fires before the window's. */
+  const cancelPointerHold = React.useCallback(
+    () => endHold("interruption"),
+    [endHold],
+  );
 
   const beginHold = React.useCallback(
     (source: VoiceNoteHoldSource) => {
@@ -280,7 +341,9 @@ export function useComposerVoiceNote({
       document.addEventListener("visibilitychange", onVisibilityChange);
       if (source === "pointer") {
         window.addEventListener("pointerup", onRelease);
-        window.addEventListener("pointercancel", onRelease);
+        // A cancelled press is the system taking the pointer away, not the
+        // user letting go: it must never read as a tap and lock hands free.
+        window.addEventListener("pointercancel", onInterruption);
       } else {
         window.addEventListener("keyup", onKeyUp);
       }
@@ -289,7 +352,7 @@ export function useComposerVoiceNote({
           window.removeEventListener("blur", onInterruption);
           document.removeEventListener("visibilitychange", onVisibilityChange);
           window.removeEventListener("pointerup", onRelease);
-          window.removeEventListener("pointercancel", onRelease);
+          window.removeEventListener("pointercancel", onInterruption);
           window.removeEventListener("keyup", onKeyUp);
         },
         source,
@@ -332,11 +395,33 @@ export function useComposerVoiceNote({
   const handleEditorKeyDown = React.useCallback(
     (
       event: React.KeyboardEvent<HTMLElement>,
-      { editorEmpty }: { editorEmpty: boolean },
+      {
+        editorEmpty,
+        mentionOpen = false,
+      }: { editorEmpty: boolean; mentionOpen?: boolean },
     ): boolean => {
       // Mid-composition keys belong to the IME (Space picks a candidate).
       if (event.nativeEvent.isComposing) return false;
       const status = statusRef.current;
+      if (event.key === "Escape") {
+        // An open autocomplete owns Escape: the first press closes the list,
+        // and only a press with no list open reaches the recording. This
+        // handler runs before the mention handler, so it has to decline
+        // rather than rely on the list marking the event handled.
+        if (mentionOpen) return false;
+        if (status !== "idle") {
+          event.preventDefault();
+          requestDiscardRef.current();
+          return true;
+        }
+        // ProseMirror marks Escape handled at the contenteditable, so a
+        // sibling composer's recording is otherwise unreachable from here.
+        if (discardActiveVoiceNoteRecording()) {
+          event.preventDefault();
+          return true;
+        }
+        return false;
+      }
       if (isSpaceKey(event)) {
         // Shift+Space and other chords are not Space: they keep typing.
         if (!isPlainKey(event)) return false;
@@ -353,11 +438,6 @@ export function useComposerVoiceNote({
         return true;
       }
       if (status === "idle") return false;
-      if (event.key === "Escape") {
-        event.preventDefault();
-        discard();
-        return true;
-      }
       if (isLockKey(event) && isPlainKey(event)) {
         if (lockKeyHeldRef.current) {
           // Holding L: swallow the auto-repeat instead of typing "l".
@@ -376,14 +456,43 @@ export function useComposerVoiceNote({
       }
       return false;
     },
-    [beginHold, canStart, discard, lock],
+    [beginHold, canStart, lock],
   );
 
   // Esc discards from anywhere: the recorder is a closable surface, so the
-  // app-level Esc shortcut (mark channel read) yields to it instead of
-  // winning on listener order.
+  // app-level Esc shortcut (mark channel read) and the panels around it yield
+  // to it instead of winning on listener order.
+  //
+  // Two passes, because the row's own controls are Radix tooltip triggers and
+  // an open (or still-animating-out) tooltip is a document-capture layer that
+  // would swallow the key: for a target inside the row the recorder claims Esc
+  // in the window capture phase, which runs before any document listener.
+  // Everything else goes through the bubble pass, so menus, popovers and
+  // dialogs opened over the composer still take Esc first as before.
   const active = recorder.status !== "idle";
-  useEscapeKey(discard, active);
+  React.useEffect(() => {
+    if (!active) return;
+    const surface = acquireEscapeSurface();
+    const rowOwnsTarget = (target: EventTarget | null) =>
+      target instanceof Node &&
+      (recorderRef.current?.contains(target) ?? false);
+    const handle = (event: KeyboardEvent, insideRow: boolean) => {
+      if (event.key !== "Escape" || event.defaultPrevented) return;
+      if (!surface.isTopmost()) return;
+      if (rowOwnsTarget(event.target) !== insideRow) return;
+      event.preventDefault();
+      requestDiscardRef.current();
+    };
+    const onCapture = (event: KeyboardEvent) => handle(event, true);
+    const onBubble = (event: KeyboardEvent) => handle(event, false);
+    window.addEventListener("keydown", onCapture, { capture: true });
+    window.addEventListener("keydown", onBubble);
+    return () => {
+      window.removeEventListener("keydown", onCapture, { capture: true });
+      window.removeEventListener("keydown", onBubble);
+      surface.release();
+    };
+  }, [active]);
 
   // Outside the editor (a focused chip, toolbar control, or nothing at all
   // during a pointer hold), L still locks; the editor path handles typing.
@@ -416,6 +525,15 @@ export function useComposerVoiceNote({
   React.useEffect(
     () => () => {
       releaseHold();
+      releaseRecordingRef.current?.();
+      releaseRecordingRef.current = null;
+      // Navigation can take the whole composer away mid-recording (a profile
+      // or thread overlay replacing the channel on a narrow window). The live
+      // region unmounts with it, so the only way the loss is not silent is a
+      // toast, which lives at the app root and outlives the composer.
+      if (statusRef.current !== "idle") {
+        toast("Voice note discarded when the composer closed.");
+      }
     },
     [releaseHold],
   );
@@ -587,8 +705,11 @@ export function useComposerVoiceNote({
     ...recorder,
     acceptsAttachment: recorder.status === "idle" && !hasAttachment,
     beginPointerHold,
+    cancelHold: cancelPointerHold,
     discard,
     endHold: endPointerHold,
+    /** Another composer holds the microphone: this one's mic is disabled. */
+    otherComposerIsRecording,
     finish,
     handleEditorKeyDown,
     hasAttachment,

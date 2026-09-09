@@ -765,6 +765,9 @@ function MessageComposerImpl({
           editorEmpty: richText.editor
             ? richText.editor.isEmpty
             : isContentEmpty,
+          // Escape belongs to the mention list while it is open; the recorder
+          // handler runs first here, so it has to be told.
+          mentionOpen: mentions.isMentionOpen,
         })
       ) {
         return;
@@ -1018,6 +1021,7 @@ function MessageComposerImpl({
                 voiceNote.status === "processing"
               }
               isVoiceNoteRecording={voiceNote.status !== "idle"}
+              isVoiceNoteBlocked={voiceNote.otherComposerIsRecording}
               hasVoiceNoteAttachment={voiceNote.hasAttachment}
               voiceNoteRecorder={voiceNote.recorderElement}
               onCaptureSelection={handleCaptureSelection}
@@ -1032,6 +1036,7 @@ function MessageComposerImpl({
               onPaperclip={handlePaperclipClick}
               onSendVoiceNote={voiceNote.send}
               onVoiceNote={voiceNote.startLocked}
+              onVoiceNoteHoldCancel={voiceNote.cancelHold}
               onVoiceNoteHoldEnd={voiceNote.endHold}
               onVoiceNoteHoldStart={voiceNote.beginPointerHold}
               onRemoveAddressedAgent={removeAddressedAgent}

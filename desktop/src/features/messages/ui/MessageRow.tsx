@@ -39,12 +39,11 @@ import { UserAvatar } from "@/shared/ui/UserAvatar";
 import { useChannelNavigation } from "@/shared/context/ChannelNavigationContext";
 import { parseImetaTags } from "@/shared/ui/markdown/parseImeta";
 import { useMessageEmoji } from "@/features/messages/lib/useMessageEmoji";
+import { useVoiceNoteCardContext } from "@/features/messages/ui/useVoiceNoteCardContext";
 import { parseWaveMessageContent } from "@/features/messages/lib/waveMessage";
 import { resolveSnapshotSharedBy } from "@/features/messages/lib/snapshotSharedBy";
-import { isVoiceNoteAttachment } from "@/features/messages/lib/audioAttachment";
 import { getChannelIdFromTags } from "@/features/messages/lib/threading";
 import { Markdown } from "@/shared/ui/markdown";
-import type { VoiceNoteCardContext } from "@/shared/ui/markdown/types";
 import { resolveMentionProps } from "@/shared/lib/resolveMentionNames";
 import type { VideoReviewContext } from "@/shared/ui/VideoPlayer";
 import { VideoReviewCommentMarkdown } from "@/shared/ui/VideoReviewCommentMarkdown";
@@ -326,35 +325,13 @@ export const MessageRow = React.memo(
     // event's own `h` tag still says which conversation it belongs to.
     const conversationChannelId =
       channelId ?? getChannelIdFromTags(message.tags ?? []);
-    const voiceNoteCard = React.useMemo<
-      VoiceNoteCardContext | undefined
-    >(() => {
-      if (!imetaByUrl) return undefined;
-      let hasVoiceNote = false;
-      for (const entry of imetaByUrl.values()) {
-        if (isVoiceNoteAttachment(entry)) {
-          hasVoiceNote = true;
-          break;
-        }
-      }
-      if (!hasVoiceNote) return undefined;
-      const conversation =
-        channels.find((channel) => channel.id === conversationChannelId)
-          ?.channelType === "dm"
-          ? "dm"
-          : "channel";
-      return {
-        conversation,
-        renderTranscript: renderVoiceNoteTranscript,
-        sender: message.author,
-      };
-    }, [
+    const voiceNoteCard = useVoiceNoteCardContext({
+      channelId: conversationChannelId,
       channels,
-      conversationChannelId,
       imetaByUrl,
-      message.author,
-      renderVoiceNoteTranscript,
-    ]);
+      renderTranscript: renderVoiceNoteTranscript,
+      sender: message.author,
+    });
 
     const indentRem = getThreadReplyIndentRem(message.depth);
     const descendantGuideOffsetRem = connectDescendants

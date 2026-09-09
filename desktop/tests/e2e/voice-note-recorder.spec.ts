@@ -91,10 +91,61 @@ async function startHandsFree(page: Page) {
   await expect(page.locator("[role=tooltip]")).toHaveCount(0);
 }
 
+/**
+ * A sent note is only on screen once the recorder has encoded it, the upload
+ * has resolved and the published message has echoed back through the bridge.
+ * The live region says "Voice note sent" at the start of that chain, not the
+ * end, so the card needs a bound of its own rather than Playwright's default
+ * 5s expect window, which a loaded runner can overrun.
+ */
+const SENT_CARD_TIMEOUT_MS = 15_000;
+
 async function expectSent(page: Page, count = 1) {
-  await expect(recorder(page)).toHaveCount(0);
-  await expect(sentCards(page)).toHaveCount(count);
+  await expect(recorder(page)).toHaveCount(0, {
+    timeout: SENT_CARD_TIMEOUT_MS,
+  });
+  await expect(sentCards(page)).toHaveCount(count, {
+    timeout: SENT_CARD_TIMEOUT_MS,
+  });
   await expect(page.getByTestId("composer-voice-note-card")).toHaveCount(0);
+}
+
+async function mediaRecorderStops(page: Page): Promise<number> {
+  return page.evaluate(
+    () => (window as ClockWindow).__BUZZ_E2E_MEDIA_RECORDER_STOPS__ ?? 0,
+  );
+}
+
+/** Seeds a message with one reply so `#general` has a thread to open. */
+async function seedThreadRoot(page: Page): Promise<string> {
+  await expect
+    .poll(() =>
+      page.evaluate(
+        () => typeof window.__BUZZ_E2E_EMIT_MOCK_MESSAGE__ === "function",
+      ),
+    )
+    .toBe(true);
+  const rootId = await page.evaluate(() => {
+    const root = window.__BUZZ_E2E_EMIT_MOCK_MESSAGE__?.({
+      channelName: "general",
+      content: "Voice note thread root",
+      createdAt: 1_700_900_000,
+    });
+    if (!root) throw new Error("Failed to seed the thread root.");
+    window.__BUZZ_E2E_EMIT_MOCK_MESSAGE__?.({
+      channelName: "general",
+      content: "A reply, so the root shows a thread summary",
+      createdAt: 1_700_900_001,
+      parentEventId: root.id,
+    });
+    return root.id;
+  });
+  await expect(
+    page.locator(
+      `[data-testid="message-thread-summary"][data-thread-head-id="${rootId}"]`,
+    ),
+  ).toBeVisible();
+  return rootId;
 }
 
 async function blurActiveElement(page: Page) {
@@ -139,10 +190,18 @@ test.beforeEach(async ({ page }) => {
     };
     // The recorder's elapsed clock is `performance.now()`; letting the spec
     // move it forward reaches the 5:00 cap without a five-minute wait.
+    //
+    // Installed lazily, on the first advance. React's scheduler calls
+    // `performance.now` constantly, so replacing it with a JS closure costs
+    // the whole page real time (app boot measured ~600ms shimmed against
+    // ~420ms native here). Paying that in the twelve specs that never touch
+    // the clock is what pushed this file over Playwright's default expect
+    // window on a loaded runner and made it flake. Only the cap spec pays it
+    // now, and only from the moment it asks.
     let clockOffset = 0;
     const realNow = performance.now.bind(performance);
-    performance.now = () => realNow() + clockOffset;
     clockWindow.__BUZZ_E2E_ADVANCE_CLOCK__ = (ms) => {
+      if (clockOffset === 0) performance.now = () => realNow() + clockOffset;
       clockOffset += ms;
     };
   });
@@ -392,39 +451,34 @@ test("Escape discards from any focus and never marks the channel read", async ({
   // mic is leaving the toolbar, and its tooltip must not eat the first Esc.
   await startHandsFree(page);
   await expect(page.getByTestId("message-input")).toBeFocused();
-  const stopsBefore = await page.evaluate(
-    () => (window as ClockWindow).__BUZZ_E2E_MEDIA_RECORDER_STOPS__ ?? 0,
-  );
+  const stopsBefore = await mediaRecorderStops(page);
   await page.keyboard.press("Escape");
   await expect(recorder(page)).toHaveCount(0);
-  await expect
-    .poll(() =>
-      page.evaluate(
-        () => (window as ClockWindow).__BUZZ_E2E_MEDIA_RECORDER_STOPS__ ?? 0,
-      ),
-    )
-    .toBe(stopsBefore + 1);
+  await expect.poll(() => mediaRecorderStops(page)).toBe(stopsBefore + 1);
   await expect(sentCards(page)).toHaveCount(0);
   await expect(channel).toHaveCSS("font-weight", "700");
 
   // Focus on a recorder control (the pause button of a locked note). Its
-  // tooltip opens on keyboard focus and, being the topmost layer, takes the
-  // first Esc; the next Esc discards, and focus lands back in the editor
-  // rather than on body. The mark-read shortcut never runs.
+  // tooltip opens on keyboard focus and is a document-level Radix layer that
+  // would otherwise eat the key, so the row claims Escape in the window
+  // capture phase for its own controls: one press discards, and focus lands
+  // back in the editor rather than on body. The mark-read shortcut never runs.
   await startHandsFree(page);
   await recorder(page).getByTestId("voice-note-pause-resume").focus();
   expect(await activeElement(page)).toBe("voice-note-pause-resume");
   const pauseTooltip = page.getByRole("tooltip", { name: "Pause recording" });
   await expect(pauseTooltip).toBeVisible();
   await page.keyboard.press("Escape");
-  await expect(pauseTooltip).toHaveCount(0);
-  await expect(recorder(page)).toHaveAttribute(
-    "data-voice-note-state",
-    "locked",
-  );
-  await page.keyboard.press("Escape");
   await expect(recorder(page)).toHaveCount(0);
   await expect(page.getByTestId("message-input")).toBeFocused();
+  await expect(channel).toHaveCSS("font-weight", "700");
+
+  // The trash is a tooltip trigger too, and a second press landing inside
+  // the tooltip's exit animation used to be swallowed as well.
+  await startHandsFree(page);
+  await recorder(page).getByTestId("voice-note-discard").focus();
+  await page.keyboard.press("Escape");
+  await expect(recorder(page)).toHaveCount(0);
   await expect(channel).toHaveCSS("font-weight", "700");
 
   // The Send slot with focus: same, and Send is not a tooltip trigger, so a
@@ -672,8 +726,11 @@ test("the 5:00 cap sends a locked note and waits while it is paused", async ({
       ms,
     );
 
-  await advance(298_000);
-  await expect(row).toContainText(/4:5\d \/ 5:00/);
+  // 4:00, not 4:58: the clock only jumps on demand, so the seconds between
+  // the jump and the assertions are real ones counted against the cap. Two
+  // seconds of headroom is not a margin on a loaded runner; sixty is.
+  await advance(240_000);
+  await expect(row).toContainText(/4:0\d \/ 5:00/);
   await expect(row).toHaveAttribute("data-voice-note-state", "locked");
 
   // Paused: wall time passes, recorded time does not, so no cap.
@@ -691,7 +748,8 @@ test("the 5:00 cap sends a locked note and waits while it is paused", async ({
   // Resumed: the last second of recorded time reaches the cap and sends.
   await row.getByRole("button", { name: "Resume recording" }).click();
   await expect(row).toHaveAttribute("data-voice-note-state", "locked");
-  await advance(3_000);
+  await expect(row).toContainText(/4:0\d \/ 5:00/);
+  await advance(61_000);
   await expectSent(page);
 });
 
@@ -772,4 +830,224 @@ test("the review setting is read when the note finishes, not when it starts", as
   await page.waitForTimeout(150);
   await page.getByTestId("send-voice-note").click();
   await expectSent(page, 2);
+});
+
+test("Escape closes the mention list before it reaches the recording", async ({
+  page,
+}) => {
+  await openGeneral(page);
+  await startHandsFree(page);
+  const input = page.getByTestId("message-input");
+  await input.click();
+  await input.pressSequentially("@al");
+  const mentions = page.getByTestId("mention-autocomplete");
+  await expect(mentions).toBeVisible();
+
+  // The recorder's editor key path runs before the mention handler, so it has
+  // to decline while a list is open instead of taking the key for itself.
+  const stopsBefore = await mediaRecorderStops(page);
+  await page.keyboard.press("Escape");
+  await expect(mentions).toHaveCount(0);
+  await expect(recorder(page)).toHaveAttribute(
+    "data-voice-note-state",
+    "locked",
+  );
+  expect(await mediaRecorderStops(page)).toBe(stopsBefore);
+  await expect(liveStatus(page)).not.toHaveText("Voice note discarded");
+
+  // With the list gone the same key discards, as it does anywhere else.
+  await page.keyboard.press("Escape");
+  await expect(recorder(page)).toHaveCount(0);
+  await expect(liveStatus(page)).toHaveText("Voice note discarded");
+});
+
+test("only one composer in the window can record", async ({ page }) => {
+  await openGeneral(page);
+  const threadId = await seedThreadRoot(page);
+  const summary = page.locator(
+    `[data-testid="message-thread-summary"][data-thread-head-id="${threadId}"]`,
+  );
+  await summary.click();
+  const threadPanel = page.getByTestId("message-thread-panel");
+  await expect(threadPanel).toBeVisible();
+  const threadInput = threadPanel.getByTestId("message-input");
+  await expect(threadInput).toBeVisible();
+
+  // Record in the channel composer, beside the docked thread's own composer.
+  await page.getByRole("button", { name: "Record voice note" }).first().click();
+  await expect(recorder(page)).toHaveCount(1);
+
+  // The thread's mic is disabled while the microphone is taken, and Space in
+  // its empty editor types a space instead of opening a second recorder.
+  const threadMic = threadPanel.getByRole("button", {
+    name: "Record voice note",
+  });
+  await expect(threadMic).toBeDisabled();
+  await threadInput.click();
+  await page.keyboard.press("Space");
+  await expect(recorder(page)).toHaveCount(1);
+  expect(await threadInput.evaluate((element) => element.textContent)).toMatch(
+    /[ {2}]/,
+  );
+  // Two composers, two live regions, but only one of them may be announcing.
+  const statuses = page.getByTestId("voice-note-live-status");
+  await expect(statuses).toHaveCount(2);
+  await expect(statuses.filter({ hasText: /Recording/ })).toHaveCount(1);
+
+  // ProseMirror marks Escape handled at the contenteditable, so the sibling
+  // recording is only reachable because the composer key path asks the
+  // registry who is recording.
+  await page.keyboard.press("ControlOrMeta+A");
+  await page.keyboard.press("Backspace");
+  await page.keyboard.press("Escape");
+  await expect(recorder(page)).toHaveCount(0);
+  await expect(threadPanel).toBeVisible();
+  await expect(sentCards(page)).toHaveCount(0);
+
+  // The microphone is free again, and now the thread composer may take it.
+  await expect(threadMic).toBeEnabled();
+  await threadMic.click();
+  await expect(threadPanel.getByTestId("voice-note-recorder")).toHaveCount(1);
+  await page.keyboard.press("Escape");
+  await expect(recorder(page)).toHaveCount(0);
+});
+
+test("losing the composer to navigation says the recording is gone", async ({
+  page,
+}) => {
+  await openGeneral(page);
+  const threadId = await seedThreadRoot(page);
+  // Narrow enough that a thread takes the whole pane: the channel composer,
+  // and the live region inside it, unmount with the recording still running.
+  // The sidebar goes off canvas at this width, so the channel is opened first.
+  await page.setViewportSize({ width: 560, height: 720 });
+  await startHandsFree(page);
+  const stopsBefore = await mediaRecorderStops(page);
+
+  await page
+    .locator(
+      `[data-testid="message-thread-summary"][data-thread-head-id="${threadId}"]`,
+    )
+    .click();
+  await expect(page.getByTestId("message-thread-panel")).toBeVisible();
+  await expect(recorder(page)).toHaveCount(0);
+  await expect.poll(() => mediaRecorderStops(page)).toBe(stopsBefore + 1);
+  // A toast, not the live region: the live region left with the composer.
+  await expect(
+    page.getByText("Voice note discarded when the composer closed."),
+  ).toBeVisible();
+  await expect(sentCards(page)).toHaveCount(0);
+});
+
+test("inside a focused thread, Escape discards the note and keeps the thread", async ({
+  page,
+}) => {
+  await openGeneral(page);
+  const threadId = await seedThreadRoot(page);
+  await page
+    .locator(
+      `[data-testid="message-thread-summary"][data-thread-head-id="${threadId}"]`,
+    )
+    .click();
+  const threadPanel = page.getByTestId("message-thread-panel");
+  await expect(threadPanel).toBeVisible();
+  const expand = page.getByRole("button", { name: "Expand thread" });
+  await expand.click();
+  const drawer = page.getByTestId("focus-thread-drawer-overlay");
+  await expect(drawer).toBeVisible();
+
+  // The drawer owns Escape until the recorder opens above it on the stack.
+  const threadMic = threadPanel.getByRole("button", {
+    name: "Record voice note",
+  });
+  await threadMic.click();
+  const row = threadPanel.getByTestId("voice-note-recorder");
+  await expect(row).toHaveAttribute("data-voice-note-state", "locked");
+  await row.getByTestId("voice-note-pause-resume").focus();
+  await page.keyboard.press("Escape");
+  await expect(row).toHaveCount(0);
+  await expect(drawer).toBeVisible();
+  await expect(sentCards(page)).toHaveCount(0);
+
+  // With the recording gone the drawer takes the key back.
+  await page.keyboard.press("Escape");
+  await expect(drawer).toHaveCount(0);
+});
+
+test("Escape while the note is being prepared does not discard it", async ({
+  page,
+}) => {
+  // Hold the decode open so "processing" is a state the spec controls rather
+  // than a few milliseconds it has to race.
+  await page.addInitScript(() => {
+    const pendingDecodes: Array<(buffer: AudioBuffer) => void> = [];
+    let released = false;
+    const drain = () => {
+      while (released && pendingDecodes.length > 0) {
+        pendingDecodes.shift()?.({
+          duration: 1,
+          getChannelData: () => new Float32Array([0]),
+          numberOfChannels: 1,
+          sampleRate: 8_000,
+        } as AudioBuffer);
+      }
+    };
+    (
+      window as Window & {
+        __BUZZ_E2E_RESOLVE_VOICE_NOTE_DECODE__?: () => void;
+      }
+    ).__BUZZ_E2E_RESOLVE_VOICE_NOTE_DECODE__ = () => {
+      // The release can land before the decode is even queued: "processing"
+      // starts when the recorder stops, and the blob arrives a tick later.
+      released = true;
+      drain();
+    };
+    AudioContext.prototype.decodeAudioData = () =>
+      new Promise<AudioBuffer>((resolve) => {
+        pendingDecodes.push(resolve);
+        drain();
+      });
+  });
+  await openGeneral(page);
+  await startHandsFree(page);
+  await page.waitForTimeout(150);
+  await page.getByTestId("send-voice-note").click();
+  const row = recorder(page);
+  await expect(row).toHaveAttribute("data-voice-note-state", "processing");
+
+  // Escape is ambient, and the note is already on its way out.
+  await page.keyboard.press("Escape");
+  await page.keyboard.press("Escape");
+  await expect(row).toHaveAttribute("data-voice-note-state", "processing");
+  await expect(liveStatus(page)).toHaveText("Preparing voice note");
+
+  // The trash is still the deliberate way out, and still works here.
+  await expect(row.getByTestId("voice-note-discard")).toBeEnabled();
+
+  await page.evaluate(() =>
+    (
+      window as Window & {
+        __BUZZ_E2E_RESOLVE_VOICE_NOTE_DECODE__?: () => void;
+      }
+    ).__BUZZ_E2E_RESOLVE_VOICE_NOTE_DECODE__?.(),
+  );
+  await expectSent(page);
+  await expect(liveStatus(page)).toHaveText("Voice note sent");
+});
+
+test("a cancelled press does not lock a recording", async ({ page }) => {
+  await openGeneral(page);
+  await pressMic(page);
+  // Well inside the tap window, so a release here would lock hands free.
+  await page.evaluate(() => {
+    window.dispatchEvent(
+      new PointerEvent("pointercancel", { bubbles: true, pointerId: 1 }),
+    );
+  });
+  await expect(recorder(page)).toHaveCount(0);
+  await page.mouse.up();
+  await page.waitForTimeout(200);
+  await expect(recorder(page)).toHaveCount(0);
+  await expect(sentCards(page)).toHaveCount(0);
+  await expect(page.getByTestId("composer-voice-note-card")).toHaveCount(0);
 });

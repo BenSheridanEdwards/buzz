@@ -44,6 +44,7 @@ export const MessageComposerToolbar = React.memo(
     isFormattingOpen,
     isSending,
     isUploading,
+    isVoiceNoteBlocked = false,
     isVoiceNoteLocked = false,
     isVoiceNoteProcessing = false,
     isVoiceNoteRecording = false,
@@ -61,6 +62,7 @@ export const MessageComposerToolbar = React.memo(
     onPaperclip,
     onSendVoiceNote,
     onVoiceNote,
+    onVoiceNoteHoldCancel,
     onVoiceNoteHoldEnd,
     onVoiceNoteHoldStart,
     onRemoveAddressedAgent = ignoreAddressRemoval,
@@ -79,6 +81,8 @@ export const MessageComposerToolbar = React.memo(
     isFormattingOpen: boolean;
     isSending: boolean;
     isUploading: boolean;
+    /** Another composer holds the microphone: this one cannot start. */
+    isVoiceNoteBlocked?: boolean;
     /** Hands-free recording: the send slot becomes a full-width Send. */
     isVoiceNoteLocked?: boolean;
     /** Waiting for the microphone or encoding: Send is not yet possible. */
@@ -100,6 +104,8 @@ export const MessageComposerToolbar = React.memo(
     onSendVoiceNote?: () => void;
     /** Click activation without a pointer hold: keyboard or assistive tech. */
     onVoiceNote?: () => void;
+    /** The pointer was taken away mid-hold; never a tap, never a send. */
+    onVoiceNoteHoldCancel?: () => void;
     /** Pointer released; the composer decides whether that sends. */
     onVoiceNoteHoldEnd?: () => void;
     /** Primary pointer pressed on the mic: hold to record. */
@@ -122,6 +128,9 @@ export const MessageComposerToolbar = React.memo(
     const handleMicPointerUp = React.useCallback(() => {
       onVoiceNoteHoldEnd?.();
     }, [onVoiceNoteHoldEnd]);
+    const handleMicPointerCancel = React.useCallback(() => {
+      onVoiceNoteHoldCancel?.();
+    }, [onVoiceNoteHoldCancel]);
     const handleMicClick = React.useCallback(
       (event: React.MouseEvent<HTMLButtonElement>) => {
         // Pointer clicks (detail >= 1) already ran as a hold; keyboard and
@@ -300,10 +309,12 @@ export const MessageComposerToolbar = React.memo(
                         aria-label="Record voice note"
                         className="touch-none select-none"
                         data-testid="record-voice-note"
-                        disabled={composerDisabled || isUploading}
+                        disabled={
+                          composerDisabled || isUploading || isVoiceNoteBlocked
+                        }
                         onClick={handleMicClick}
                         onMouseDown={onCaptureSelection}
-                        onPointerCancel={handleMicPointerUp}
+                        onPointerCancel={handleMicPointerCancel}
                         onPointerDown={handleMicPointerDown}
                         onPointerUp={handleMicPointerUp}
                         size="icon"

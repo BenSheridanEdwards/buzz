@@ -6,6 +6,7 @@ import {
   THREAD_FOCUS_SLIVER_WIDTH_PX,
 } from "@/features/channels/lib/threadFocusLayout";
 import { getThreadViewMode } from "@/features/channels/lib/threadViewModePreference";
+import { useEscapeKey } from "@/shared/hooks/useEscapeKey";
 import { cn } from "@/shared/lib/cn";
 
 type FocusThreadDrawerProps = {
@@ -199,29 +200,26 @@ export function FocusThreadDrawer({
   const previousFocusRef = React.useRef<HTMLElement | null>(null);
   const viewportRightInsetPx = useViewportRightInsetPx(overlayRef);
 
-  React.useEffect(() => {
-    if (!escapeEnabled) return;
-
-    function handleEscape(event: KeyboardEvent) {
-      if (event.key !== "Escape") return;
+  // The drawer is a closable Escape surface like the overlay panels, so a
+  // recorder (or any surface) opened inside it after the drawer sits above it
+  // on the stack and takes the key first; the drawer takes it back when that
+  // surface closes. Capture phase keeps the drawer ahead of the document-level
+  // Radix layers it covers, exactly as the hand-rolled listener did.
+  const shouldIgnoreEscape = React.useCallback(
+    (event: KeyboardEvent) => {
       const target = event.target;
-      if (
+      return (
         hasActiveEdit &&
         target instanceof Node &&
-        drawerRef.current?.contains(target)
-      ) {
-        return;
-      }
-      event.preventDefault();
-      event.stopImmediatePropagation();
-      onClose();
-    }
-
-    window.addEventListener("keydown", handleEscape, { capture: true });
-    return () => {
-      window.removeEventListener("keydown", handleEscape, { capture: true });
-    };
-  }, [escapeEnabled, hasActiveEdit, onClose]);
+        (drawerRef.current?.contains(target) ?? false)
+      );
+    },
+    [hasActiveEdit],
+  );
+  useEscapeKey(onClose, escapeEnabled, {
+    capture: true,
+    shouldIgnore: shouldIgnoreEscape,
+  });
 
   React.useLayoutEffect(() => {
     previousFocusRef.current =
