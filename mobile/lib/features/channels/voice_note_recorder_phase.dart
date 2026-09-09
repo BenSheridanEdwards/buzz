@@ -50,6 +50,7 @@ class VoiceNoteRecorderState {
     this.origin = Offset.zero,
     this.position = Offset.zero,
     this.heldSince,
+    this.beganAt,
     this.generation = 0,
     this.cancelledByGesture = false,
     this.textDirection = TextDirection.ltr,
@@ -69,6 +70,12 @@ class VoiceNoteRecorderState {
 
   /// When the current hold began, used to tell taps from holds.
   final DateTime? heldSince;
+
+  /// When the user started this take, kept for the whole take. [heldSince] is
+  /// cleared as soon as the finger leaves, so this is the only record of how
+  /// long the press itself lasted, which is what the minimum-length check
+  /// judges the user by.
+  final DateTime? beganAt;
 
   /// Increments on every restart so stale async work can be ignored.
   final int generation;
@@ -116,6 +123,7 @@ class VoiceNoteRecorderState {
     Offset? position,
     DateTime? heldSince,
     bool clearHeldSince = false,
+    DateTime? beganAt,
     int? generation,
     bool? cancelledByGesture,
     TextDirection? textDirection,
@@ -125,6 +133,7 @@ class VoiceNoteRecorderState {
     origin: origin ?? this.origin,
     position: position ?? this.position,
     heldSince: clearHeldSince ? null : (heldSince ?? this.heldSince),
+    beganAt: beganAt ?? this.beganAt,
     generation: generation ?? this.generation,
     cancelledByGesture: cancelledByGesture ?? this.cancelledByGesture,
     textDirection: textDirection ?? this.textDirection,
@@ -157,6 +166,7 @@ class VoiceNoteRecorderPhaseNotifier extends Notifier<VoiceNoteRecorderState> {
       origin: origin,
       position: origin,
       heldSince: now ?? clock.now(),
+      beganAt: now ?? clock.now(),
       generation: state.generation + 1,
       textDirection: textDirection,
     );
@@ -258,6 +268,7 @@ class VoiceNoteRecorderPhaseNotifier extends Notifier<VoiceNoteRecorderState> {
     if (state.phase != VoiceNoteRecorderPhase.reviewing) return;
     state = VoiceNoteRecorderState(
       phase: VoiceNoteRecorderPhase.locked,
+      beganAt: clock.now(),
       generation: state.generation + 1,
     );
   }

@@ -14,6 +14,7 @@ import 'package:buzz/shared/relay/relay.dart';
 import 'package:buzz/shared/theme/theme.dart';
 import 'package:buzz/shared/voice_notes/voice_note_preferences.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/semantics.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:hooks_riverpod/hooks_riverpod.dart';
 import 'package:image_picker/image_picker.dart';
@@ -193,8 +194,14 @@ class FakeChannelsNotifier extends ChannelsNotifier {
 }
 
 class FakeAppLifecycleNotifier extends AppLifecycleNotifier {
+  FakeAppLifecycleNotifier([this.initial = AppLifecycleState.resumed]);
+
+  /// Lifecycle the app is already in when the composer mounts, so a test can
+  /// exercise a guard that reads the current state rather than a transition.
+  final AppLifecycleState initial;
+
   @override
-  AppLifecycleState build() => AppLifecycleState.resumed;
+  AppLifecycleState build() => initial;
 
   void setLifecycle(AppLifecycleState value) => state = value;
 }
@@ -355,6 +362,25 @@ Future<void> tapMic(WidgetTester tester) async {
 /// Counts semantics nodes carrying exactly [label].
 int semanticsNodeCount(WidgetTester tester, String label) =>
     find.bySemanticsLabel(label).evaluate().length;
+
+/// Counts nodes labelled [label] in the semantics tree a screen reader
+/// actually walks. Unlike [semanticsNodeCount] this misses nothing and,
+/// more importantly, counts nothing that has been excluded from the tree.
+int semanticsTreeLabelCount(WidgetTester tester, String label) {
+  final root = tester.binding.rootElement?.renderObject?.debugSemantics;
+  if (root == null) return 0;
+  var count = 0;
+  void visit(SemanticsNode node) {
+    if (node.label == label) count += 1;
+    node.visitChildren((child) {
+      visit(child);
+      return true;
+    });
+  }
+
+  visit(root);
+  return count;
+}
 
 /// Switches the composer to another community, which changes its draft
 /// identity exactly as leaving for another relay does in production.

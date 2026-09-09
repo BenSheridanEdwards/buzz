@@ -212,6 +212,28 @@ void main() {
     expect(phase(tester).phase, VoiceNoteRecorderPhase.idle);
   });
 
+  testWidgets('a press over the minimum keeps a capture the slow start cut '
+      'short', (tester) async {
+    // The mic opens late (permission, temp dir, native start), so the audio
+    // is shorter than the press. The press is what the user can judge.
+    final recorder = FakeVoiceNoteRecorder(
+      recordedDuration: const Duration(milliseconds: 800),
+    )..pendingStart = Completer<void>();
+    await pumpComposer(tester, recorder: recorder);
+
+    final gesture = await holdMic(tester);
+    await tester.pump(const Duration(milliseconds: 400));
+    recorder.pendingStart!.complete();
+    await tester.pump();
+    await tester.pump(const Duration(milliseconds: 800));
+    await gesture.up();
+    await tester.pumpAndSettle();
+
+    expect(attachmentFor(recorder.path), findsOneWidget);
+    expect(find.text(voiceNoteHoldToRecordHint), findsNothing);
+    expect(phase(tester).phase, VoiceNoteRecorderPhase.idle);
+  });
+
   testWidgets('a capture of exactly the minimum is kept', (tester) async {
     final recorder = FakeVoiceNoteRecorder(
       recordedDuration: voiceNoteMinDuration,

@@ -5,6 +5,7 @@ class _ComposerVoiceNote {
     required this.beginHold,
     required this.onKeyboardHidden,
     required this.onDraftIdentityChanged,
+    required this.generation,
     required ValueNotifier<bool> isPreparing,
     required ValueNotifier<bool> isRecording,
     required VoidCallback onCancel,
@@ -22,6 +23,10 @@ class _ComposerVoiceNote {
   final void Function({int? pointer, Offset origin}) beginHold;
   final VoidCallback onKeyboardHidden;
   final VoidCallback onDraftIdentityChanged;
+
+  /// Take the phase machine is on. It keys the recorder, so every take gets
+  /// its own element instead of reusing the one that is still fading out.
+  final int generation;
   final ValueNotifier<bool> _isPreparing;
   final ValueNotifier<bool> _isRecording;
   final VoidCallback _onCancel;
@@ -32,6 +37,7 @@ class _ComposerVoiceNote {
   bool get isRecording => _isRecording.value;
   Widget? get recorder => isRecording
       ? VoiceNoteComposerRecorder(
+          key: ValueKey('voice-note-recorder-take-$generation'),
           onCancel: _onCancel,
           onRecorded: _onRecorded,
           onError: _onError,
@@ -61,6 +67,9 @@ _ComposerVoiceNote _useComposerVoiceNote({
   final isPreparing = useState(false);
   final isRecording = useState(false);
   final phaseNotifier = ref.read(voiceNoteRecorderPhaseProvider.notifier);
+  final generation = ref.watch(
+    voiceNoteRecorderPhaseProvider.select((state) => state.generation),
+  );
 
   final resetForDraftIdentityChange = useCallback(() {
     isPreparing.value = false;
@@ -96,11 +105,48 @@ _ComposerVoiceNote _useComposerVoiceNote({
     }
   });
 
+  void cancel() {
+    isPreparing.value = false;
+    isRecording.value = false;
+    phaseNotifier.reset();
+  }
+
+  bool isBackgrounded() {
+    final lifecycle = ref.read(appLifecycleProvider);
+    return lifecycle == AppLifecycleState.paused ||
+        lifecycle == AppLifecycleState.detached;
+  }
+
   void beginRecording() {
     if (!isPreparing.value) return;
+    // A start deferred behind the keyboard can land after the app has gone
+    // away. The recorder's own lifecycle guard is not mounted yet, so this is
+    // the only fence: never open the mic where the user cannot see it.
+    if (isBackgrounded()) {
+      cancel();
+      return;
+    }
     isPreparing.value = false;
     isRecording.value = true;
   }
+
+  // The recorder cancels its own capture when the app leaves, but the window
+  // between the mic press and the recorder mounting (the keyboard is still
+  // hiding) belongs to nobody else.
+  useEffect(() {
+    final subscription = ref.listenManual(appLifecycleProvider, (
+      previous,
+      next,
+    ) {
+      if (next != AppLifecycleState.paused &&
+          next != AppLifecycleState.detached) {
+        return;
+      }
+      if (!isPreparing.value) return;
+      cancel();
+    });
+    return subscription.close;
+  }, const []);
 
   bool start() {
     // Validate before touching the composer, so a refused start keeps the
@@ -134,12 +180,6 @@ _ComposerVoiceNote _useComposerVoiceNote({
     );
   }
 
-  void cancel() {
-    isPreparing.value = false;
-    isRecording.value = false;
-    phaseNotifier.reset();
-  }
-
   void fail(String message) {
     uploadError.value = message;
     cancel();
@@ -166,6 +206,7 @@ _ComposerVoiceNote _useComposerVoiceNote({
     beginHold: beginHold,
     onKeyboardHidden: beginRecording,
     onDraftIdentityChanged: resetForDraftIdentityChange,
+    generation: generation,
     isPreparing: isPreparing,
     isRecording: isRecording,
     onCancel: cancel,

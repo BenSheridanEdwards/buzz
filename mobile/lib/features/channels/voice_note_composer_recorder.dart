@@ -61,10 +61,21 @@ class VoiceNoteComposerRecorder extends HookConsumerWidget {
 
   @override
   Widget build(BuildContext context, WidgetRef ref) {
-    final phaseState = ref.watch(voiceNoteRecorderPhaseProvider);
+    final liveState = ref.watch(voiceNoteRecorderPhaseProvider);
     final phaseNotifier = ref.read(voiceNoteRecorderPhaseProvider.notifier);
     final reviewBeforeSending = ref.watch(voiceNoteReviewSettingProvider);
-    final generation = phaseState.generation;
+    // The generation this element was mounted for, frozen for its lifetime.
+    // The composer swaps the recorder in and out through a 140 ms fade, so an
+    // element from a finished take is still mounted — and still watching the
+    // phase — while the next take begins. Freezing the generation keeps that
+    // outgoing element from adopting the new take: it never builds a second
+    // recorder, it stops reacting to the phase, and it only ever releases the
+    // generation it owned (rule 2).
+    final generation = useRef(liveState.generation).value;
+    final isOwner = liveState.generation == generation;
+    final ownedState = useRef(liveState);
+    if (isOwner) ownedState.value = liveState;
+    final phaseState = ownedState.value;
     final recorder = useMemoized(ref.read(voiceNoteRecorderFactoryProvider), [
       generation,
     ]);
@@ -78,8 +89,6 @@ class VoiceNoteComposerRecorder extends HookConsumerWidget {
     final segmentStartedAt = useRef<DateTime?>(null);
     final accumulated = useRef(Duration.zero);
     final reviewRecording = useState<VoiceNoteRecording?>(null);
-    final latestGeneration = useRef(generation);
-    latestGeneration.value = generation;
     final lockChipLink = useMemoized(LayerLink.new);
     final lockChipController = useMemoized(OverlayPortalController.new);
 
@@ -88,7 +97,8 @@ class VoiceNoteComposerRecorder extends HookConsumerWidget {
     // review stays until the user decides (rule 6).
     void cancelIfCapturing() {
       if (!context.mounted) return;
-      if (!ref.read(voiceNoteRecorderPhaseProvider).isRecording) return;
+      final current = ref.read(voiceNoteRecorderPhaseProvider);
+      if (current.generation != generation || !current.isRecording) return;
       unawaited(recorder.cancel());
       onCancel();
     }
@@ -127,8 +137,7 @@ class VoiceNoteComposerRecorder extends HookConsumerWidget {
         if (pending != null) {
           unawaited(deleteDroppedVoiceNoteRecording(pending.file.path));
         }
-        final owned = latestGeneration.value;
-        scheduleMicrotask(() => phaseNotifier.release(owned));
+        scheduleMicrotask(() => phaseNotifier.release(generation));
       },
       const [],
     );
@@ -141,23 +150,34 @@ class VoiceNoteComposerRecorder extends HookConsumerWidget {
       }
     }
 
-    /// Whether the finish that began under [finishingGeneration] is still the
-    /// one the phase machine expects. Anything that reset the phase in the
-    /// meantime (a cancel, a channel switch, a fresh take) owns the composer
-    /// now, so a late stop result must be dropped, not published (rule 2).
-    bool stillFinishing(int finishingGeneration) {
+    /// Whether the finish this element began is still the one the phase
+    /// machine expects. Anything that reset the phase in the meantime (a
+    /// cancel, a channel switch, a fresh take) owns the composer now, so a
+    /// late stop result must be dropped, not published (rule 2).
+    bool stillFinishing() {
       if (!context.mounted) return false;
       final current = ref.read(voiceNoteRecorderPhaseProvider);
       return current.phase == VoiceNoteRecorderPhase.finishing &&
-          current.generation == finishingGeneration;
+          current.generation == generation;
+    }
+
+    /// Whether this take is too short to keep. The audio can be shorter than
+    /// the press: `hasPermission`, the temp directory, and the native start
+    /// all run first. Telling someone who held the mic for well over a second
+    /// that a voice note needs at least one second is a lie, so a press that
+    /// long is kept even when the capture came up short.
+    bool isTooShort(Duration captured, DateTime? beganAt) {
+      if (captured >= voiceNoteMinDuration) return false;
+      final pressedFor = beganAt == null
+          ? Duration.zero
+          : clock.now().difference(beganAt);
+      return pressedFor < voiceNoteMinDuration;
     }
 
     Future<void> finish() async {
       if (isStopping.value) return;
       isStopping.value = true;
-      final finishingGeneration = ref
-          .read(voiceNoteRecorderPhaseProvider)
-          .generation;
+      final beganAt = ref.read(voiceNoteRecorderPhaseProvider).beganAt;
       unawaited(HapticFeedback.mediumImpact());
       if (!isStarted.value) {
         // Released before capture began: wait for the start to settle. A
@@ -167,16 +187,16 @@ class VoiceNoteComposerRecorder extends HookConsumerWidget {
         } catch (_) {
           return;
         }
-        if (!stillFinishing(finishingGeneration) || !isStarted.value) return;
+        if (!stillFinishing() || !isStarted.value) return;
       }
       try {
         final recording = await recorder.stop();
         // Deletions are best effort and never gate the composer's recovery.
-        if (!stillFinishing(finishingGeneration)) {
+        if (!stillFinishing()) {
           unawaited(deleteDroppedVoiceNoteRecording(recording.file.path));
           return;
         }
-        if (recording.duration < voiceNoteMinDuration) {
+        if (isTooShort(recording.duration, beganAt)) {
           unawaited(deleteDroppedVoiceNoteRecording(recording.file.path));
           onError(voiceNoteHoldToRecordHint);
           return;
@@ -188,7 +208,7 @@ class VoiceNoteComposerRecorder extends HookConsumerWidget {
           onRecorded(recording);
         }
       } catch (_) {
-        if (stillFinishing(finishingGeneration)) {
+        if (stillFinishing()) {
           onError('Buzz could not finish the voice note.');
         }
       }
@@ -217,6 +237,9 @@ class VoiceNoteComposerRecorder extends HookConsumerWidget {
       previous,
       next,
     ) {
+      // A take this element does not own belongs to the element that
+      // replaced it; reacting here would start or stop its recorder.
+      if (next.generation != generation) return;
       final from = previous?.phase;
       switch (next.phase) {
         case VoiceNoteRecorderPhase.idle:
@@ -318,7 +341,7 @@ class VoiceNoteComposerRecorder extends HookConsumerWidget {
     useEffect(() {
       // The portal controller must not change during build; settle it once
       // this frame has been laid out.
-      final shouldShow = phase == VoiceNoteRecorderPhase.holding;
+      final shouldShow = isOwner && phase == VoiceNoteRecorderPhase.holding;
       var active = true;
       WidgetsBinding.instance.addPostFrameCallback((_) {
         if (!active || !context.mounted) return;
@@ -329,10 +352,10 @@ class VoiceNoteComposerRecorder extends HookConsumerWidget {
         }
       });
       return () => active = false;
-    }, [phase]);
+    }, [phase, isOwner]);
 
     KeyEventResult handleKey(FocusNode node, KeyEvent event) {
-      if (event is! KeyDownEvent) return KeyEventResult.ignored;
+      if (event is! KeyDownEvent || !isOwner) return KeyEventResult.ignored;
       if (event.logicalKey == LogicalKeyboardKey.escape) {
         if (phase == VoiceNoteRecorderPhase.finishing) {
           return KeyEventResult.ignored;
@@ -433,7 +456,12 @@ class VoiceNoteComposerRecorder extends HookConsumerWidget {
               : const Duration(milliseconds: 140),
           curve: Curves.easeOutCubic,
           alignment: Alignment.bottomCenter,
-          child: content,
+          // An element from a finished take keeps its last frame while it
+          // fades, but it leaves the semantics tree at once: the live take
+          // owns those labels, and a screen reader must not find two of
+          // each (rule 7). Its controls are already unreachable by touch,
+          // the live take being painted over them.
+          child: ExcludeSemantics(excluding: !isOwner, child: content),
         ),
       ),
     );
