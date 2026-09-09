@@ -300,6 +300,29 @@ pub struct RelayRefusal {
     pub detail: Option<String>,
 }
 
+/// Longest run of relay-authored text kept from a refusal, in characters.
+///
+/// The relay writes `error` and `message` and nothing upstream bounds the
+/// body: `relay_error_details` reads it with `text()`, and this branch is the
+/// first thing to *persist* it. `membership_record_for_outcome` writes the
+/// refusal into `relay-membership.json` (one row per agent/relay pair, on a
+/// fleet that multiplies) and the card renders it on every summary pass. A
+/// relay answering megabytes would put megabytes there. Bound it at
+/// construction so every consumer inherits the bound: [`RelayRefusal::message`],
+/// [`RelayRefusal::haystack`], the rendered `relay returned <status>: <text>`
+/// string, and the `*_detail` copy that embeds it.
+pub const MAX_RELAY_TEXT_CHARS: usize = 200;
+
+/// `text` cut to [`MAX_RELAY_TEXT_CHARS`] characters on a char boundary, with
+/// a marker so a reader can tell the relay said more. Counted in `char`s, not
+/// bytes, so a multi-byte body can never split a code point.
+fn bound_relay_text(text: &str) -> String {
+    match text.char_indices().nth(MAX_RELAY_TEXT_CHARS) {
+        None => text.to_string(),
+        Some((cut, _)) => format!("{}... (truncated)", &text[..cut]),
+    }
+}
+
 impl RelayRefusal {
     /// The text to show a user: the human `message` when the relay sent one,
     /// else the machine reason.
@@ -407,14 +430,18 @@ pub async fn relay_error_details(response: reqwest::Response) -> RelayErrorDetai
     }
 
     if let Ok(value) = serde_json::from_str::<serde_json::Value>(&body) {
+        // Bounded HERE, at the one place a refusal is built, so the cap
+        // cannot be applied on one consumer and dropped from another: the
+        // rendered `error` string below is composed from these same two
+        // values, and so is everything the sidecar persists.
         let code = value
             .get("error")
             .and_then(serde_json::Value::as_str)
-            .map(str::to_string);
+            .map(bound_relay_text);
         let detail = value
             .get("message")
             .and_then(serde_json::Value::as_str)
-            .map(str::to_string);
+            .map(bound_relay_text);
         if code.is_some() || detail.is_some() {
             // Message first in the rendered string, unchanged: it is the
             // sentence written for a human when the relay sends both.
@@ -471,6 +498,10 @@ pub async fn query_relay_at(
 /// relay's answer about the *querying identity*, not a transport failure.
 /// The membership preflight needs that distinction; every other caller wants
 /// the flat string and uses [`query_relay_at`].
+///
+/// Sent on the no-redirect [`AppState::relay_query_client`]: the membership
+/// roster this returns is read as the relay's own assertion about who may
+/// publish there, so a third origin must not be able to supply it.
 pub async fn query_relay_details_at(
     state: &AppState,
     api_base_url: &str,
@@ -489,7 +520,7 @@ pub async fn query_relay_details_at(
         }
     })?;
     send_query_request(
-        &state.http_client,
+        &state.relay_query_client,
         &url,
         &auth,
         None,
@@ -512,7 +543,7 @@ pub async fn query_relay_at_with_keys(
         serde_json::to_vec(filters).map_err(|e| format!("filter serialization failed: {e}"))?;
     let auth = build_nip98_auth_header_for_keys(keys, &Method::POST, &url, &body_bytes)?;
     send_query_request(
-        &state.http_client,
+        &state.relay_query_client,
         &url,
         &auth,
         auth_tag,
@@ -531,6 +562,12 @@ pub async fn query_relay_at_with_keys(
 /// can drive the real send/timeout/classify path with a short deadline against
 /// a stalled loopback. A timeout surfaces through `classify_request_error` as
 /// the stable `"relay unreachable: request timed out"` string.
+///
+/// It is also the one place a 3xx is refused. Both builders send on the
+/// no-redirect [`AppState::relay_query_client`], so the redirect arrives here
+/// verbatim instead of being followed: a query answered by another origin is
+/// not the relay's answer, and the NIP-43 roster read on top of this helper
+/// turns a forged one into a permanent, uncheckable `Member`.
 async fn send_query_request(
     http_client: &reqwest::Client,
     url: &str,
@@ -555,6 +592,20 @@ async fn send_query_request(
             error: classify_request_error(&e),
             refusal: None,
         })?;
+    // Checked BEFORE the non-success branch: a 3xx is not a success, so
+    // without this it would be read as a relay error rather than as "another
+    // origin was asked to answer", and the message would not say so. No
+    // `refusal` either: a redirect is nothing the relay said about the
+    // request, so the membership caller keeps the row `Unknown` and retries.
+    if response.status().is_redirection() {
+        return Err(RelayErrorDetails {
+            error: format!(
+                "the relay query was redirected off the relay ({}), so the relay did not answer it",
+                response.status()
+            ),
+            refusal: None,
+        });
+    }
     if !response.status().is_success() {
         return Err(relay_error_details(response).await);
     }
@@ -678,6 +729,15 @@ pub async fn sync_managed_agent_profile(
     // The one cost is churn: an agent holding `bob-a1f3` while `bob` is free
     // moves to `bob` on a publish whose read failed. A missing profile beats
     // a stable one.
+    //
+    // On the relay this exists for, that is not a transient loss. A relay
+    // closed to the desktop identity refuses this read on EVERY publish and
+    // every reconcile, for as long as the user is not a member, so the hint
+    // is absent for the whole life of the pair and the move to the plain slug
+    // is guaranteed rather than rare. It is still one-way (the plain slug is
+    // the first candidate, so nothing moves back), it happens once, it lands
+    // on the nicer handle, and mentions bind pubkeys rather than handles, so
+    // a moved handle breaks no reference.
     let agent_pubkey = agent_keys.public_key().to_hex();
     let existing = match query_agent_profile(state, relay_url, &agent_pubkey).await {
         Ok(profile) => profile.and_then(|info| info.nip05),
@@ -827,15 +887,19 @@ pub struct AgentProfileInfo {
 
 // ── NIP-11 membership advertisement ─────────────────────────────────────────
 
-#[derive(serde::Deserialize)]
-struct RelayInformationDocument {
-    #[serde(default)]
-    supported_nips: Vec<u32>,
-}
-
 /// Whether the relay at `http_base_url` advertises NIP-43 (relay membership)
 /// in its NIP-11 document. A closed relay advertises it; an open relay does
 /// not, and no membership work is needed there.
+///
+/// The answer must actually BE a NIP-11 document: `supported_nips` has to be
+/// present and an array, or this is an error rather than "the relay is open".
+/// A `#[serde(default)]` here made any 200 JSON object (an ingress error
+/// page like `{"error":"backend starting"}`, a relay mid-restart, a proxy's
+/// own JSON) deserialize to an empty NIP list and read as `OpenRelay`, the one
+/// outcome that CLEARS the agent's membership sidecar row, registers nothing
+/// and leaves no card at all. That is the same end state the redirect guard
+/// below exists to prevent, reachable with no redirect involved. An error
+/// keeps the row `Unknown` and the next start retries.
 ///
 /// Sent on the no-redirect [`AppState::relay_meta_client`], and any 3xx is an
 /// error rather than an answer. "This relay is open" is a claim only the
@@ -868,8 +932,24 @@ pub async fn relay_advertises_membership_at(
         return Err(relay_error_message(response).await);
     }
 
-    let info = parse_json_response::<RelayInformationDocument>(response).await?;
-    Ok(info.supported_nips.contains(&43))
+    let document = parse_json_response::<serde_json::Value>(response).await?;
+    let Some(supported_nips) = document
+        .get("supported_nips")
+        .and_then(serde_json::Value::as_array)
+    else {
+        return Err(
+            "the relay answered /info with something that is not a NIP-11 document \
+             (no supported_nips list), so it did not say whether it is open"
+                .to_string(),
+        );
+    };
+    // A stringly-typed `"43"` counts too. NIP-11 says numbers and Buzz's own
+    // relay emits numbers, so this only fires for a non-conforming document,
+    // and "membership is advertised" is the safe reading of an ambiguous one:
+    // it keeps the row instead of clearing it.
+    Ok(supported_nips
+        .iter()
+        .any(|nip| nip.as_u64() == Some(43) || nip.as_str() == Some("43")))
 }
 
 // ── Signed-event submission ─────────────────────────────────────────────────

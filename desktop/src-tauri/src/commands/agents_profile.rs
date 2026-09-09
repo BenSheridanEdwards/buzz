@@ -189,9 +189,9 @@ pub(crate) fn mark_profile_reconciled(
 /// keeps deferred reconciliation from following a community switch it was
 /// never authorized for while honoring a deliberate per-agent pin wherever
 /// it points.
-pub(crate) async fn reconcile_agent_profile(
+pub(crate) async fn reconcile_agent_profile<R: tauri::Runtime>(
     state: &AppState,
-    app: &AppHandle,
+    app: &AppHandle<R>,
     agent_pubkey: &str,
     data: &ProfileReconcileData,
 ) -> Result<ProfileReconcileOutcome, String> {
@@ -221,7 +221,33 @@ pub(crate) async fn reconcile_agent_profile(
     ensure_relay_membership_before_publish(state, app, agent_pubkey, &relay_url).await;
 
     // Query the relay for the agent's existing kind:0 profile.
-    let existing = query_agent_profile(state, &relay_url, agent_pubkey).await?;
+    //
+    // ADVISORY, never a gate, for the same reason as in
+    // `relay::sync_managed_agent_profile`: this read authenticates as the
+    // WORKSPACE identity while the kind:0 it precedes is signed by the AGENT.
+    // On a relay closed to the desktop the operator admits the agent, not the
+    // desktop, so this `/query` is refused every time while the agent's own
+    // `/events` publish would succeed. Propagating it made the reconcile the
+    // one publisher a legacy agent has AND the one thing that could never
+    // run, so an agent created before registration existed got no profile at
+    // all, permanently, with no other path to one.
+    //
+    // Degrading to "no existing profile" is the honest reading of a read that
+    // did not happen, and it is idempotent: `profile_needs_sync` returns true
+    // and the publish below republishes the profile the desktop already knows
+    // it wants. The one thing the read protects, the handle, is protected
+    // separately by `resolve_managed_agent_nip05`, which keeps the existing
+    // handle when its own confirmation cannot be completed.
+    let existing = match query_agent_profile(state, &relay_url, agent_pubkey).await {
+        Ok(existing) => existing,
+        Err(error) => {
+            eprintln!(
+                "buzz-desktop: could not read {agent_pubkey} kind:0 before reconciling on \
+                 {relay_url}, republishing the expected profile instead: {error}"
+            );
+            None
+        }
+    };
 
     // Resolve the expected avatar — backfilling for legacy records that have no
     // stored avatar_url yet.
@@ -271,9 +297,9 @@ pub(crate) async fn reconcile_agent_profile(
     // The handle this agent should carry on this relay: whatever the relay
     // already attributes to it when that is still derived from the current
     // name (stable across reconciles), else the first free candidate. A
-    // lookup outage is an error here, never a silent `None`: kind:0 is
-    // absolute state on the relay and publishing without the handle would
-    // strip it.
+    // lookup that cannot be completed neither strips the handle nor abandons
+    // the publish: it keeps the handle the agent already carries and the
+    // profile still goes out (see `resolve_managed_agent_nip05`).
     let expected_nip05 = crate::relay::nip05::resolve_managed_agent_nip05(
         state,
         &relay_url,
@@ -322,9 +348,9 @@ pub(crate) async fn reconcile_agent_profile(
 /// relay/network failure is persisted as `Unknown` by the preflight and
 /// logged; the kind:0 publish that follows fails on its own if the relay is
 /// really down, and the next start or reconcile retries.
-async fn ensure_relay_membership_before_publish(
+async fn ensure_relay_membership_before_publish<R: tauri::Runtime>(
     state: &AppState,
-    app: &AppHandle,
+    app: &AppHandle<R>,
     agent_pubkey: &str,
     relay_url: &str,
 ) {
@@ -437,3 +463,7 @@ pub(crate) async fn publish_persona_profile(
 // Async so the blocking body (disk reads/writes + process termination) runs off
 // the main UI thread via spawn_blocking. State is re-derived from the owned
 // AppHandle inside the closure (`State<'_, _>` is borrowed, MutexGuard is !Send).
+
+#[cfg(test)]
+#[path = "agents_profile_reconcile_tests.rs"]
+mod reconcile_tests;

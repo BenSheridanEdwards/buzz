@@ -312,10 +312,16 @@ const EVENTS_INVENTORY: &[(&str, usize, usize)] = &[
     // Stub-relay route in the tombstone-flush gate tests; production flush
     // publishes through the guarded boundary-1 funnel.
     ("src/commands/teams/pending/tests/gate.rs", 1, 0),
-    // Stub-relay route in the managed-agent relay-membership tests; the
+    // Stub-relay route in the managed-agent relay-membership tests (now in
+    // their own file, so the production module has no events URL at all); the
     // production kind:9030 registration publishes through the guarded
     // boundary-1 funnel (`submit_event_at_with_keys`).
-    ("src/managed_agents/relay_membership.rs", 1, 0),
+    ("src/managed_agents/relay_membership_tests.rs", 1, 0),
+    // Stub-relay route in the profile-reconcile tests (the "closed to the
+    // desktop, open to the agent" relay driven through the reconcile); the
+    // production kind:0 publish goes through the guarded boundary-2 site in
+    // `relay.rs`.
+    ("src/commands/agents_profile_reconcile_tests.rs", 1, 0),
     // Stub-relay route in the profile-sync tests (the "closed to the desktop,
     // open to the agent" relay); the production kind:0 publish goes through
     // the guarded boundary-2 site in `relay.rs`.

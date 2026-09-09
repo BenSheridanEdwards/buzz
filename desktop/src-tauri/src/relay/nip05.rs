@@ -261,6 +261,20 @@ pub async fn lookup_nip05_owner(
     })
 }
 
+/// The handle to publish when the relay's well-known could not answer: the
+/// one the agent already carries, and only when it is on this relay's own
+/// domain.
+///
+/// Republishing the existing handle changes nothing about relay state, which
+/// is exactly what an unanswerable confirmation justifies. The domain check
+/// is what keeps it from being a change: a handle for another relay's domain
+/// is not one this relay could ever attribute to the agent, so it is dropped
+/// rather than published here.
+fn unconfirmable_handle(existing_handle: Option<&str>, domain: &str) -> Option<String> {
+    let (local, existing_domain) = split_handle(existing_handle?)?;
+    (existing_domain == domain).then(|| format!("{local}@{domain}"))
+}
+
 /// Resolve the handle a managed agent should publish on `relay_url`.
 ///
 /// Every candidate, including one the agent's kind:0 already carries, is
@@ -271,10 +285,26 @@ pub async fn lookup_nip05_owner(
 /// race keeps a handle in its own kind:0 that resolves to nobody. Trusting
 /// that copy would leave it stranded until someone renamed the agent.
 ///
-/// Returns `Ok(None)` when the relay does not serve NIP-05 or every candidate
-/// is taken by someone else. Returns `Err` when the lookup itself failed, so a
-/// transient outage never publishes a kind:0 that would strip the handle the
-/// relay already holds (kind:0 is absolute state on the relay).
+/// Returns `Ok(None)` when every candidate is taken by someone else.
+///
+/// ADVISORY, never a gate. When the well-known cannot answer at all (a 502
+/// or a 404 from an ingress in front of the relay, a rewrite, a same-origin
+/// 3xx, a timeout), this keeps whatever handle the agent already carries on
+/// this domain and publishes it unchanged, and publishes no handle when there
+/// is none. Both halves matter and they used to disagree: an error propagated
+/// out of `sync_managed_agent_profile` and abandoned the whole kind:0, so an
+/// ordinary proxy hiccup cost the agent its name, avatar and about to protect
+/// a handle that, on a fresh agent, did not exist; while a 404 went the other
+/// way and published a kind:0 with no handle at all, stripping the one the
+/// relay holds (kind:0 is absolute state there). Buzz's own relay always
+/// answers 200 with a names map (`crates/buzz-relay/src/api/nip05.rs`), so
+/// neither shape is the relay saying anything about handles: it is the relay
+/// not answering, and the right response to that is to change nothing.
+///
+/// Keeping the existing handle is safe: it is the handle the relay itself
+/// last attributed to this agent, republished verbatim, and the relay drops a
+/// contested one silently on its UNIQUE index. The next reconcile whose
+/// lookup succeeds re-confirms it.
 pub async fn resolve_managed_agent_nip05(
     state: &AppState,
     relay_url: &str,
@@ -297,8 +327,25 @@ pub async fn resolve_managed_agent_nip05(
     let http_base = super::relay_http_base_url(relay_url);
     let agent_pubkey = agent_pubkey_hex.to_ascii_lowercase();
     for local in nip05_probe_order(existing_handle, &candidates, &domain) {
-        match lookup_nip05_owner(state, &http_base, &local).await? {
-            Nip05Lookup::Unsupported => return Ok(None),
+        let lookup = match lookup_nip05_owner(state, &http_base, &local).await {
+            Ok(lookup) => lookup,
+            // The endpoint could not answer. Every remaining candidate would
+            // ask the same endpoint, so stop probing and change nothing.
+            Err(error) => {
+                eprintln!(
+                    "buzz-desktop: NIP-05 confirmation for {agent_pubkey} on {domain} could not \
+                     be completed, keeping the handle it already carries: {error}"
+                );
+                return Ok(unconfirmable_handle(existing_handle, &domain));
+            }
+        };
+        match lookup {
+            // A 404 is the same class: the relay serves this route
+            // unconditionally, so a 404 is an ingress or a rewrite answering
+            // in its place, not the relay saying handles are meaningless.
+            Nip05Lookup::Unsupported => {
+                return Ok(unconfirmable_handle(existing_handle, &domain));
+            }
             // Free: nobody holds it, including a handle the relay dropped on
             // a collision that has since been released. Republishing reclaims
             // it.
@@ -598,21 +645,28 @@ mod tests {
             assert_eq!(*looked_up.lock().unwrap(), vec!["bob"]);
         }
 
-        /// A lookup outage while confirming an existing handle propagates: it
-        /// must never fall through to "publish the kind:0 without a handle",
-        /// which would strip the handle the relay holds.
+        /// A lookup outage while confirming an existing handle keeps that
+        /// handle. It must never fall through to "publish the kind:0 without
+        /// a handle", which would strip the one the relay holds, and it must
+        /// not become an error either, which would abandon the whole profile
+        /// over a question the profile does not depend on.
         #[tokio::test]
-        async fn outage_while_confirming_an_existing_handle_propagates() {
+        async fn outage_while_confirming_an_existing_handle_keeps_it() {
             let state = build_app_state();
-            let result = resolve_managed_agent_nip05(
+            let handle = resolve_managed_agent_nip05(
                 &state,
                 "ws://127.0.0.1:9",
                 AGENT,
                 "Bob",
                 Some("bob@127.0.0.1"),
             )
-            .await;
-            assert!(result.is_err(), "lookup outage must propagate: {result:?}");
+            .await
+            .expect("an unanswerable lookup is not a gate");
+            assert_eq!(
+                handle.as_deref(),
+                Some("bob@127.0.0.1"),
+                "an outage must republish the handle unchanged, never strip it"
+            );
         }
 
         #[tokio::test]
@@ -630,14 +684,31 @@ mod tests {
             assert_eq!(handle, None);
         }
 
+        /// A 404 answers nothing (Buzz's relay always answers 200 there), so
+        /// with no handle to keep, none is published, and none is invented.
         #[tokio::test]
-        async fn relay_without_nip05_publishes_no_handle() {
+        async fn a_404_with_nothing_to_keep_publishes_no_handle() {
             let (relay, _) = spawn_well_known(None).await;
             let state = build_app_state();
             let handle = resolve_managed_agent_nip05(&state, &relay, AGENT, "Bob", None)
                 .await
                 .unwrap();
             assert_eq!(handle, None);
+        }
+
+        /// ...and with a handle to keep, the same 404 keeps it. This is the
+        /// arm that used to differ: `Unsupported` was mapped to `Ok(None)`,
+        /// so an ingress 404 in front of the relay published a kind:0 with no
+        /// `nip05` and deleted a handle the relay was still holding.
+        #[tokio::test]
+        async fn a_404_never_strips_the_handle_the_agent_carries() {
+            let (relay, _) = spawn_well_known(None).await;
+            let state = build_app_state();
+            let handle =
+                resolve_managed_agent_nip05(&state, &relay, AGENT, "Bob", Some("bob@127.0.0.1"))
+                    .await
+                    .unwrap();
+            assert_eq!(handle.as_deref(), Some("bob@127.0.0.1"));
         }
 
         /// A cross-origin redirect must not be able to answer the handle
@@ -678,23 +749,43 @@ mod tests {
             });
 
             let state = build_app_state();
-            let result =
-                resolve_managed_agent_nip05(&state, &format!("ws://{addr}"), AGENT, "Bob", None)
-                    .await;
+            let relay = format!("ws://{addr}");
 
-            let error = result.expect_err("a 3xx is not the relay's answer");
+            // The lookup itself refuses the redirect rather than reading the
+            // other origin's answer.
+            let error =
+                lookup_nip05_owner(&state, &crate::relay::relay_http_base_url(&relay), "bob")
+                    .await
+                    .expect_err("a 3xx is not the relay's answer");
             assert!(
                 error.contains("redirected"),
                 "the error must name the redirect: {error}"
             );
+
+            // And the resolver degrades rather than adopting it: origin B
+            // claims `bob` for OTHER and would leave every other candidate
+            // free, so a client that followed the redirect would come back
+            // with `bob-a1f3`. Nothing was confirmed, so nothing is
+            // published.
+            let handle = resolve_managed_agent_nip05(&state, &relay, AGENT, "Bob", None)
+                .await
+                .expect("an unanswerable lookup is not a gate");
+            assert_eq!(
+                handle, None,
+                "a third origin's answer must never become the agent's handle"
+            );
         }
 
+        /// An unreachable relay publishes no handle when there is none to
+        /// keep. It must not invent one, and it must not fail the publish.
         #[tokio::test]
-        async fn unreachable_relay_is_an_error_not_a_silent_drop() {
+        async fn unreachable_relay_publishes_no_handle_and_invents_none() {
             let state = build_app_state();
-            let result =
-                resolve_managed_agent_nip05(&state, "ws://127.0.0.1:9", AGENT, "Bob", None).await;
-            assert!(result.is_err(), "lookup outage must propagate: {result:?}");
+            let handle =
+                resolve_managed_agent_nip05(&state, "ws://127.0.0.1:9", AGENT, "Bob", None)
+                    .await
+                    .expect("an unreachable lookup is not a gate");
+            assert_eq!(handle, None);
         }
     }
 }

@@ -809,6 +809,38 @@ mod profile_sync_stub_relay {
     ///
     /// Returns the ws URL and the events the relay actually received.
     async fn spawn_relay_closed_to_the_desktop() -> (String, Arc<Mutex<Vec<serde_json::Value>>>) {
+        spawn_stub_relay(QueryDoor::RefusesTheDesktop, WellKnown::EmptyNames).await
+    }
+
+    /// How the stub answers the desktop's `POST /query`.
+    #[derive(Clone, Copy)]
+    enum QueryDoor {
+        /// The bridge's membership refusal: the operator admitted the agent,
+        /// not the desktop.
+        RefusesTheDesktop,
+        /// A perfectly ordinary empty answer: this agent has no kind:0 yet.
+        AnswersEmpty,
+    }
+
+    /// How the stub answers `GET /.well-known/nostr.json`.
+    #[derive(Clone, Copy)]
+    enum WellKnown {
+        /// 200 with an empty `names` map: every handle is free. What Buzz's
+        /// own relay answers for an unknown name.
+        EmptyNames,
+        /// A status Buzz's relay never emits there (`api/nip05.rs` always
+        /// answers 200), so it is an ingress, a rewrite or a proxy answering
+        /// in the relay's place: the relay did not say anything about
+        /// handles.
+        Status(u16),
+    }
+
+    /// Stub relay for the "closed to the desktop, open to the agent" shape,
+    /// with each door answered independently so a test can break exactly one.
+    async fn spawn_stub_relay(
+        query: QueryDoor,
+        well_known: WellKnown,
+    ) -> (String, Arc<Mutex<Vec<serde_json::Value>>>) {
         use axum::{
             http::header::CONTENT_TYPE, http::StatusCode, routing::get, routing::post, Router,
         };
@@ -818,16 +850,23 @@ mod profile_sync_stub_relay {
         let app = Router::new()
             .route(
                 "/query",
-                post(|| async {
-                    (
-                        StatusCode::FORBIDDEN,
-                        [(CONTENT_TYPE, "application/json")],
-                        serde_json::json!({
-                            "error": "relay_membership_required",
-                            "message": "You must be a relay member to access this relay"
-                        })
-                        .to_string(),
-                    )
+                post(move || async move {
+                    match query {
+                        QueryDoor::RefusesTheDesktop => (
+                            StatusCode::FORBIDDEN,
+                            [(CONTENT_TYPE, "application/json")],
+                            serde_json::json!({
+                                "error": "relay_membership_required",
+                                "message": "You must be a relay member to access this relay"
+                            })
+                            .to_string(),
+                        ),
+                        QueryDoor::AnswersEmpty => (
+                            StatusCode::OK,
+                            [(CONTENT_TYPE, "application/json")],
+                            "[]".to_string(),
+                        ),
+                    }
                 }),
             )
             .route(
@@ -858,12 +897,19 @@ mod profile_sync_stub_relay {
             )
             .route(
                 "/.well-known/nostr.json",
-                get(|| async {
-                    (
-                        StatusCode::OK,
-                        [(CONTENT_TYPE, "application/json")],
-                        serde_json::json!({ "names": {}, "relays": {} }).to_string(),
-                    )
+                get(move || async move {
+                    match well_known {
+                        WellKnown::EmptyNames => (
+                            StatusCode::OK,
+                            [(CONTENT_TYPE, "application/json")],
+                            serde_json::json!({ "names": {}, "relays": {} }).to_string(),
+                        ),
+                        WellKnown::Status(code) => (
+                            StatusCode::from_u16(code).expect("valid status"),
+                            [(CONTENT_TYPE, "application/json")],
+                            serde_json::json!({ "error": "upstream unavailable" }).to_string(),
+                        ),
+                    }
                 }),
             );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -940,5 +986,140 @@ mod profile_sync_stub_relay {
                 .is_some_and(|handle| handle.starts_with("bob@")),
             "the handle must still be resolved from the relay: {content}"
         );
+    }
+
+    /// A well-known that cannot answer must not abandon the whole profile.
+    ///
+    /// The NIP-05 confirmation is a handle question, and every other field of
+    /// the kind:0 (name, avatar, about) is independent of it. Propagating the
+    /// lookup failure meant a 502 or a same-origin 301 in front of
+    /// `/.well-known/` cost the agent its entire profile to protect a handle
+    /// that, on a freshly created agent, does not exist yet. `/.well-known/`
+    /// is the path most likely to be rewritten by a proxy, and a 5xx there is
+    /// ordinary infrastructure, not an attack.
+    #[tokio::test]
+    async fn an_unanswerable_well_known_still_publishes_the_agents_kind_0() {
+        let (relay, posted) =
+            spawn_stub_relay(QueryDoor::AnswersEmpty, WellKnown::Status(502)).await;
+        let state = crate::app_state::build_app_state();
+        let agent_keys = nostr::Keys::generate();
+
+        crate::relay::sync_managed_agent_profile(
+            &state,
+            &relay,
+            &agent_keys,
+            "Bob",
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap_or_else(|error| {
+            panic!("a 502 on the handle lookup must not abandon the profile: {error}")
+        });
+
+        let events = posted.lock().unwrap();
+        let profile = events
+            .iter()
+            .find(|event| event.get("kind").and_then(serde_json::Value::as_u64) == Some(0))
+            .unwrap_or_else(|| panic!("no kind:0 was posted; got {events:?}"));
+        let content: serde_json::Value = serde_json::from_str(
+            profile
+                .get("content")
+                .and_then(|v| v.as_str())
+                .unwrap_or(""),
+        )
+        .expect("kind:0 content is JSON");
+        assert_eq!(
+            content
+                .get("display_name")
+                .or_else(|| content.get("name"))
+                .and_then(|v| v.as_str()),
+            Some("Bob"),
+            "the fields that owe the well-known nothing must still go out: {content}"
+        );
+    }
+
+    /// ...and it must not strip the handle the relay already holds either.
+    ///
+    /// The two arms used to disagree: a 502 abandoned the publish to protect
+    /// the handle, while a 404 published a kind:0 with no `nip05` at all,
+    /// which is absolute state on the relay and therefore deletes it. Both
+    /// are the same event (the relay did not answer), so both now keep what
+    /// the agent already carries. 404 is in the table because Buzz's relay
+    /// answers 200 with an empty map for an unknown name and never 404s that
+    /// route, so a 404 is a proxy, exactly like the 502.
+    #[tokio::test]
+    async fn an_unanswerable_well_known_keeps_the_handle_the_agent_already_carries() {
+        let agent = nostr::Keys::generate();
+        let agent_hex = agent.public_key().to_hex();
+        for status in [404u16, 502, 429] {
+            let (relay, _) =
+                spawn_stub_relay(QueryDoor::AnswersEmpty, WellKnown::Status(status)).await;
+            let state = crate::app_state::build_app_state();
+            let domain = crate::relay::nip05::nip05_domain(&relay);
+            let existing = format!("bob-a1f3@{domain}");
+
+            let resolved = crate::relay::nip05::resolve_managed_agent_nip05(
+                &state,
+                &relay,
+                &agent_hex,
+                "Bob",
+                Some(&existing),
+            )
+            .await
+            .unwrap_or_else(|error| panic!("a {status} must not be a gate: {error}"));
+
+            assert_eq!(
+                resolved.as_deref(),
+                Some(existing.as_str()),
+                "a {status} on the well-known must republish the handle unchanged, never strip it"
+            );
+        }
+    }
+
+    /// With nothing to protect, an unanswerable well-known publishes no
+    /// handle and still publishes everything else. The fallback is "change
+    /// nothing", not "invent a handle the relay never confirmed".
+    #[tokio::test]
+    async fn an_unanswerable_well_known_invents_no_handle_for_a_fresh_agent() {
+        let (relay, _) = spawn_stub_relay(QueryDoor::AnswersEmpty, WellKnown::Status(502)).await;
+        let state = crate::app_state::build_app_state();
+        let agent = nostr::Keys::generate();
+
+        let resolved = crate::relay::nip05::resolve_managed_agent_nip05(
+            &state,
+            &relay,
+            &agent.public_key().to_hex(),
+            "Bob",
+            None,
+        )
+        .await
+        .expect("an unanswerable lookup is not an error");
+        assert_eq!(
+            resolved, None,
+            "an unconfirmed handle must not be published"
+        );
+    }
+
+    /// A handle for another relay's domain is not a handle this relay could
+    /// attribute to the agent, so the fallback drops it rather than
+    /// publishing it here.
+    #[tokio::test]
+    async fn the_fallback_never_carries_a_handle_from_another_relay() {
+        let (relay, _) = spawn_stub_relay(QueryDoor::AnswersEmpty, WellKnown::Status(502)).await;
+        let state = crate::app_state::build_app_state();
+        let agent = nostr::Keys::generate();
+
+        let resolved = crate::relay::nip05::resolve_managed_agent_nip05(
+            &state,
+            &relay,
+            &agent.public_key().to_hex(),
+            "Bob",
+            Some("bob@relay.example.com"),
+        )
+        .await
+        .expect("an unanswerable lookup is not an error");
+        assert_eq!(resolved, None, "a foreign-domain handle is not republished");
     }
 }

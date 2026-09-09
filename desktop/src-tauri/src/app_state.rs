@@ -45,6 +45,24 @@ pub struct AppState {
     /// row and registers nothing. `redirect::Policy::none()` returns the 3xx
     /// verbatim so the caller rejects it as "the relay did not answer".
     pub relay_meta_client: reqwest::Client,
+    /// A no-redirect client for the authenticated HTTP bridge read
+    /// (`POST /query`). Same authority hazard as
+    /// [`AppState::relay_meta_client`], one door further in: the NIP-43
+    /// roster this returns decides whether an agent is already a member,
+    /// whether the workspace identity may add it, and what role it holds.
+    /// A 3xx to a third origin answering with a kind:13534 signed by any key
+    /// at all reads as `AlreadyMember`, which persists as `Member`. That is
+    /// the one state `should_preflight_membership` skips, so the restore pass
+    /// and every reconcile stop checking that pair forever while the agent is
+    /// never registered and no card says so. The kind-13534-is-relay-only
+    /// guarantee lives in the relay's `ingest_event`; it does not travel
+    /// with the bytes.
+    ///
+    /// Separate from `relay_meta_client` because this client carries a
+    /// NIP-98 `Authorization` header bound to the exact URL and method, and
+    /// keeps the app-wide `http_client`'s connection-pool budget: `/query`
+    /// is the desktop's hot read path, not an occasional metadata fetch.
+    pub relay_query_client: reqwest::Client,
     pub relay_url_override: Mutex<Option<String>>,
     pub workspace_apply_lock: Arc<AsyncMutex<()>>,
     pub workspace_apply_generation: AtomicU64,
@@ -214,6 +232,23 @@ pub fn build_relay_meta_client() -> reqwest::Result<reqwest::Client> {
         .build()
 }
 
+/// Client for the authenticated `POST /query` bridge read. See
+/// [`AppState::relay_query_client`]: it MUST NOT follow redirects, because
+/// the roster it returns is read as the relay's own assertion about who may
+/// publish there, and a 3xx would hand that authority to another origin.
+///
+/// Returned as a `Result` so the fail-closed invariant is testable: callers
+/// must never substitute a redirect-following client on build failure. Pool
+/// settings match the app-wide `http_client` because this is a hot path.
+pub fn build_relay_query_client() -> reqwest::Result<reqwest::Client> {
+    reqwest::Client::builder()
+        .resolve("localhost", std::net::SocketAddr::from(([127, 0, 0, 1], 0)))
+        .pool_idle_timeout(std::time::Duration::from_secs(300))
+        .pool_max_idle_per_host(2)
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+}
+
 pub fn build_app_state() -> AppState {
     // Env var takes precedence (dev/CI). If absent, resolve_persisted_identity()
     // in setup() will replace the ephemeral placeholder with a persisted key.
@@ -246,6 +281,11 @@ pub fn build_app_state() -> AppState {
             "relay_meta_client must build with redirect::Policy::none(); a \
              redirect-following fallback would let a third origin decide an \
              agent's NIP-05 handle and make a closed relay read as open",
+        ),
+        relay_query_client: build_relay_query_client().expect(
+            "relay_query_client must build with redirect::Policy::none(); a \
+             redirect-following fallback would let a third origin supply the \
+             relay's membership roster and persist a permanent false Member",
         ),
         relay_url_override: Mutex::new(None),
         workspace_apply_lock: Arc::new(AsyncMutex::new(())),
