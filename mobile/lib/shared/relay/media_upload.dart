@@ -106,11 +106,21 @@ class MediaPolicyUploadException implements Exception {
   String toString() => _mediaPolicyUploadMessage;
 }
 
-/// The relay refused a bare `audio/mp4` upload with 415 or 422.
+/// The relay refused a bare `audio/mp4` upload with 415.
 ///
-/// Raised only on the `buzz-audio` path: the relay's NIP-11 verdict was
-/// stale (the operator disabled audio uploads, or a rollback dropped the
-/// extension), so the caller invalidates it and resends the envelope.
+/// Raised only on the `buzz-audio` path, and only for 415: the relay maps
+/// "this content type is not accepted here" (`DisallowedContentType`,
+/// `UnknownContentType`, `UnsupportedContainer`, `WrongCodec`) to 415, which
+/// is what a relay whose NIP-11 verdict has gone stale answers: the operator
+/// disabled audio uploads, or a rollback dropped the extension. The caller
+/// invalidates the verdict and resends the envelope.
+///
+/// 422 is deliberately not this exception. The relay maps its validation
+/// failures (`MetadataForbidden`, `MoovNotAtFront`, `InvalidAudio`) to 422,
+/// which means the relay does accept audio and this particular file was
+/// rejected: on this path that is a client packaging bug. Falling back on it
+/// would hide the bug behind a working voice note while every note paid for
+/// two packagings and two uploads, forever, so 422 propagates instead.
 class RelayAudioRejectedException implements Exception {
   final int statusCode;
   final String body;
@@ -504,10 +514,13 @@ class MediaUploadService {
   /// canonical MP4 envelope (`video/mp4`, `voice-note-<id>.mp4`) that relays
   /// without the `buzz-audio` extension accept.
   ///
-  /// A 415 or 422 on the audio upload means the relay's advertised verdict is
-  /// stale: [onAudioRejected] fires so the caller can drop the cached verdict,
-  /// and the note is packaged again and resent as the envelope in the same
-  /// call, so one wrong guess never strands the user on a retry loop.
+  /// A 415 on the audio upload means the relay's advertised verdict is stale:
+  /// [onAudioRejected] fires so the caller can drop the cached verdict, and
+  /// the note is packaged again and resent as the envelope in the same call,
+  /// so one wrong guess never strands the user on a retry loop. [onProgress]
+  /// is reset to 0 before the resend so the bar restarts once rather than
+  /// appearing to run backwards. Every other status, 422 included, propagates
+  /// (see [RelayAudioRejectedException]).
   Future<BlobDescriptor> uploadVoiceNote(
     XFile voiceNote, {
     required Duration duration,
@@ -533,6 +546,10 @@ class MediaUploadService {
       } on RelayAudioRejectedException {
         onAudioRejected?.call();
         _throwIfCancelled(cancellationToken);
+        // The audio attempt's bytes are discarded, so the envelope upload
+        // starts from zero: say so once instead of letting the caller's bar
+        // fall from the audio attempt's last value.
+        onProgress?.call(0);
       }
     }
     return _uploadPackagedVoiceNote(
@@ -695,7 +712,11 @@ class MediaUploadService {
       if (policyRejection && _allowedImageMimeTypes.contains(mimeType)) {
         throw const MediaPolicyUploadException();
       }
-      if (policyRejection && allowAudio) {
+      // 415 only: see [RelayAudioRejectedException]. A 422 on bare audio is
+      // the relay validating and refusing a file we produced, so it falls
+      // through and propagates as `upload failed (422)`.
+      if (allowAudio &&
+          response.statusCode == HttpStatus.unsupportedMediaType) {
         throw RelayAudioRejectedException(response.statusCode, response.body);
       }
       throw Exception(
