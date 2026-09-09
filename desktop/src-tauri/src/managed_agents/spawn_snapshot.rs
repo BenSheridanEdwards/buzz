@@ -179,8 +179,22 @@ pub(crate) fn effective_effort(descriptor: &EffectiveHarnessDescriptor) -> Optio
 }
 
 impl SpawnConfigSnapshot {
-    /// Assemble the snapshot from values a spawn has already resolved.
+    /// Assemble the snapshot from values a spawn has already resolved, using
+    /// the production sidecar resolver.
     pub(crate) fn from_inputs(inputs: SpawnConfigInputs<'_>) -> Self {
+        Self::from_inputs_with(inputs, super::sidecar_resolver)
+    }
+
+    /// [`Self::from_inputs`] with the sidecar resolver injected.
+    ///
+    /// `mcp_command` is a restart-diff field derived from whether the
+    /// configured sidecar actually resolves, so the absent case has to be
+    /// reachable without depending on what happens to be in this machine's
+    /// `target/debug`.
+    pub(crate) fn from_inputs_with(
+        inputs: SpawnConfigInputs<'_>,
+        resolve_sidecar: impl FnOnce(&'static str) -> Option<std::path::PathBuf>,
+    ) -> Self {
         let SpawnConfigInputs {
             record,
             descriptor,
@@ -198,9 +212,11 @@ impl SpawnConfigSnapshot {
             acp_command: record.acp_command.clone(),
             command: descriptor.command.clone(),
             args: descriptor.args.clone(),
-            mcp_command: known_acp_runtime(&descriptor.command)
-                .and_then(|runtime| runtime.mcp_command)
-                .unwrap_or("")
+            // The sidecar as the child will really receive it: a configured
+            // binary that does not resolve here is stamped as absent, so the
+            // restart badge fires on the day it appears instead of the
+            // snapshot claiming a tool the agent never had.
+            mcp_command: super::attached_mcp_command_with(&descriptor.command, resolve_sidecar)
                 .to_string(),
             // Effort has ONE representation in the snapshot: `effort_level`
             // below, always holding the projected effective value. The keys

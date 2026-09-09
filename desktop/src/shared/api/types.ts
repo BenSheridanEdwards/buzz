@@ -564,6 +564,12 @@ export type AcpRuntimeCatalogEntry = {
   definitionEnv?: Record<string, string>;
   /** Spawn-time parallelism cap; absent for uncapped harnesses. */
   maxParallelism?: number;
+  /**
+   * Parallelism a new record stores when the form leaves it blank. The
+   * app-wide default unless the harness overrides it (Hermes: 1). Shown as
+   * the blank-field placeholder so the stored value is never a surprise.
+   */
+  defaultParallelism: number;
 };
 
 /** An AcpRuntimeCatalogEntry that is confirmed available — command and binaryPath are non-null. */

@@ -941,3 +941,91 @@ fn openclaw_cap_crossing_parallelism_snapshots_differ() {
 #[cfg(test)]
 #[path = "tests_ext.rs"]
 mod ext;
+
+// ── mcp_command: the sidecar the child will really receive ──────────────────
+//
+// `from_inputs` is the only producer of `SpawnConfigSnapshot.mcp_command`, on
+// both sides of the restart diff (the spawn stamps one, the summary recomputes
+// the prospective one). The catalog says codex-acp is configured for
+// `buzz-dev-mcp`; whether that name reaches the snapshot depends on the binary
+// resolving, so both branches are driven here through the production
+// constructor rather than through the derivation helper alone.
+
+fn snapshot_for_command(
+    command: &str,
+    resolve_sidecar: impl FnOnce(&'static str) -> Option<std::path::PathBuf>,
+) -> SpawnConfigSnapshot {
+    let mut record = record();
+    record.agent_command = command.to_string();
+    let descriptor = crate::managed_agents::readiness::EffectiveHarnessDescriptor {
+        command: command.to_string(),
+        args: vec![],
+        env: Default::default(),
+    };
+    SpawnConfigSnapshot::from_inputs_with(
+        SpawnConfigInputs {
+            record: &record,
+            descriptor: &descriptor,
+            relay_url: "wss://ws.example",
+            team_instructions: None,
+            system_prompt: None,
+            model: None,
+            provider: None,
+            enforced_owner_only: false,
+            session_policy: AcpSessionPolicy::Channel,
+        },
+        resolve_sidecar,
+    )
+}
+
+/// A configured sidecar that does not resolve is stamped absent, so the badge
+/// fires on the day it appears instead of the snapshot claiming a tool the
+/// agent never had. Reverting this to the plain catalog lookup stamps
+/// "buzz-dev-mcp" under an absent resolver and fails here.
+#[test]
+fn spawn_snapshot_mcp_command_reports_only_a_resolvable_sidecar() {
+    assert_eq!(
+        snapshot_for_command("codex-acp", |_| None).mcp_command,
+        "",
+        "a codex record whose sidecar does not resolve must stamp no sidecar"
+    );
+    assert_eq!(
+        snapshot_for_command("codex-acp", |name| Some(std::path::PathBuf::from(format!(
+            "/usr/local/bin/{name}"
+        ))))
+        .mcp_command,
+        "buzz-dev-mcp",
+        "a resolvable sidecar is stamped under its catalog name"
+    );
+    // A harness with no configured sidecar is unaffected either way.
+    assert_eq!(
+        snapshot_for_command("goose", |name| Some(std::path::PathBuf::from(format!(
+            "/usr/local/bin/{name}"
+        ))))
+        .mcp_command,
+        ""
+    );
+}
+
+/// The stamped and prospective sides disagreeing is exactly what raises the
+/// restart badge, so an appearing sidecar must show as one `mcp_command` entry.
+#[test]
+fn spawn_snapshot_mcp_command_drift_is_a_restart_diff_entry() {
+    let stamped = snapshot_for_command("codex-acp", |_| None);
+    let current = snapshot_for_command("codex-acp", |name| {
+        Some(std::path::PathBuf::from(format!("/usr/local/bin/{name}")))
+    });
+    let diff = eligible_restart_diff(
+        false,
+        Some(TrackedSpawnState {
+            stamped: &stamped,
+            current: &current,
+            stamped_availability: None,
+            current_availability: None,
+        }),
+    );
+    assert!(
+        diff.iter().any(|entry| entry.field == "mcp_command"),
+        "an appearing sidecar must badge: {diff:?}"
+    );
+}

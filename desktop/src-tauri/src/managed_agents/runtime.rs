@@ -108,8 +108,8 @@ fn persona_drift_state(
 /// pin is ignored — see `effective_agent_relay_url`). Returns `None` for
 /// records that cannot form a valid pair key yet (e.g. key-less agents that
 /// mint keys on first start).
-pub(crate) fn workspace_pair_key(
-    app: &AppHandle,
+pub(crate) fn workspace_pair_key<R: tauri::Runtime>(
+    app: &AppHandle<R>,
     record: &ManagedAgentRecord,
 ) -> Option<ManagedAgentRuntimeKey> {
     let state = app.state::<crate::app_state::AppState>();
@@ -141,6 +141,34 @@ pub fn build_managed_agent_summary(
     teams: &[crate::managed_agents::TeamRecord],
     global_config: &crate::managed_agents::GlobalAgentConfig,
     memberships: &crate::managed_agents::RelayMembershipStore,
+) -> Result<ManagedAgentSummary, String> {
+    build_managed_agent_summary_with(
+        app,
+        record,
+        runtimes,
+        personas,
+        teams,
+        global_config,
+        memberships,
+        crate::managed_agents::sidecar_resolver,
+    )
+}
+
+/// [`build_managed_agent_summary`] with the MCP sidecar resolver injected.
+///
+/// `mcp_command` on the summary reports the sidecar the agent would really
+/// receive, so the "configured but absent" case has to be reachable in a test
+/// without depending on what happens to be in this machine's `target/debug`.
+#[allow(clippy::too_many_arguments)]
+pub fn build_managed_agent_summary_with<R: tauri::Runtime>(
+    app: &AppHandle<R>,
+    record: &ManagedAgentRecord,
+    runtimes: &HashMap<ManagedAgentRuntimeKey, ManagedAgentPairRuntime>,
+    personas: &[crate::managed_agents::types::AgentDefinition],
+    teams: &[crate::managed_agents::TeamRecord],
+    global_config: &crate::managed_agents::GlobalAgentConfig,
+    memberships: &crate::managed_agents::RelayMembershipStore,
+    resolve_sidecar: impl FnOnce(&'static str) -> Option<std::path::PathBuf>,
 ) -> Result<ManagedAgentSummary, String> {
     use crate::managed_agents::BackendKind;
 
@@ -288,10 +316,11 @@ pub fn build_managed_agent_summary(
             env: Default::default(),
         }
     });
-    let effective_mcp_command = known_acp_runtime(&descriptor.command)
-        .and_then(|r| r.mcp_command)
-        .unwrap_or("")
-        .to_string();
+    // Only a sidecar that actually resolves here is reported as attached; a
+    // missing binary reads as "none", matching what the spawn would hand the
+    // child.
+    let effective_mcp_command =
+        super::attached_mcp_command_with(&descriptor.command, resolve_sidecar).to_string();
 
     Ok(ManagedAgentSummary {
         pubkey: record.pubkey.clone(),
@@ -525,22 +554,35 @@ pub fn spawn_agent_child(
         .map_err(|error| format!("failed to clone log handle: {error}"))?;
     let resolved_acp_command = resolve_command(&record.acp_command)
         .ok_or_else(|| missing_command_message(&record.acp_command, "ACP harness command"))?;
-    let effective_mcp_command = known_acp_runtime(effective_command)
-        .and_then(|r| r.mcp_command)
-        .unwrap_or("");
-    let resolved_mcp_command: Option<std::path::PathBuf> = if effective_mcp_command.is_empty() {
-        None
-    } else {
-        match resolve_command(effective_mcp_command) {
-            Some(path) => Some(path),
-            None => {
-                eprintln!(
-                    "buzz-desktop: mcp_command {effective_mcp_command:?} not found, skipping"
-                );
+    // A configured sidecar that does not resolve is a degraded spawn, not a
+    // detail: the agent loses those tools for the whole run. Record it in the
+    // agent's own log (the file the user opens when it misbehaves) rather
+    // than only on the Desktop's stderr, which nobody reads.
+    //
+    // The spawn is the one caller that may probe a login shell, and its answer
+    // is remembered by `sticky_sidecar_path` so the read-only paths (summary,
+    // restart snapshot) see the same sidecar afterwards and the restart badge
+    // does not flap when a forced discovery clears the resolve cache.
+    let resolved_mcp_command: Option<std::path::PathBuf> =
+        match super::mcp_sidecar_with(effective_command, |name| {
+            super::sticky_sidecar_path(name, resolve_command)
+        }) {
+            Some((_, Some(path))) => Some(path),
+            Some((name, None)) => {
+                let note =
+                    format!("=== MCP sidecar {name:?} not found; starting without its tools ===");
+                // Diagnostic only: the agent is meant to start without the
+                // sidecar's tools, not to be refused because the note could not
+                // be written. The failure still goes to stderr rather than
+                // vanishing.
+                if let Err(error) = append_log_marker(&log_path, &note) {
+                    eprintln!("buzz-desktop: failed to record the skipped MCP sidecar: {error}");
+                }
+                eprintln!("buzz-desktop: {note}");
                 None
             }
-        }
-    };
+            None => None,
+        };
     // Resolve agent command to a full path (DMG launches have minimal PATH).
     let resolved_agent_command = resolve_command(effective_command)
         .map(|p| p.display().to_string())

@@ -1,4 +1,5 @@
 import { invoke as tauriInvoke } from "@tauri-apps/api/core";
+import { DEFAULT_AGENT_PARALLELISM } from "@/features/agents/lib/agentParallelism";
 import {
   activateRateLimit,
   parseRateLimitHint,
@@ -202,6 +203,12 @@ export type RawAcpRuntimeCatalogEntry = {
   /** Definition-level env vars for `source: custom` entries; absent for builtin/preset. */
   definition_env?: Record<string, string>;
   max_parallelism?: number;
+  /**
+   * Parallelism a new record stores when the form leaves it blank. Always
+   * emitted by the current backend; optional here so an entry from any other
+   * source falls back to the app default instead of rendering `undefined`.
+   */
+  default_parallelism?: number;
   effort_canonical_values?: string[] | null;
 };
 
@@ -710,6 +717,9 @@ export function fromRawAcpRuntimeCatalogEntry(
     ...(entry.max_parallelism !== undefined && {
       maxParallelism: entry.max_parallelism,
     }),
+    // Guarded like `max_parallelism` above: an entry without the key must fall
+    // back to the app default, not render "Hermes default (undefined)".
+    defaultParallelism: entry.default_parallelism ?? DEFAULT_AGENT_PARALLELISM,
   };
 }
 

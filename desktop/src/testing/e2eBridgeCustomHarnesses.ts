@@ -5,6 +5,7 @@
  * independently of the full e2eBridge.ts context (which requires a browser
  * environment and full Playwright setup).
  */
+import { DEFAULT_AGENT_PARALLELISM } from "../features/agents/lib/agentParallelism.ts";
 import type { RawAcpRuntimeCatalogEntry } from "../shared/api/tauri.ts";
 
 /** In-memory store for custom harnesses saved via `save_custom_harness`. */
@@ -19,6 +20,70 @@ export const mockCustomHarnesses = new Map<string, RawAcpRuntimeCatalogEntry>();
  * delete and the mock would report success while the UI still shows it.
  */
 export const mockDeletedCustomHarnesses = new Set<string>();
+
+/**
+ * Command identities the Hermes preset answers to, mirroring Rust's
+ * `preset_default_parallelism` over `normalize_command_identity`.
+ */
+const HERMES_COMMAND_IDENTITIES = new Set(["hermes", "hermes-acp"]);
+
+/**
+ * The per-harness default parallelism the backend derives from a command,
+ * mirroring Rust's `harness_default_parallelism`.
+ *
+ * `save_custom_harness` in `commands/agent_discovery.rs` emits
+ * `harness_default_parallelism(&definition.command)` for custom harnesses too,
+ * so a custom harness wrapping `hermes-acp` comes back with 1, not the app
+ * default. The identity fold matches `normalize_command_identity`: basename,
+ * lowercased, `_`/space folded to `-`, and the Windows launcher suffixes
+ * (`.exe` and npm's `.cmd`/`.bat`) stripped.
+ */
+export function mockHarnessDefaultParallelismForCommand(
+  command: string | null | undefined,
+): number {
+  const basename = (command ?? "")
+    .trim()
+    .replace(/\\/g, "/")
+    .replace(/\/+$/, "")
+    .split("/")
+    .pop();
+  const identity = (basename ?? "")
+    .toLowerCase()
+    .replace(/[ _]/g, "-")
+    .replace(/\.(exe|cmd|bat)$/, "");
+  return HERMES_COMMAND_IDENTITIES.has(identity)
+    ? 1
+    : DEFAULT_AGENT_PARALLELISM;
+}
+
+/** The shape `mockHarnessDefaultParallelismFrom` matches catalogs on. */
+type HarnessDefaultLookupEntry = {
+  id: string;
+  command?: string | null;
+  default_parallelism?: number;
+};
+
+/**
+ * The parallelism a blank create stores for `command`, mirroring Rust's
+ * `mint_parallelism`: the matching catalog entry's `default_parallelism`, else
+ * the app default.
+ *
+ * `declared` is the spec's static catalog config; the mutation store is
+ * searched after it, because a harness a spec saved through
+ * `handleSaveCustomHarness` exists only there. Without that second source a
+ * create against a saved harness would mint the app default even though the
+ * same mock had just advertised 1 for it.
+ */
+export function mockHarnessDefaultParallelismFrom(
+  command: string,
+  declared: readonly HarnessDefaultLookupEntry[],
+): number {
+  const matches = (runtime: HarnessDefaultLookupEntry) =>
+    runtime.command === command || runtime.id === command;
+  const entry =
+    declared.find(matches) ?? [...mockCustomHarnesses.values()].find(matches);
+  return entry?.default_parallelism ?? DEFAULT_AGENT_PARALLELISM;
+}
 
 /** Reset the store between tests. */
 export function resetMockCustomHarnesses(): void {
@@ -97,6 +162,10 @@ export function handleSaveCustomHarness(args: {
     node_required: false,
     auth_status: { status: "not_applicable" },
     source: "custom",
+    // Keyed on the command, like the backend: `save_custom_harness` returns
+    // `harness_default_parallelism(&definition.command)`, so a custom harness
+    // wrapping `hermes-acp` (in any launcher spelling) advertises 1.
+    default_parallelism: mockHarnessDefaultParallelismForCommand(def.command),
     // Omit definition_env when the env map is empty — mirrors Rust's BTreeMap
     // serialization which skips empty maps so the field is absent on the wire.
     definition_env:
