@@ -19,9 +19,24 @@ internal object AndroidVoiceNotePackager {
     private const val encoderTimeoutNs = 30_000_000_000L
     private const val copyBufferSize = 1024 * 1024
 
+    /** Upload container for a recorded voice note. Wire names match the Dart side. */
+    enum class Container(val wireName: String) {
+        /** H.264/AAC MP4 envelope uploaded as `video/mp4`. */
+        MP4_ENVELOPE("mp4"),
+
+        /** Bare AAC audio uploaded as `audio/mp4` on relays advertising `buzz-audio`. */
+        M4A("m4a"),
+        ;
+
+        companion object {
+            fun fromWireName(value: String?): Container? = entries.firstOrNull { it.wireName == value }
+        }
+    }
+
     fun packageForUpload(
         sourcePath: String,
         cacheDirectory: File,
+        container: Container = Container.MP4_ENVELOPE,
     ): String {
         val source = File(sourcePath)
         require(source.isFile) { "The recording could not be found." }
@@ -30,6 +45,21 @@ internal object AndroidVoiceNotePackager {
         require(audio.durationUs > 0) { "The recording has no playable audio." }
         require(audio.mimeType == MediaFormat.MIMETYPE_AUDIO_AAC) {
             "The recording is not AAC audio."
+        }
+
+        if (container == Container.M4A) {
+            val outputFile = File(cacheDirectory, "${UUID.randomUUID()}.m4a")
+            try {
+                muxAudioOnly(
+                    audioPath = sourcePath,
+                    audioTrackIndex = audio.index,
+                    outputPath = outputFile.absolutePath,
+                )
+                return outputFile.absolutePath
+            } catch (error: Exception) {
+                outputFile.delete()
+                throw error
+            }
         }
 
         val videoFile = File(cacheDirectory, "${UUID.randomUUID()}-voice-note-video.mp4")
@@ -240,6 +270,42 @@ internal object AndroidVoiceNotePackager {
         } finally {
             audioExtractor.release()
             videoExtractor.release()
+            try {
+                muxer?.release()
+            } catch (_: Exception) {
+                // Best-effort muxer cleanup after a packaging failure.
+            }
+        }
+    }
+
+    /**
+     * Remuxes only the source AAC track into a fresh MPEG-4 container.
+     *
+     * No video track, no [MediaMuxer.setLocation] or [MediaMuxer.setOrientationHint], so the
+     * relay's metadata-free M4A validator sees exactly one AAC track. MediaMuxer still writes
+     * `moov` last and adds its own moov-level `meta` box; the Dart fast-start rewrite relocates
+     * `moov` and drops that box before upload.
+     */
+    private fun muxAudioOnly(
+        audioPath: String,
+        audioTrackIndex: Int,
+        outputPath: String,
+    ) {
+        val audioExtractor = MediaExtractor()
+        var muxer: MediaMuxer? = null
+        try {
+            audioExtractor.setDataSource(audioPath)
+            audioExtractor.selectTrack(audioTrackIndex)
+
+            muxer = MediaMuxer(outputPath, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4)
+            val destinationAudioTrack = muxer.addTrack(
+                audioExtractor.getTrackFormat(audioTrackIndex),
+            )
+            muxer.start()
+            copyTrack(audioExtractor, muxer, destinationAudioTrack)
+            muxer.stop()
+        } finally {
+            audioExtractor.release()
             try {
                 muxer?.release()
             } catch (_: Exception) {
