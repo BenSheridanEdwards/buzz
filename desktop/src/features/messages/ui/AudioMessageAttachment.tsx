@@ -429,12 +429,19 @@ export function AudioMessageAttachment({
 
   const timeLabel = `${formatVoiceNoteDuration(currentTime)} / ${formatVoiceNoteDuration(duration)}`;
   const nextPlaybackRate = nextVoiceNotePlaybackRate(playbackRate);
+  // A seek that lands on the last frame ends the media as surely as playing
+  // to it does, and the element fires `ended` either way. Only playback
+  // running out rewinds the head; a scrub the user aimed at the end stays
+  // there. Recorded at the seek because the `ended` event cannot tell them
+  // apart, and `paused` at that moment is a browser detail.
+  const seekedToEndRef = React.useRef(false);
   const seekTo = React.useCallback(
     (next: number, knownDuration: number) => {
       const clamped = Math.max(0, Math.min(next, knownDuration));
       if (audioRef.current && Number.isFinite(clamped)) {
         audioRef.current.currentTime = clamped;
       }
+      seekedToEndRef.current = knownDuration > 0 && clamped >= knownDuration;
       setCurrentTime(clamped);
       paintProgress(clamped, knownDuration);
     },
@@ -732,12 +739,17 @@ export function AudioMessageAttachment({
           }
         }}
         onEnded={() => {
-          setCurrentTime(0);
           setIsPlaying(false);
+          // Reached by a scrub to the last frame, not by playing out: leave
+          // the head where the user put it. `play()` from the end rewinds on
+          // its own, so nothing is stranded.
+          if (seekedToEndRef.current) return;
+          setCurrentTime(0);
           paintProgress(0);
         }}
         onPause={() => setIsPlaying(false)}
         onPlay={() => {
+          seekedToEndRef.current = false;
           setPlaybackError(false);
           setIsPlaying(true);
         }}

@@ -729,11 +729,24 @@ test("records from the composer and renders an inline waveform card", async ({
   const composerCard = page.getByTestId("composer-voice-note-card");
   await expect(composerCard).toBeVisible();
   await waitForAnimations(page);
+  // The cap is the point: 21rem in a 2200px composer. Assert the cap itself,
+  // then let the rendered box settle onto it — the card enters on a spring
+  // that overshoots the resting scale by a fraction of a percent, so a single
+  // zero-tolerance read of the animated box is a race with the last frame
+  // (336.17 idle here, 338.80 under load).
+  await expect(composerCard).toHaveCSS("max-width", "336px");
+  await expect
+    .poll(
+      async () =>
+        (await composerCard.boundingBox())?.width ?? Number.POSITIVE_INFINITY,
+      {
+        message: "the composer voice-note card settles at its 21rem cap",
+        timeout: 10_000,
+      },
+    )
+    .toBeLessThanOrEqual(336);
   const composerCardBox = await composerCard.boundingBox();
   expect(composerCardBox).not.toBeNull();
-  expect(
-    composerCardBox?.width ?? Number.POSITIVE_INFINITY,
-  ).toBeLessThanOrEqual(336);
   await expect(
     composerCard.getByRole("button", { name: "Play voice note" }),
   ).toBeVisible();
@@ -942,23 +955,65 @@ test("records from the composer and renders an inline waveform card", async ({
       value: Number(element.value),
     }));
   const total = (await readScrub()).max;
+  // Each scrub is polled with a bound of its own and the reason written down:
+  // the position is a media-element read mirrored into React state, so it
+  // lands a frame or two after the key, and a loaded runner can outrun
+  // Playwright's default expect window.
+  const SCRUB_TIMEOUT_MS = 10_000;
+  const scrubbedTo = (message: string) =>
+    expect.poll(async () => (await readScrub()).value, {
+      message,
+      timeout: SCRUB_TIMEOUT_MS,
+    });
   await page.keyboard.press("ArrowRight");
-  await expect
-    .poll(async () => (await readScrub()).value)
-    .toBeCloseTo(Math.min(1, total), 2);
+  await scrubbedTo("ArrowRight steps one second forward").toBeCloseTo(
+    Math.min(1, total),
+    2,
+  );
   await expect(card.getByTestId("voice-note-time")).toHaveText(
     /^0:0\d \/ 0:0\d$/,
   );
   await page.keyboard.press("Home");
-  await expect.poll(async () => (await readScrub()).value).toBe(0);
+  await scrubbedTo("Home returns to the start").toBe(0);
   await page.keyboard.press("Shift+ArrowRight");
-  await expect
-    .poll(async () => (await readScrub()).value)
-    .toBeCloseTo(Math.min(5, total), 2);
+  await scrubbedTo("Shift+ArrowRight steps five seconds, clamped").toBeCloseTo(
+    Math.min(5, total),
+    2,
+  );
   await page.keyboard.press("End");
+  await scrubbedTo("End goes to the last frame").toBeCloseTo(total, 2);
+  // A seek onto the last frame ends the media, and the element fires `ended`
+  // for it exactly as it does for playback running out — whether a paused
+  // scrub gets one depends on how far playback reached before the pause, so
+  // fire it here rather than race it. That race was this spec's flake, and
+  // what it caught was the card rewinding the head on a scrub the user aimed
+  // at the end.
+  //
+  // The painted progress is the witness rather than the slider: the element
+  // really is parked at the end, so a `timeupdate` settling after the seek
+  // re-mirrors that position into the state either way, while only a rewind
+  // repaints the waveform back to the start.
+  const progressClipPath = () =>
+    card
+      .getByTestId("voice-note-progress-waveform")
+      .evaluate((element) => getComputedStyle(element).clipPath);
+  const audio = card.locator("audio");
+  await audio.dispatchEvent("ended");
   await expect
-    .poll(async () => (await readScrub()).value)
-    .toBeCloseTo(total, 2);
+    .poll(progressClipPath, {
+      message: "a scrub onto the last frame is not a playthrough",
+      timeout: SCRUB_TIMEOUT_MS,
+    })
+    .not.toContain("100%");
+  // Playing out is the other case, and it does rewind to the start.
+  await audio.dispatchEvent("play");
+  await audio.dispatchEvent("ended");
+  await expect
+    .poll(progressClipPath, {
+      message: "playback running out rewinds the head",
+      timeout: SCRUB_TIMEOUT_MS,
+    })
+    .toContain("100%");
   await page.keyboard.press("Home");
   await expect(card.getByTestId("voice-note-time")).toHaveText(
     /^0:00 \/ 0:0\d$/,
