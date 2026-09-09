@@ -616,6 +616,7 @@ fn quad_definition(respond_to: &str, allowlist: Vec<&str>) -> AgentDefinition {
 fn mint_explicit_input_wins_over_definition() {
     let definition = quad_definition("anyone", vec![]);
     let minted = resolve_mint_behavioral_defaults(
+        "",
         Some(RespondTo::OwnerOnly),
         Vec::new(),
         Some(2),
@@ -623,7 +624,7 @@ fn mint_explicit_input_wins_over_definition() {
     )
     .unwrap();
     assert_eq!(minted.respond_to, RespondTo::OwnerOnly);
-    assert_eq!(minted.parallelism, Some(2));
+    assert_eq!(minted.definition_parallelism, Some(2));
 }
 
 #[test]
@@ -631,18 +632,18 @@ fn mint_copies_definition_quad_when_input_silent() {
     let allow = "a".repeat(64);
     let definition = quad_definition("allowlist", vec![&allow]);
     let minted =
-        resolve_mint_behavioral_defaults(None, Vec::new(), None, Some(&definition)).unwrap();
+        resolve_mint_behavioral_defaults("", None, Vec::new(), None, Some(&definition)).unwrap();
     assert_eq!(minted.respond_to, RespondTo::Allowlist);
     assert_eq!(minted.respond_to_allowlist, vec![allow]);
-    assert_eq!(minted.parallelism, Some(8));
+    assert_eq!(minted.definition_parallelism, Some(8));
 }
 
 #[test]
 fn mint_without_definition_or_input_uses_client_defaults() {
-    let minted = resolve_mint_behavioral_defaults(None, Vec::new(), None, None).unwrap();
+    let minted = resolve_mint_behavioral_defaults("", None, Vec::new(), None, None).unwrap();
     assert_eq!(minted.respond_to, RespondTo::default());
     assert!(minted.respond_to_allowlist.is_empty());
-    assert_eq!(minted.parallelism, None);
+    assert_eq!(minted.definition_parallelism, None);
 }
 
 #[test]
@@ -651,8 +652,8 @@ fn mint_fails_loudly_on_unknown_definition_respond_to() {
     // author intended SOMETHING, and guessing which thing is the one wrong
     // move. The error must carry the offending string.
     let definition = quad_definition("allowlst", vec![]);
-    let err =
-        resolve_mint_behavioral_defaults(None, Vec::new(), None, Some(&definition)).unwrap_err();
+    let err = resolve_mint_behavioral_defaults("", None, Vec::new(), None, Some(&definition))
+        .unwrap_err();
     assert!(
         err.contains("allowlst"),
         "error must name the bad mode: {err}"
@@ -664,8 +665,8 @@ fn mint_fails_loudly_on_empty_definition_allowlist() {
     // Inbound definitions bypass the dialog guard entirely — the mint
     // boundary is the backstop against a crash-looping instance.
     let definition = quad_definition("allowlist", vec![]);
-    let err =
-        resolve_mint_behavioral_defaults(None, Vec::new(), None, Some(&definition)).unwrap_err();
+    let err = resolve_mint_behavioral_defaults("", None, Vec::new(), None, Some(&definition))
+        .unwrap_err();
     assert!(
         err.contains("at least one pubkey"),
         "unexpected error: {err}"
@@ -676,8 +677,8 @@ fn mint_fails_loudly_on_empty_definition_allowlist() {
 fn mint_fails_loudly_on_out_of_range_definition_parallelism() {
     let mut definition = quad_definition("anyone", vec![]);
     definition.parallelism = Some(64);
-    let err =
-        resolve_mint_behavioral_defaults(None, Vec::new(), None, Some(&definition)).unwrap_err();
+    let err = resolve_mint_behavioral_defaults("", None, Vec::new(), None, Some(&definition))
+        .unwrap_err();
     assert!(err.contains("64"), "error must name the bad value: {err}");
 }
 
@@ -686,7 +687,7 @@ fn mint_normalizes_definition_allowlist_from_wire() {
     let upper = "A".repeat(64);
     let definition = quad_definition("allowlist", vec![&upper]);
     let minted =
-        resolve_mint_behavioral_defaults(None, Vec::new(), None, Some(&definition)).unwrap();
+        resolve_mint_behavioral_defaults("", None, Vec::new(), None, Some(&definition)).unwrap();
     assert_eq!(minted.respond_to_allowlist, vec!["a".repeat(64)]);
 }
 
@@ -695,16 +696,70 @@ fn mint_resolves_each_behavioral_field_independently() {
     // PR #1667 review (convergent): the input-wins rule is per-FIELD, not
     let definition = quad_definition("anyone", vec![]);
     let minted =
-        resolve_mint_behavioral_defaults(None, Vec::new(), None, Some(&definition)).unwrap();
+        resolve_mint_behavioral_defaults("", None, Vec::new(), None, Some(&definition)).unwrap();
     assert_eq!(minted.respond_to, RespondTo::Anyone, "inherited");
-    assert_eq!(minted.parallelism, Some(8), "inherited");
+    assert_eq!(minted.definition_parallelism, Some(8), "inherited");
+}
+
+// ── The harness default the three mint sites store ──────────────────────────
+//
+// `MintBehavioralDefaults::parallelism` is the value every mint site writes to
+// `ManagedAgentRecord.parallelism` (create, persona snapshot import, team
+// snapshot import). Deleting the harness fold below turns Hermes back into 10
+// at all three, and these tests are what says so.
+
+/// A blank parallelism on the Hermes harness mints 1, not the app default,
+/// whether the site holds the runtime id or the command; every other harness
+/// still mints the app default. `definition_parallelism` stays `None`
+/// throughout, so the portable definition keeps saying "no opinion".
+#[test]
+fn mint_fills_a_blank_parallelism_with_the_harness_default() {
+    let app_default = crate::managed_agents::DEFAULT_AGENT_PARALLELISM;
+    assert_ne!(app_default, 1, "the Hermes default must be observable");
+
+    for harness in ["hermes", "hermes-acp", "/opt/hermes/bin/hermes-acp"] {
+        let minted =
+            resolve_mint_behavioral_defaults(harness, None, Vec::new(), None, None).unwrap();
+        assert_eq!(minted.parallelism, 1, "record parallelism for {harness:?}");
+        assert_eq!(
+            minted.definition_parallelism, None,
+            "definition parallelism for {harness:?} must stay unset"
+        );
+    }
+
+    for harness in ["goose", "codex-acp", "buzz-agent", "/opt/custom/agent", ""] {
+        let minted =
+            resolve_mint_behavioral_defaults(harness, None, Vec::new(), None, None).unwrap();
+        assert_eq!(
+            minted.parallelism, app_default,
+            "record parallelism for {harness:?}"
+        );
+    }
+}
+
+/// An explicit request, and a value inherited from the linked definition, both
+/// beat the harness default — the fold fills a blank, it does not clamp.
+#[test]
+fn mint_harness_default_never_overrides_a_requested_parallelism() {
+    let minted =
+        resolve_mint_behavioral_defaults("hermes-acp", None, Vec::new(), Some(4), None).unwrap();
+    assert_eq!(minted.parallelism, 4, "explicit input wins");
+    assert_eq!(minted.definition_parallelism, Some(4));
+
+    // quad_definition carries parallelism: Some(8).
+    let definition = quad_definition("anyone", vec![]);
+    let minted =
+        resolve_mint_behavioral_defaults("hermes", None, Vec::new(), None, Some(&definition))
+            .unwrap();
+    assert_eq!(minted.parallelism, 8, "definition value wins");
+    assert_eq!(minted.definition_parallelism, Some(8));
 }
 
 #[test]
 fn mint_rejects_out_of_range_input_parallelism() {
     // The "validated when present" contract on MintBehavioralDefaults holds
     // for the INPUT branch too, not just definition values.
-    let err = resolve_mint_behavioral_defaults(None, Vec::new(), Some(64), None).unwrap_err();
+    let err = resolve_mint_behavioral_defaults("", None, Vec::new(), Some(64), None).unwrap_err();
     assert!(err.contains("64"), "error must name the bad value: {err}");
     assert!(
         !err.contains("definition"),
@@ -761,6 +816,7 @@ fn summary_fixture(
         log_path: String::new(),
         respond_to: RespondTo::OwnerOnly,
         respond_to_allowlist: Vec::new(),
+        relay_membership: None,
     }
 }
 

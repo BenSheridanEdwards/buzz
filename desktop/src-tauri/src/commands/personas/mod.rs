@@ -4,7 +4,7 @@ use crate::{
     app_state::AppState,
     managed_agents::{
         current_instance_id, delete_agent_key, load_managed_agents, load_personas, load_teams,
-        save_managed_agents, save_personas, stop_managed_agent_process,
+        managed_agents_base_dir, save_managed_agents, save_personas, stop_managed_agent_process,
         sync_managed_agent_processes, try_regenerate_nest, validate_persona_activation_change,
         validate_persona_deletion, AgentDefinition, ManagedAgentRecord,
     },
@@ -129,20 +129,33 @@ fn collect_remote_deployed(
         .collect()
 }
 
-/// Remove cascade agents from `agents` and persist via the injectable `save`.
+/// Remove cascade agents from `agents`, persist via the injectable `save`, and
+/// drop the derived per-agent state each removed record leaves behind.
 ///
-/// Extracted from `delete_persona` so unit tests can inject a failing save and
-/// verify retry-safety without a full `AppHandle` mock: if `save` returns `Err`,
-/// this function propagates it before the keyring deletions and tombstones that
-/// appear after the `?` in the call site — nothing is destroyed and the command
-/// is safe to retry.
+/// This is the cascade's counterpart to `run_managed_agent_deletion`, and it
+/// owns the derived-state clear for the same reason that one does: there is
+/// more than one removal path and every one of them must clear the same
+/// sidecars, so exactly one function per path should be the thing to call.
+/// The cascade used to call `forget_managed_agent_derived_state` itself, from
+/// a loop inside the `tauri::AppHandle` body that no test could reach, which
+/// made it a second independent call site whose removal failed nothing.
+///
+/// Ordering follows the same rule as the single delete: the clear happens
+/// only after the records have actually left disk. `save` returning `Err`
+/// propagates before any derived state, keyring entry or tombstone is
+/// touched, so nothing is destroyed and the command is safe to retry.
 fn commit_cascade_agents(
+    base_dir: &std::path::Path,
     agents: &mut Vec<ManagedAgentRecord>,
     cascade: &std::collections::HashSet<String>,
     save: impl FnOnce(&[ManagedAgentRecord]) -> Result<(), String>,
 ) -> Result<(), String> {
     agents.retain(|a| !cascade.contains(&a.pubkey));
-    save(agents)
+    save(agents)?;
+    for pubkey in cascade {
+        super::agents::forget_managed_agent_derived_state(base_dir, pubkey);
+    }
+    Ok(())
 }
 
 #[tauri::command]
@@ -254,8 +267,16 @@ pub async fn delete_persona(id: String, app: AppHandle) -> Result<(), String> {
             //   persona save fails → cascade agents gone, persona survives; a retry
             //                        finds an empty cascade and proceeds cleanly
             // Keys and tombstones are enqueued only after their records leave disk.
+            //
+            // The base dir is resolved BEFORE the first destructive write.
+            // It used to be bound in the side-effect section below, where a
+            // failure would skip the key deletion, the derived-state clear
+            // and both tombstones for every cascaded agent after the records
+            // had already gone (rule 1). Resolving it here makes that failure
+            // mode a clean refusal with nothing destroyed instead.
+            let base_dir = managed_agents_base_dir(&app)?;
             if !cascade.is_empty() {
-                commit_cascade_agents(&mut agents, &cascade, |recs| {
+                commit_cascade_agents(&base_dir, &mut agents, &cascade, |recs| {
                     save_managed_agents(&app, recs)
                 })?;
             }
@@ -268,6 +289,10 @@ pub async fn delete_persona(id: String, app: AppHandle) -> Result<(), String> {
             save_personas(&app, &personas)?;
 
             // Side effects — strictly after records leave disk.
+            // The relay-membership sidecar is not among them:
+            // `commit_cascade_agents` owns that clear, the way
+            // `run_managed_agent_deletion` owns it for the single delete, so
+            // neither path has a second thing to remember.
             for pk in &cascade {
                 state.clear_agent_session_caches(pk);
                 // Remove nsec from keyring after the record is gone.

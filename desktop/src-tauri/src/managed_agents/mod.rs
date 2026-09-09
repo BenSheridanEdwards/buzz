@@ -17,6 +17,8 @@ pub(crate) mod config_bridge;
 pub(crate) mod custom_harnesses;
 mod definition_validation;
 mod discovery;
+mod hermes_profiles;
+pub use hermes_profiles::{default_hermes_home_dir, list_hermes_profiles_for_home, HermesProfile};
 pub(crate) mod effective_config;
 mod env_vars;
 pub(crate) mod git_bash;
@@ -31,6 +33,7 @@ mod personas;
 mod process_lifecycle;
 pub(crate) mod readiness;
 pub(crate) mod reconcile;
+mod relay_membership;
 mod relay_mesh;
 mod repos;
 mod restore;
@@ -88,7 +91,10 @@ pub(crate) use global_config::{
 };
 pub(crate) use managed_node_paths::*;
 pub use nest::*;
-pub use parallelism::{acp_agents_value, effective_parallelism, harness_max_parallelism};
+pub use parallelism::{
+    acp_agents_value, effective_parallelism, harness_default_parallelism, harness_max_parallelism,
+    mint_parallelism,
+};
 pub use personas::*;
 #[cfg(windows)]
 pub use process_lifecycle::*;
@@ -96,6 +102,13 @@ pub(crate) use readiness::{
     agent_readiness, resolve_effective_agent_env, resolve_effective_harness_descriptor,
     AgentReadiness, Requirement,
 };
+pub use relay_membership::{
+    clear_relay_membership, load_relay_memberships, preflight_managed_agent_relay_membership,
+    relay_membership_for, should_preflight_membership, ManagedAgentRelayMembership,
+    RelayMembershipStore,
+};
+#[cfg(test)]
+pub use relay_membership::{record_relay_membership, RelayMembershipState};
 pub use relay_mesh::*;
 pub use repos::{
     effective_repos_dir, ensure_repos_symlink, resolve_repos_at_boot, validate_repos_dir,

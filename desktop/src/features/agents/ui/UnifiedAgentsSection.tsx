@@ -8,6 +8,11 @@ import {
 import { resolveAgentCardModelLabel } from "@/features/agents/lib/agentCardModelLabel";
 import { effectiveAgentDescription } from "@/features/agents/lib/agentDescription";
 import { friendlyAgentLastError } from "@/features/agents/lib/friendlyAgentLastError";
+import {
+  noticeGroupKey,
+  relayMembershipNotice,
+  relayMembershipNoticeGroups,
+} from "@/features/agents/lib/relayMembership";
 import type { AgentAvailabilityReader } from "@/features/agents/lib/useAgentAvailability";
 import { isManagedAgentActive } from "@/features/agents/lib/managedAgentControlActions";
 import { pickProfileAgent } from "@/features/agents/lib/pickProfileAgent";
@@ -26,6 +31,7 @@ import { AgentIdentityCard } from "./AgentIdentityCard";
 import { AgentRuntimeAvatarControl } from "./AgentRuntimeAvatarControl";
 import { CreateIdentityCard } from "./CreateIdentityCard";
 import { PersonaActionsMenu } from "./PersonaActionsMenu";
+import { RelayMembershipBlock } from "./RelayMembershipBlock";
 import { buildUnifiedGroups } from "./unifiedAgentGroups";
 
 type UnifiedAgentsSectionProps = {
@@ -109,6 +115,14 @@ export function UnifiedAgentsSection(props: UnifiedAgentsSectionProps) {
     () => buildUnifiedGroups(personas, agents, isArchived),
     [personas, agents, isArchived],
   );
+  // Every distinct relay-membership problem across the whole section, for
+  // BOTH subjects and not just the biggest group. This is the only component
+  // that renders the remedy, so a notice missing from this list is an agent
+  // whose npub and operator command nothing in the app puts on screen.
+  const membershipNotices = React.useMemo(
+    () => relayMembershipNoticeGroups(agents),
+    [agents],
+  );
   const [collapsed, setCollapsed] = React.useState<Set<string>>(new Set());
   function toggle(key: string) {
     setCollapsed((prev) => {
@@ -132,6 +146,34 @@ export function UnifiedAgentsSection(props: UnifiedAgentsSectionProps) {
 
       {!isLoading ? (
         <div className="space-y-3" data-testid="unified-agents-groups">
+          {/*
+            The feature's only recovery affordance, for every agent the relay
+            will not admit, whichever identity it refused.
+
+            A relay that refused the WORKSPACE identity refused it once, for
+            every agent below: same npub, same operator command, same remedy.
+            Rendered per card it would be one identical amber block per agent
+            for a single problem that is not any agent's, so it renders here,
+            once per distinct problem, above the agents it holds up. An
+            AGENT-subject refusal is its own problem with its own npub and its
+            own `add-member`, so it gets its own block, named after the agent.
+
+            The card badge names the problem and this block carries the way
+            out of it, so a badge with no block below it is a dead end. That
+            shipped twice: once when every renderer of the block was deleted
+            and left orphaned, and once when only the workspace half was
+            rehomed here. There is one renderer now, and
+            `UnifiedAgentsSectionRelayMembership.test.mjs` mounts this section
+            and reads the command out of the DOM for each subject.
+          */}
+          {membershipNotices.map(({ notice, agentCount, agentNames }) => (
+            <RelayMembershipBlock
+              agentCount={agentCount}
+              agentNames={agentNames}
+              key={noticeGroupKey(notice)}
+              notice={notice}
+            />
+          ))}
           <div className={IDENTITY_CARD_GRID_CLASS}>
             <CreateIdentityCard
               ariaLabel="New agent"
@@ -361,9 +403,33 @@ function AgentPersonaCard({
             <AlertTriangle className="h-3 w-3" />
             Configuration missing
           </Badge>
+        ) : agent ? (
+          <RelayMembershipBadge agent={agent} />
         ) : null
       }
     />
+  );
+}
+
+/**
+ * Card-face badge for an agent a closed relay will not let publish. The full
+ * explanation, npub and operator command live in the `RelayMembershipBlock`
+ * this section renders above the grid for every subject, so the badge names
+ * the problem and the block carries the way out of it. The badge must never
+ * be the only thing rendered for a notice: see `relayMembershipNoticeGroups`.
+ */
+function RelayMembershipBadge({ agent }: { agent: ManagedAgent }) {
+  const notice = relayMembershipNotice(agent.pubkey, agent.relayMembership);
+  if (!notice) return null;
+  return (
+    <Badge
+      className="gap-1"
+      data-testid={`agent-relay-membership-${notice.severity}-${agent.pubkey}`}
+      variant={notice.severity === "blocked" ? "warning" : "secondary"}
+    >
+      <AlertTriangle aria-hidden="true" className="h-3 w-3" />
+      {notice.badge}
+    </Badge>
   );
 }
 
@@ -455,7 +521,9 @@ function StandaloneAgentCard({
             <AlertTriangle className="h-3 w-3" />
             Configuration missing
           </Badge>
-        ) : null
+        ) : (
+          <RelayMembershipBadge agent={agent} />
+        )
       }
     />
   );

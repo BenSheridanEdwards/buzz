@@ -282,7 +282,29 @@ fn extract_retry_in_hint(body: &str) -> Option<u64> {
     digits.parse::<u64>().ok()
 }
 
+pub mod refusal;
+pub use refusal::RelayRefusal;
+
+/// A non-2xx relay response, read once: the caller-facing string every
+/// existing call site already used, plus the relay's structured refusal when
+/// the answer was a client-side refusal it is safe to act on.
+#[derive(Debug, Clone)]
+pub struct RelayErrorDetails {
+    /// Exactly what [`relay_error_message`] returns.
+    pub error: String,
+    /// Present only for a 4xx (never 429) whose body parsed as JSON with an
+    /// `error` or `message` field. A 429, a 5xx, an intercepted page and a
+    /// body that is not structured JSON all leave this `None`, so a caller
+    /// can never mistake an outage for the relay's definitive answer.
+    pub refusal: Option<RelayRefusal>,
+}
+
 pub async fn relay_error_message(response: reqwest::Response) -> String {
+    relay_error_details(response).await.error
+}
+
+/// [`relay_error_message`] that also keeps the relay's structured refusal.
+pub async fn relay_error_details(response: reqwest::Response) -> RelayErrorDetails {
     let status = response.status();
 
     // Check for intercepted/proxy responses before reading the body.
@@ -295,7 +317,10 @@ pub async fn relay_error_message(response: reqwest::Response) -> String {
         .to_string();
 
     if let Some(msg) = classify_intercepted_response(&final_host, &content_type) {
-        return msg;
+        return RelayErrorDetails {
+            error: msg,
+            refusal: None,
+        };
     }
 
     // Real relay error: extract the structured message field if available.
@@ -309,7 +334,10 @@ pub async fn relay_error_message(response: reqwest::Response) -> String {
         Ok(body) => body,
         Err(e) => {
             if let Some(timeout) = classify_body_timeout(&e) {
-                return timeout;
+                return RelayErrorDetails {
+                    error: timeout,
+                    refusal: None,
+                };
             }
             String::new()
         }
@@ -330,24 +358,51 @@ pub async fn relay_error_message(response: reqwest::Response) -> String {
         // gate from receiving an uncapped hint from an untrusted relay.
         let capped_hint = hint.map(|s| s.min(crate::relay_admission::MAX_HINT_SECONDS));
         crate::relay_admission::activate_rate_limit(capped_hint);
-        if let Some(secs) = capped_hint {
-            return format!("relay rate-limited: retry in {secs}s");
-        }
-        return "relay rate-limited: quota exceeded".to_string();
+        let error = match capped_hint {
+            Some(secs) => format!("relay rate-limited: retry in {secs}s"),
+            None => "relay rate-limited: quota exceeded".to_string(),
+        };
+        // Deliberately no `refusal`: a quota window says nothing about the
+        // request itself, so no caller may treat it as the relay's answer.
+        return RelayErrorDetails {
+            error,
+            refusal: None,
+        };
     }
 
     if let Ok(value) = serde_json::from_str::<serde_json::Value>(&body) {
-        if let Some(message) = value.get("message").and_then(serde_json::Value::as_str) {
-            return format!("relay returned {status}: {message}");
-        }
-
-        if let Some(error) = value.get("error").and_then(serde_json::Value::as_str) {
-            return format!("relay returned {status}: {error}");
+        // Bounded by construction: `RelayRefusal::new` is the only way to
+        // build one (see `relay/refusal.rs`), so the cap cannot be applied on
+        // this door and dropped from another. The rendered `error` string
+        // below is composed from the same bounded values, and so is
+        // everything the sidecar persists.
+        let refusal = RelayRefusal::new(
+            value
+                .get("error")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string),
+            value
+                .get("message")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string),
+        );
+        if !refusal.is_silent() {
+            // `message()` is the human sentence when the relay sent both,
+            // unchanged: it is the one written for a reader.
+            return RelayErrorDetails {
+                error: format!("relay returned {status}: {}", refusal.message()),
+                // Only a client-side refusal is the relay's definitive answer
+                // about this request. A 5xx is an outage and must stay one.
+                refusal: status.is_client_error().then_some(refusal),
+            };
         }
     }
 
     // Non-JSON, non-HTML body: emit status only — no raw body in the UI.
-    format!("relay returned {status}")
+    RelayErrorDetails {
+        error: format!("relay returned {status}"),
+        refusal: None,
+    }
 }
 
 // ── HTTP bridge: POST /query ────────────────────────────────────────────────
@@ -372,13 +427,41 @@ pub async fn query_relay_at(
     api_base_url: &str,
     filters: &[serde_json::Value],
 ) -> Result<Vec<nostr::Event>, String> {
+    query_relay_details_at(state, api_base_url, filters)
+        .await
+        .map_err(|details| details.error)
+}
+
+/// [`query_relay_at`] that keeps the relay's structured refusal.
+///
+/// A closed relay enforces membership on `/query` before it looks at the
+/// filters (`api/bridge.rs`, `query_events_authed`), so a 403 here is the
+/// relay's answer about the *querying identity*, not a transport failure.
+/// The membership preflight needs that distinction; every other caller wants
+/// the flat string and uses [`query_relay_at`].
+///
+/// Sent on the no-redirect [`AppState::relay_query_client`]: the membership
+/// roster this returns is read as the relay's own assertion about who may
+/// publish there, so a third origin must not be able to supply it.
+pub async fn query_relay_details_at(
+    state: &AppState,
+    api_base_url: &str,
+    filters: &[serde_json::Value],
+) -> Result<Vec<nostr::Event>, RelayErrorDetails> {
     crate::relay_admission::wait_for_rate_limit().await;
     let url = format!("{}/query", api_base_url);
-    let body_bytes =
-        serde_json::to_vec(filters).map_err(|e| format!("filter serialization failed: {e}"))?;
-    let auth = build_nip98_auth_header(&Method::POST, &url, &body_bytes, state)?;
+    let body_bytes = serde_json::to_vec(filters).map_err(|e| RelayErrorDetails {
+        error: format!("filter serialization failed: {e}"),
+        refusal: None,
+    })?;
+    let auth = build_nip98_auth_header(&Method::POST, &url, &body_bytes, state).map_err(|e| {
+        RelayErrorDetails {
+            error: e,
+            refusal: None,
+        }
+    })?;
     send_query_request(
-        &state.http_client,
+        &state.relay_query_client,
         &url,
         &auth,
         None,
@@ -401,7 +484,7 @@ pub async fn query_relay_at_with_keys(
         serde_json::to_vec(filters).map_err(|e| format!("filter serialization failed: {e}"))?;
     let auth = build_nip98_auth_header_for_keys(keys, &Method::POST, &url, &body_bytes)?;
     send_query_request(
-        &state.http_client,
+        &state.relay_query_client,
         &url,
         &auth,
         auth_tag,
@@ -409,6 +492,7 @@ pub async fn query_relay_at_with_keys(
         QUERY_REQUEST_TIMEOUT,
     )
     .await
+    .map_err(|details| details.error)
 }
 
 /// Issue an authenticated `POST /query` and parse the response, applying the
@@ -419,6 +503,12 @@ pub async fn query_relay_at_with_keys(
 /// can drive the real send/timeout/classify path with a short deadline against
 /// a stalled loopback. A timeout surfaces through `classify_request_error` as
 /// the stable `"relay unreachable: request timed out"` string.
+///
+/// It is also the one place a 3xx is refused. Both builders send on the
+/// no-redirect [`AppState::relay_query_client`], so the redirect arrives here
+/// verbatim instead of being followed: a query answered by another origin is
+/// not the relay's answer, and the NIP-43 roster read on top of this helper
+/// turns a forged one into a permanent, uncheckable `Member`.
 async fn send_query_request(
     http_client: &reqwest::Client,
     url: &str,
@@ -426,7 +516,7 @@ async fn send_query_request(
     auth_tag: Option<&str>,
     body_bytes: Vec<u8>,
     timeout: std::time::Duration,
-) -> Result<Vec<nostr::Event>, String> {
+) -> Result<Vec<nostr::Event>, RelayErrorDetails> {
     let mut request = http_client
         .post(url)
         .header("Authorization", auth)
@@ -439,11 +529,33 @@ async fn send_query_request(
         .body(body_bytes)
         .send()
         .await
-        .map_err(|e| classify_request_error(&e))?;
-    if !response.status().is_success() {
-        return Err(relay_error_message(response).await);
+        .map_err(|e| RelayErrorDetails {
+            error: classify_request_error(&e),
+            refusal: None,
+        })?;
+    // Checked BEFORE the non-success branch: a 3xx is not a success, so
+    // without this it would be read as a relay error rather than as "another
+    // origin was asked to answer", and the message would not say so. No
+    // `refusal` either: a redirect is nothing the relay said about the
+    // request, so the membership caller keeps the row `Unknown` and retries.
+    if response.status().is_redirection() {
+        return Err(RelayErrorDetails {
+            error: format!(
+                "the relay query was redirected off the relay ({}), so the relay did not answer it",
+                response.status()
+            ),
+            refusal: None,
+        });
     }
-    parse_json_response(response).await
+    if !response.status().is_success() {
+        return Err(relay_error_details(response).await);
+    }
+    parse_json_response(response)
+        .await
+        .map_err(|error| RelayErrorDetails {
+            error,
+            refusal: None,
+        })
 }
 
 // ── Command response parsing ────────────────────────────────────────────────
@@ -478,9 +590,10 @@ fn build_profile_event(
     display_name: &str,
     avatar_url: Option<&str>,
     about: Option<&str>,
+    nip05: Option<&str>,
     auth_tag_json: Option<&str>,
 ) -> Result<nostr::Event, String> {
-    let builder = crate::events::build_profile(Some(display_name), None, avatar_url, about, None)?;
+    let builder = crate::events::build_profile(Some(display_name), None, avatar_url, about, nip05)?;
 
     let builder = if let Some(tag_json) = auth_tag_json {
         // Bridge nostr 0.37 PublicKey → nostr 0.36 PublicKey via hex encoding.
@@ -525,9 +638,117 @@ pub async fn sync_managed_agent_profile(
     about: Option<&str>,
     auth_tag: Option<&str>, // NIP-OA auth tag JSON
 ) -> Result<(), String> {
+    // Egress guard BEFORE any network round trip: the NIP-05 resolution
+    // below talks to the relay, and a key backup in the profile text must be
+    // refused without ever leaving the device.
+    for (bytes, context) in [
+        (display_name.as_bytes(), "agent profile sync"),
+        (about.unwrap_or("").as_bytes(), "agent profile sync"),
+    ] {
+        crate::egress_guard::assert_no_key_backup_bytes(bytes, context)?;
+    }
+    // kind:0 is absolute state on the relay, so EVERY managed-agent profile
+    // publish must carry the handle or the relay clears it. The existing
+    // handle is read back first so reconciles prefer whatever the agent
+    // already carries, subject to the relay confirming it still attributes
+    // that handle to this agent (see `nip05::resolve_managed_agent_nip05`).
+    //
+    // ADVISORY, never a gate. This read authenticates as the WORKSPACE
+    // identity, while the kind:0 it precedes is signed by the AGENT's own
+    // keys. On a closed relay those are different subjects: the operator
+    // running `buzz-admin add-member --pubkey <agent hex>` admits the agent
+    // and not the desktop, so a plain-member or unlisted user's `/query` is
+    // refused with a 403 while the agent's own `/events` publish would
+    // succeed. Propagating that refusal abandoned the publish and the agent
+    // never got a name, avatar or handle at all, with no reconcile that could
+    // ever fix it because the reconcile does the same read.
+    //
+    // Losing the hint is safe by construction: after the contested-handle
+    // fix, `existing` decides nothing but the probe ORDER
+    // (`nip05_probe_order`), and every candidate including that one is
+    // confirmed against the relay's own attribution before it is returned.
+    // The one cost is churn: an agent holding `bob-a1f3` while `bob` is free
+    // moves to `bob` on a publish whose read failed. A missing profile beats
+    // a stable one.
+    //
+    // On the relay this exists for, that is not a transient loss. A relay
+    // closed to the desktop identity refuses this read on EVERY publish and
+    // every reconcile, for as long as the user is not a member, so the hint
+    // is absent for the whole life of the pair and the move to the plain slug
+    // is guaranteed rather than rare. It is still one-way (the plain slug is
+    // the first candidate, so nothing moves back), it happens once, it lands
+    // on the nicer handle, and mentions bind pubkeys rather than handles, so
+    // a moved handle breaks no reference.
+    //
+    // The handle itself is a different matter, and it is why this read has a
+    // SECOND source. `resolve_managed_agent_nip05` keeps whatever handle the
+    // agent already carries when the well-known cannot confirm it, and this
+    // read is the only place it learns that handle. Both reads address the
+    // same host, so when one ingress fault takes both, a hint that degrades
+    // to `None` published a kind:0 with no `nip05` and the relay CLEARED the
+    // agent's handle, on precisely the relay where the workspace read is
+    // always refused. `read_agent_profile_advisory` asks again as the AGENT,
+    // the identity the relay does admit, so the fallback has a source that
+    // does not depend on the refused read.
+    //
+    // Both of those sources are still `/query` on one host, and both are
+    // bounded by `QUERY_REQUEST_TIMEOUT`, so a relay that is merely SLOW
+    // loses both while `/events` goes on accepting the publish that then
+    // strips the handle. `last_known_agent_nip05` is the last resort for
+    // exactly that, and its doc comment states what it does not cover: this
+    // process's very first publish for a pair.
+    let agent_pubkey = agent_keys.public_key().to_hex();
+    let existing =
+        read_agent_profile_advisory(state, relay_url, Some(agent_keys), &agent_pubkey, auth_tag)
+            .await
+            .and_then(|info| info.nip05)
+            // ...and when NEITHER read could be completed, the last handle
+            // this process saw the relay attribute to this agent. A refusal
+            // has a second identity to ask; a read that runs past
+            // `QUERY_REQUEST_TIMEOUT` has none, and a slow relay answers
+            // `/events` long after it stopped answering `/query`, so the
+            // publish lands and takes the handle with it. See
+            // `last_known_agent_nip05` for what this does and does not cover.
+            .or_else(|| last_known_agent_nip05(state, relay_url, &agent_pubkey));
+    let nip05 = nip05::resolve_managed_agent_nip05(
+        state,
+        relay_url,
+        &agent_pubkey,
+        display_name,
+        existing.as_deref(),
+    )
+    .await?;
+    sync_managed_agent_profile_with_nip05(
+        state,
+        relay_url,
+        agent_keys,
+        display_name,
+        avatar_url,
+        about,
+        nip05.as_deref(),
+        auth_tag,
+    )
+    .await
+}
+
+/// [`sync_managed_agent_profile`] with an already-resolved NIP-05 handle.
+/// Callers that computed the handle to decide whether a sync is needed at
+/// all (profile reconciliation) use this to publish exactly what they
+/// compared against.
+#[allow(clippy::too_many_arguments)]
+pub async fn sync_managed_agent_profile_with_nip05(
+    state: &AppState,
+    relay_url: &str,
+    agent_keys: &nostr::Keys,
+    display_name: &str,
+    avatar_url: Option<&str>,
+    about: Option<&str>,
+    nip05: Option<&str>,
+    auth_tag: Option<&str>, // NIP-OA auth tag JSON
+) -> Result<(), String> {
     crate::relay_admission::wait_for_rate_limit().await;
     // Build a signed kind:0 profile event (with optional NIP-OA auth tag).
-    let event = build_profile_event(agent_keys, display_name, avatar_url, about, auth_tag)?;
+    let event = build_profile_event(agent_keys, display_name, avatar_url, about, nip05, auth_tag)?;
     let event_json = event.as_json();
     let body_bytes = event_json.into_bytes();
     crate::egress_guard::assert_no_key_backup_bytes(&body_bytes, "agent profile sync")?;
@@ -556,6 +777,17 @@ pub async fn sync_managed_agent_profile(
         ));
     }
 
+    // The relay accepted this kind:0, so the handle it carries is the handle
+    // the relay now holds. Remembering it here rather than only on the read
+    // covers the agent whose profile this process created: it has a handle
+    // from its very first publish, so a later publish whose reads both time
+    // out has something to keep. A publish that deliberately carries NO
+    // handle leaves the entry alone; see `AppState::agent_nip05_cache` for
+    // why "the read failed" must not look like "there is no handle".
+    if let Some(nip05) = nip05 {
+        remember_agent_nip05(state, relay_url, &agent_keys.public_key().to_hex(), nip05);
+    }
+
     Ok(())
 }
 
@@ -576,23 +808,211 @@ pub async fn query_agent_profile(
     relay_url: &str,
     agent_pubkey: &str,
 ) -> Result<Option<AgentProfileInfo>, String> {
-    let filter = serde_json::json!({
+    let events = query_relay_at(
+        state,
+        &relay_http_base_url(relay_url),
+        &[agent_profile_filter(agent_pubkey)],
+    )
+    .await?;
+    Ok(parse_agent_profile(&events))
+}
+
+/// [`query_agent_profile`] authenticated as the AGENT rather than as the
+/// workspace identity, carrying the agent's NIP-OA auth tag when it has one.
+///
+/// Same filter, same parse, different subject on the NIP-98 header, which is
+/// the whole point on a closed relay, where those two identities have
+/// different standing.
+pub async fn query_agent_profile_with_keys(
+    state: &AppState,
+    relay_url: &str,
+    agent_keys: &Keys,
+    auth_tag: Option<&str>,
+) -> Result<Option<AgentProfileInfo>, String> {
+    let events = query_relay_at_with_keys(
+        state,
+        &relay_http_base_url(relay_url),
+        &[agent_profile_filter(&agent_keys.public_key().to_hex())],
+        agent_keys,
+        auth_tag,
+    )
+    .await?;
+    Ok(parse_agent_profile(&events))
+}
+
+/// The agent's own kind:0, read as the workspace identity and, when that read
+/// cannot be completed, as the AGENT.
+///
+/// Advisory in both directions: a failure is logged and yields `None`,
+/// exactly as each call site did on its own before. What changes is that
+/// there is now a second source, and it is the one that works on the relay
+/// this feature exists for.
+///
+/// Why a second source is needed at all. The workspace read is refused on a
+/// relay closed to the desktop identity (the operator ran
+/// `buzz-admin add-member --pubkey <agent hex>`, so the AGENT is a member and
+/// the desktop is not) and that refusal is not transient: it repeats on
+/// every publish and every reconcile for as long as the user is not a member.
+/// The profile this read precedes carries the handle, and kind:0 is absolute
+/// state, so a publish with no `nip05` CLEARS the handle the relay holds.
+/// `resolve_managed_agent_nip05` keeps whatever handle the agent already
+/// carries when the well-known cannot confirm it, but the only place it
+/// learned that handle was this read. Both reads address the same host, so a
+/// single ingress fault took both, and the sentence "keeps the handle the
+/// agent already carries" was true everywhere except the relay it was
+/// written for. Asking again as the agent gives the fallback a source that
+/// does not depend on the refused read.
+pub async fn read_agent_profile_advisory(
+    state: &AppState,
+    relay_url: &str,
+    agent_keys: Option<&Keys>,
+    agent_pubkey: &str,
+    auth_tag: Option<&str>,
+) -> Option<AgentProfileInfo> {
+    // An EMPTY success is not an answer about this agent, so it does not
+    // short-circuit the fallback. `Ok(None)` means "this relay returned no
+    // kind:0 for these filters", which a fresh agent genuinely produces and
+    // which a relay that answers a non-member's `/query` with `200 []`
+    // instead of a 403 also produces, as some proxies and some relay
+    // configurations do. Treating the second as the first skipped the
+    // agent-authenticated read entirely and stripped the handle exactly as
+    // before the fallback existed. Only a NON-empty answer ends the search;
+    // the cost of the other reading is one extra `/query` on the publish
+    // that first gives an agent a profile.
+    let workspace_error = match query_agent_profile(state, relay_url, agent_pubkey).await {
+        Ok(Some(profile)) => {
+            return Some(remember_profile_handle(
+                state,
+                relay_url,
+                agent_pubkey,
+                profile,
+            ))
+        }
+        Ok(None) => None,
+        Err(error) => Some(error),
+    };
+    let Some(agent_keys) = agent_keys else {
+        if let Some(workspace_error) = workspace_error {
+            eprintln!(
+                "buzz-desktop: could not read {agent_pubkey} kind:0 as the workspace identity and \
+                 have no agent keys to ask again with: {workspace_error}"
+            );
+        }
+        return None;
+    };
+    match query_agent_profile_with_keys(state, relay_url, agent_keys, auth_tag).await {
+        Ok(profile) => {
+            profile.map(|profile| remember_profile_handle(state, relay_url, agent_pubkey, profile))
+        }
+        Err(agent_error) => {
+            let workspace_error = workspace_error.unwrap_or_else(|| "no profile".to_string());
+            eprintln!(
+                "buzz-desktop: could not read {agent_pubkey} kind:0 as the workspace identity \
+                 ({workspace_error}) nor as the agent ({agent_error}), falling back to the last \
+                 handle this process saw for it"
+            );
+            None
+        }
+    }
+}
+
+/// Entries kept in [`AppState::agent_nip05_cache`].
+///
+/// One per (relay, managed agent) pair the desktop has published for, so the
+/// live working set is the agent count. The cap is the bound for a process
+/// that switches communities repeatedly: at the cap new pairs simply are not
+/// remembered, which degrades to the behaviour that existed before the cache,
+/// rather than letting the map grow with every relay ever visited.
+const MAX_REMEMBERED_AGENT_HANDLES: usize = 512;
+
+/// Cache key: the relay the handle belongs to, then the agent that holds it.
+/// A NIP-05 handle is scoped to one relay's domain, so a pair-scoped key is
+/// the only correct one: keyed by agent alone, switching communities would
+/// offer a handle from the previous relay's domain as this relay's hint.
+fn agent_handle_cache_key(relay_url: &str, agent_pubkey: &str) -> String {
+    format!(
+        "{}|{}",
+        relay_http_base_url(relay_url),
+        agent_pubkey.trim().to_ascii_lowercase()
+    )
+}
+
+/// Remember a handle the relay itself asserted for this agent.
+///
+/// Best-effort in every direction: a poisoned mutex or a full map is a lost
+/// hint, never an error, because the caller is on a path whose whole point is
+/// that it does not fail on a missing hint.
+pub(crate) fn remember_agent_nip05(
+    state: &AppState,
+    relay_url: &str,
+    agent_pubkey: &str,
+    handle: &str,
+) {
+    let handle = handle.trim();
+    if handle.is_empty() {
+        return;
+    }
+    let key = agent_handle_cache_key(relay_url, agent_pubkey);
+    let Ok(mut cache) = state.agent_nip05_cache.lock() else {
+        return;
+    };
+    if !cache.contains_key(&key) && cache.len() >= MAX_REMEMBERED_AGENT_HANDLES {
+        return;
+    }
+    cache.insert(key, handle.to_string());
+}
+
+/// The last handle this process saw the relay attribute to this agent, if any.
+///
+/// The last-resort `existing_handle`, used only when neither read could be
+/// completed. It closes the case the agent-authenticated read cannot: a read
+/// that is refused has a second identity to try, a read that runs past
+/// [`QUERY_REQUEST_TIMEOUT`] has none, and a slow relay under load produces
+/// exactly that while `/events` still accepts the publish that then clears
+/// the handle.
+///
+/// RESIDUAL, stated plainly rather than implied away: this lives in the
+/// process, so the first publish after a cold start has nothing to fall back
+/// on. Every later publish in that process does, including every reconcile.
+/// Persisting it on the managed-agent record would close that last window
+/// too, at the cost of a new persisted field and a write-back on each of the
+/// six call sites of [`sync_managed_agent_profile`]; it is not done here.
+pub(crate) fn last_known_agent_nip05(
+    state: &AppState,
+    relay_url: &str,
+    agent_pubkey: &str,
+) -> Option<String> {
+    let key = agent_handle_cache_key(relay_url, agent_pubkey);
+    state.agent_nip05_cache.lock().ok()?.get(&key).cloned()
+}
+
+/// Record the handle a successful read carried, and hand the profile back.
+fn remember_profile_handle(
+    state: &AppState,
+    relay_url: &str,
+    agent_pubkey: &str,
+    profile: AgentProfileInfo,
+) -> AgentProfileInfo {
+    if let Some(handle) = profile.nip05.as_deref() {
+        remember_agent_nip05(state, relay_url, agent_pubkey, handle);
+    }
+    profile
+}
+
+/// The one filter both reads use.
+fn agent_profile_filter(agent_pubkey: &str) -> serde_json::Value {
+    serde_json::json!({
         "authors": [agent_pubkey],
         "kinds": [0],
         "limit": 1
-    });
+    })
+}
 
-    let events = query_relay_at(state, &relay_http_base_url(relay_url), &[filter]).await?;
-
-    let Some(event) = events.first() else {
-        return Ok(None);
-    };
-
-    let Ok(content) = serde_json::from_str::<serde_json::Value>(&event.content) else {
-        return Ok(None);
-    };
-
-    Ok(Some(AgentProfileInfo {
+/// The one parse both reads use.
+fn parse_agent_profile(events: &[nostr::Event]) -> Option<AgentProfileInfo> {
+    let event = events.first()?;
+    let content = serde_json::from_str::<serde_json::Value>(&event.content).ok()?;
+    Some(AgentProfileInfo {
         display_name: content
             .get("display_name")
             .and_then(|v| v.as_str())
@@ -605,7 +1025,13 @@ pub async fn query_agent_profile(
             .get("about")
             .and_then(|v| v.as_str())
             .map(str::to_string),
-    }))
+        nip05: content
+            .get("nip05")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .map(str::to_string),
+    })
 }
 
 /// Parsed fields from a kind:0 profile event.
@@ -615,6 +1041,85 @@ pub struct AgentProfileInfo {
     pub picture: Option<String>,
     /// Published public description (kind:0 `about`).
     pub about: Option<String>,
+    /// Published NIP-05 handle (`local@relay-host`), verbatim.
+    pub nip05: Option<String>,
+}
+
+// ── NIP-11 membership advertisement ─────────────────────────────────────────
+
+/// Whether the relay at `http_base_url` advertises NIP-43 (relay membership)
+/// in its NIP-11 document. A closed relay advertises it; an open relay does
+/// not, and no membership work is needed there.
+///
+/// The answer must actually BE a NIP-11 document: `supported_nips` has to be
+/// present and an array, or this is an error rather than "the relay is open".
+/// A `#[serde(default)]` here made any 200 JSON object (an ingress error
+/// page like `{"error":"backend starting"}`, a relay mid-restart, a proxy's
+/// own JSON) deserialize to an empty NIP list and read as `OpenRelay`, the one
+/// outcome that CLEARS the agent's membership sidecar row, registers nothing
+/// and leaves no card at all. That is the same end state the redirect guard
+/// below exists to prevent, reachable with no redirect involved. An error
+/// keeps the row `Unknown` and the next start retries.
+///
+/// Sent on the no-redirect [`AppState::relay_meta_client`], and any 3xx is an
+/// error rather than an answer. "This relay is open" is a claim only the
+/// relay may make about itself: a redirect target whose `supported_nips`
+/// omits 43 would make a closed relay read as `OpenRelay`, which clears the
+/// agent's membership sidecar row, registers nothing, and leaves it unable to
+/// publish with no card state at all. An error keeps the row as `Unknown` and
+/// the next start retries.
+pub async fn relay_advertises_membership_at(
+    state: &AppState,
+    http_base_url: &str,
+) -> Result<bool, String> {
+    let url = format!("{}/info", http_base_url.trim_end_matches('/'));
+    let response = state
+        .relay_meta_client
+        .get(url)
+        .header("Accept", "application/nostr+json")
+        .timeout(std::time::Duration::from_secs(15))
+        .send()
+        .await
+        .map_err(|error| classify_request_error(&error))?;
+
+    if response.status().is_redirection() {
+        return Err(format!(
+            "the relay information document was redirected off the relay ({}), so the relay did not answer it",
+            response.status()
+        ));
+    }
+    if !response.status().is_success() {
+        return Err(relay_error_message(response).await);
+    }
+
+    let document = parse_json_response::<serde_json::Value>(response).await?;
+    // Present, an array, and NON-EMPTY. An empty list is as non-conforming as
+    // a missing field: NIP-11 has no relay that supports nothing, and Buzz's
+    // own always advertises at least NIP-1. `{"supported_nips": []}` from an
+    // ingress or a proxy is genuinely an array, so a presence-and-type check
+    // alone let it through onto `OpenRelay`, the one outcome that CLEARS the
+    // agent's membership sidecar row, registers nothing, and leaves no card
+    // at all. An error keeps the row `Unknown` and the next start retries.
+    let supported_nips = match document
+        .get("supported_nips")
+        .and_then(serde_json::Value::as_array)
+    {
+        Some(nips) if !nips.is_empty() => nips,
+        _ => {
+            return Err(
+                "the relay answered /info with something that is not a NIP-11 document \
+                 (no non-empty supported_nips list), so it did not say whether it is open"
+                    .to_string(),
+            )
+        }
+    };
+    // A stringly-typed `"43"` counts too. NIP-11 says numbers and Buzz's own
+    // relay emits numbers, so this only fires for a non-conforming document,
+    // and "membership is advertised" is the safe reading of an ambiguous one:
+    // it keeps the row instead of clearing it.
+    Ok(supported_nips
+        .iter()
+        .any(|nip| nip.as_u64() == Some(43) || nip.as_str() == Some("43")))
 }
 
 // ── Signed-event submission ─────────────────────────────────────────────────
@@ -622,10 +1127,13 @@ pub struct AgentProfileInfo {
 mod get;
 pub use get::get_relay_json;
 
+pub mod nip05;
+
 mod submit;
 pub use submit::{
     submit_event, submit_event_at_created_at, submit_event_at_with_keys,
-    submit_event_with_keys_created_at, submit_signed_event_at_with_keys, SubmitEventResponse,
+    submit_event_with_keys_created_at, submit_signed_event_at_with_keys,
+    submit_signed_event_verdict_at_with_keys, SubmitEventResponse, SubmitVerdict,
 };
 
 /// Sign an event with explicit keys and POST it to `/events` with NIP-98 auth.

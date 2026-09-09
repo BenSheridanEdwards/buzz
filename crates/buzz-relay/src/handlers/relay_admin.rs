@@ -896,4 +896,190 @@ mod postgres_tests {
             Some("https://example.com/closed.png")
         );
     }
+
+    // ─── kind:9030 role matrix: the door the desktop registers agents through ──
+    //
+    // The desktop registers every freshly minted managed-agent key with a
+    // signed kind:9030 from the workspace identity, which on a self-hosted
+    // relay is usually an *admin* (the owner key stays off the desktop). These
+    // tests pin, against a real `AppState` + Postgres, that an admin can admit
+    // a plain member, that neither an admin nor anyone else can escalate
+    // through the same door, and that a member or roleless key is refused
+    // without touching the roster.
+
+    /// Sign a fresh kind:9030 for `target` with an optional `role` tag and run
+    /// it through the real admission + command path.
+    async fn submit_9030(
+        state: &Arc<AppState>,
+        tenant: &TenantContext,
+        keys: &Keys,
+        target_hex: &str,
+        role: Option<&str>,
+    ) -> Result<(), RelayAdminError> {
+        let mut tags = vec![Tag::parse(["p", target_hex]).expect("p tag")];
+        if let Some(role) = role {
+            tags.push(Tag::parse(["role", role]).expect("role tag"));
+        }
+        let event = EventBuilder::new(Kind::Custom(9030), "")
+            .tags(tags)
+            .sign_with_keys(keys)
+            .expect("sign 9030");
+        handle_relay_admin_event(tenant, state, &event).await
+    }
+
+    async fn roster_role(
+        state: &Arc<AppState>,
+        tenant: &TenantContext,
+        hex: &str,
+    ) -> Option<String> {
+        state
+            .db
+            .get_relay_member(tenant.community(), hex)
+            .await
+            .expect("read relay member")
+            .map(|member| member.role)
+    }
+
+    fn rejected(message: &str) -> Result<(), RelayAdminError> {
+        Err(RelayAdminError::Rejected(message.to_string()))
+    }
+
+    /// Closed relay: only admin/owner may add, and only as `member` unless
+    /// the sender is the owner. Every refused attempt leaves no roster row.
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn closed_relay_9030_admits_members_from_admins_and_refuses_escalation() {
+        let host = format!("add-member-{}.example", uuid::Uuid::new_v4().simple());
+        let (state, tenant) = workspace_profile_test_state(&host, true).await;
+        let owner = Keys::generate();
+        let admin = Keys::generate();
+        let member = Keys::generate();
+        let roleless = Keys::generate();
+        for (keys, role) in [(&owner, "owner"), (&admin, "admin"), (&member, "member")] {
+            state
+                .db
+                .add_relay_member(tenant.community(), &keys.public_key().to_hex(), role, None)
+                .await
+                .unwrap_or_else(|e| panic!("seed {role}: {e}"));
+        }
+        let agent = Keys::generate().public_key().to_hex();
+
+        // A member and a key with no row cannot add anyone (no role tag =
+        // the desktop's exact request shape, defaulting to `member`).
+        for (keys, label) in [(&member, "member"), (&roleless, "roleless")] {
+            assert_eq!(
+                submit_9030(&state, &tenant, keys, &agent, None).await,
+                rejected("actor not authorized: must be admin or owner"),
+                "a {label} sender must be refused"
+            );
+            assert_eq!(
+                roster_role(&state, &tenant, &agent).await,
+                None,
+                "a refused {label} add must not plant a roster row"
+            );
+        }
+
+        // An admin cannot grant admin, and nobody can grant owner through
+        // this door (the relay owner is configuration, never an event).
+        assert_eq!(
+            submit_9030(&state, &tenant, &admin, &agent, Some("admin")).await,
+            rejected("actor not authorized: only owner can grant admin role")
+        );
+        for keys in [&admin, &owner] {
+            assert_eq!(
+                submit_9030(&state, &tenant, keys, &agent, Some("owner")).await,
+                rejected("invalid role: use kind:9032 to promote to owner")
+            );
+        }
+        assert_eq!(
+            submit_9030(&state, &tenant, &admin, &agent, Some("moderator")).await,
+            rejected("invalid role: moderator")
+        );
+        assert_eq!(
+            roster_role(&state, &tenant, &agent).await,
+            None,
+            "no escalation attempt may leave a row behind"
+        );
+
+        // The desktop's request: an admin adds the agent as a plain member.
+        submit_9030(&state, &tenant, &admin, &agent, None)
+            .await
+            .expect("an admin must be able to admit a managed agent");
+        assert_eq!(
+            roster_role(&state, &tenant, &agent).await.as_deref(),
+            Some("member")
+        );
+
+        // Idempotent re-add never changes an existing role: re-adding the
+        // admin as `member` is not a demotion, and a second registration of
+        // the same agent is a no-op. (The sender cannot target itself here:
+        // the nostr event builder drops a `p` tag naming the signer.)
+        submit_9030(&state, &tenant, &owner, &admin.public_key().to_hex(), None)
+            .await
+            .expect("re-add is a no-op, not an error");
+        assert_eq!(
+            roster_role(&state, &tenant, &admin.public_key().to_hex())
+                .await
+                .as_deref(),
+            Some("admin")
+        );
+        submit_9030(&state, &tenant, &admin, &agent, None)
+            .await
+            .expect("second registration is a no-op");
+        assert_eq!(
+            roster_role(&state, &tenant, &agent).await.as_deref(),
+            Some("member")
+        );
+
+        // Only the owner may grant admin.
+        let promoted = Keys::generate().public_key().to_hex();
+        submit_9030(&state, &tenant, &owner, &promoted, Some("admin"))
+            .await
+            .expect("the owner may add an admin");
+        assert_eq!(
+            roster_role(&state, &tenant, &promoted).await.as_deref(),
+            Some("admin")
+        );
+    }
+
+    /// Open relay: the 9030 rule is identical. Flipping
+    /// `require_relay_membership` must not widen who may write the roster,
+    /// because the roster still decides moderation capability there.
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn open_relay_9030_keeps_the_same_role_gate() {
+        let host = format!("add-member-open-{}.example", uuid::Uuid::new_v4().simple());
+        let (state, tenant) = workspace_profile_test_state(&host, false).await;
+        let admin = Keys::generate();
+        let roleless = Keys::generate();
+        state
+            .db
+            .add_relay_member(
+                tenant.community(),
+                &admin.public_key().to_hex(),
+                "admin",
+                None,
+            )
+            .await
+            .expect("seed admin");
+        let agent = Keys::generate().public_key().to_hex();
+
+        assert_eq!(
+            submit_9030(&state, &tenant, &roleless, &agent, None).await,
+            rejected("actor not authorized: must be admin or owner")
+        );
+        assert_eq!(roster_role(&state, &tenant, &agent).await, None);
+
+        submit_9030(&state, &tenant, &admin, &agent, None)
+            .await
+            .expect("an admin admits a member on an open relay too");
+        assert_eq!(
+            roster_role(&state, &tenant, &agent).await.as_deref(),
+            Some("member")
+        );
+        assert_eq!(
+            submit_9030(&state, &tenant, &admin, &agent, Some("admin")).await,
+            rejected("actor not authorized: only owner can grant admin role")
+        );
+    }
 }

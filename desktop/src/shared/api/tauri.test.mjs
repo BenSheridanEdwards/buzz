@@ -257,6 +257,53 @@ test("fromRawAcpRuntimeCatalogEntry omits maxParallelism when max_parallelism is
   );
 });
 
+// ── default_parallelism → defaultParallelism mapping ─────────────────────────
+
+test("fromRawAcpRuntimeCatalogEntry maps default_parallelism to defaultParallelism", () => {
+  const raw = {
+    id: "hermes",
+    label: "Hermes",
+    availability: "not_installed",
+    command: null,
+    source: "preset",
+    default_args: [],
+    can_auto_install: false,
+    requires_external_cli: false,
+    install_hint: "",
+    install_instructions_url: "",
+    mcp_command: null,
+    default_parallelism: 1,
+  };
+  const entry = fromRawAcpRuntimeCatalogEntry(raw);
+  assert.equal(
+    entry.defaultParallelism,
+    1,
+    "default_parallelism: 1 must map to defaultParallelism: 1 (Hermes mints at 1)",
+  );
+});
+
+test("fromRawAcpRuntimeCatalogEntry falls back to the app default when default_parallelism is absent", () => {
+  const raw = {
+    id: "goose",
+    label: "Goose",
+    availability: "available",
+    command: "goose",
+    source: "builtin",
+    default_args: [],
+    can_auto_install: false,
+    requires_external_cli: false,
+    install_hint: "",
+    install_instructions_url: "",
+    mcp_command: null,
+  };
+  const entry = fromRawAcpRuntimeCatalogEntry(raw);
+  assert.equal(
+    entry.defaultParallelism,
+    10,
+    "an entry without the key must read as the app default, never undefined",
+  );
+});
+
 // ── Teardown ──────────────────────────────────────────────────────────────────
 
 test("teardown — restore Date.now", () => {

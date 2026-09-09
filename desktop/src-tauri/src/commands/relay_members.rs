@@ -1,20 +1,12 @@
-use serde::Deserialize;
 use tauri::State;
 
 use crate::{
     app_state::AppState,
     events, nostr_convert,
     relay::{
-        classify_request_error, parse_json_response, query_relay, relay_api_base_url_with_override,
-        relay_error_message, submit_event,
+        query_relay, relay_advertises_membership_at, relay_api_base_url_with_override, submit_event,
     },
 };
-
-#[derive(Deserialize)]
-struct RelayInformationDocument {
-    #[serde(default)]
-    supported_nips: Vec<u32>,
-}
 
 #[tauri::command]
 pub async fn relay_requires_membership(
@@ -25,21 +17,7 @@ pub async fn relay_requires_membership(
         .as_deref()
         .map(crate::relay::relay_http_base_url)
         .unwrap_or_else(|| relay_api_base_url_with_override(&state));
-    let url = format!("{}/info", base_url.trim_end_matches('/'));
-    let response = state
-        .http_client
-        .get(url)
-        .header("Accept", "application/nostr+json")
-        .send()
-        .await
-        .map_err(|error| classify_request_error(&error))?;
-
-    if !response.status().is_success() {
-        return Err(relay_error_message(response).await);
-    }
-
-    let info = parse_json_response::<RelayInformationDocument>(response).await?;
-    Ok(info.supported_nips.contains(&43))
+    relay_advertises_membership_at(&state, &base_url).await
 }
 
 #[tauri::command]

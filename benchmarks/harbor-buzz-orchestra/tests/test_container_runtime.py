@@ -798,10 +798,8 @@ async def test_failed_evidence_snapshot_records_the_reason(tmp_path, monkeypatch
 
 def test_runtime_logging_keeps_readiness_and_turn_completion_signals(tmp_path):
     rt = runtime(tmp_path)
-    assert rt._rust_log(None) == "buzz_acp=info,pool::prompt=info"
-    assert rt._rust_log("custom=debug") == (
-        "custom=debug,buzz_acp=info,pool::prompt=info"
-    )
+    assert rt._rust_log(None) == "buzz_acp=info"
+    assert rt._rust_log("custom=debug") == "custom=debug,buzz_acp=info"
 
 
 def test_composed_system_prompt_carries_persona_and_team_roster(tmp_path):

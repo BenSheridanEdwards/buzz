@@ -1,8 +1,13 @@
 import { invoke as tauriInvoke } from "@tauri-apps/api/core";
+import { DEFAULT_AGENT_PARALLELISM } from "@/features/agents/lib/agentParallelism";
 import {
   activateRateLimit,
   parseRateLimitHint,
 } from "@/shared/api/relayRateLimitGate";
+import {
+  fromRawRelayMembership,
+  type RawRelayMembership,
+} from "@/shared/api/relayMembershipTypes";
 import {
   fromRawInstallRuntimeResult,
   type RawInstallRuntimeResult,
@@ -155,6 +160,8 @@ export type RawManagedAgent = {
   // Pre-feature fixtures may omit these; mapped to "owner-only"/[] in fromRawManagedAgent.
   respond_to?: ManagedAgent["respondTo"];
   respond_to_allowlist?: string[];
+  // Omitted by Rust on open relays and before the first check.
+  relay_membership?: RawRelayMembership | null;
 };
 
 type RawCreateManagedAgentResponse = {
@@ -196,6 +203,12 @@ export type RawAcpRuntimeCatalogEntry = {
   /** Definition-level env vars for `source: custom` entries; absent for builtin/preset. */
   definition_env?: Record<string, string>;
   max_parallelism?: number;
+  /**
+   * Parallelism a new record stores when the form leaves it blank. Always
+   * emitted by the current backend; optional here so an entry from any other
+   * source falls back to the app default instead of rendering `undefined`.
+   */
+  default_parallelism?: number;
   effort_canonical_values?: string[] | null;
 };
 
@@ -668,6 +681,7 @@ export function fromRawManagedAgent(agent: RawManagedAgent): ManagedAgent {
     backendAgentId: agent.backend_agent_id,
     respondTo: agent.respond_to ?? "owner-only",
     respondToAllowlist: agent.respond_to_allowlist ?? [],
+    relayMembership: fromRawRelayMembership(agent.relay_membership),
   };
 }
 
@@ -703,6 +717,9 @@ export function fromRawAcpRuntimeCatalogEntry(
     ...(entry.max_parallelism !== undefined && {
       maxParallelism: entry.max_parallelism,
     }),
+    // Guarded like `max_parallelism` above: an entry without the key must fall
+    // back to the app default, not render "Hermes default (undefined)".
+    defaultParallelism: entry.default_parallelism ?? DEFAULT_AGENT_PARALLELISM,
   };
 }
 

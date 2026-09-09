@@ -304,7 +304,10 @@ async fn stalled_query_request_times_out_with_classified_error() {
          if this guard fires, the production .timeout(...) was lost",
     );
 
-    let err = result.expect_err("a stalled /query must surface an error, not succeed");
+    let err = result
+        .expect_err("a stalled /query must surface an error, not succeed")
+        .error;
+
     assert_eq!(
         err, "relay unreachable: request timed out",
         "a timed-out /query must surface the stable classified string"
@@ -364,7 +367,10 @@ async fn stalled_response_body_times_out_with_classified_error() {
          consumption and resolve within 5s",
     );
 
-    let err = result.expect_err("a stalled response body must surface an error, not succeed");
+    let err = result
+        .expect_err("a stalled response body must surface an error, not succeed")
+        .error;
+
     assert_eq!(
         err, "relay unreachable: request timed out",
         "a body-stall timeout must surface the classified timeout string, not the \
@@ -425,7 +431,10 @@ async fn stalled_error_response_body_times_out_with_classified_error() {
          consumption and resolve within 5s",
     );
 
-    let err = result.expect_err("a stalled error-response body must surface an error, not succeed");
+    let err = result
+        .expect_err("a stalled error-response body must surface an error, not succeed")
+        .error;
+
     assert_eq!(
         err, "relay unreachable: request timed out",
         "a non-2xx body-stall timeout must surface the classified timeout string, not the \
@@ -479,7 +488,10 @@ async fn non_stalled_error_response_yields_status_message() {
     .await
     .expect("a promptly-served 500 must resolve well within 5s");
 
-    let err = result.expect_err("a 500 must surface an error, not succeed");
+    let err = result
+        .expect_err("a 500 must surface an error, not succeed")
+        .error;
+
     assert_eq!(
         err, "relay returned 500 Internal Server Error",
         "a non-stalled 500 must keep its status classification, not be reclassified as a timeout"
@@ -569,7 +581,7 @@ fn make_valid_auth_tag(agent_keys: &nostr::Keys) -> String {
 fn profile_event_with_valid_auth_tag() {
     let agent_keys = nostr::Keys::generate();
     let tag_json = make_valid_auth_tag(&agent_keys);
-    let event = build_profile_event(&agent_keys, "TestBot", None, None, Some(&tag_json))
+    let event = build_profile_event(&agent_keys, "TestBot", None, None, None, Some(&tag_json))
         .expect("should succeed with a valid auth tag");
 
     // Exactly one "auth" tag must be present.
@@ -587,7 +599,7 @@ fn profile_event_with_valid_auth_tag() {
 #[test]
 fn profile_event_without_auth_tag() {
     let agent_keys = nostr::Keys::generate();
-    let event = build_profile_event(&agent_keys, "TestBot", None, None, None)
+    let event = build_profile_event(&agent_keys, "TestBot", None, None, None, None)
         .expect("should succeed without an auth tag");
 
     // No "auth" tags should be present.
@@ -610,6 +622,7 @@ fn profile_event_includes_about_when_description_present() {
         None,
         Some("A meticulous code reviewer."),
         None,
+        None,
     )
     .expect("should succeed with an about");
     let content: serde_json::Value =
@@ -623,7 +636,7 @@ fn profile_event_includes_about_when_description_present() {
 #[test]
 fn profile_event_omits_about_when_absent() {
     let agent_keys = nostr::Keys::generate();
-    let event = build_profile_event(&agent_keys, "TestBot", None, None, None)
+    let event = build_profile_event(&agent_keys, "TestBot", None, None, None, None)
         .expect("should succeed without an about");
     let content: serde_json::Value =
         serde_json::from_str(&event.content).expect("kind:0 content is JSON");
@@ -631,14 +644,170 @@ fn profile_event_omits_about_when_absent() {
 }
 
 #[test]
+fn profile_event_carries_nip05_handle_verbatim() {
+    let agent_keys = nostr::Keys::generate();
+    let event = build_profile_event(
+        &agent_keys,
+        "TestBot",
+        None,
+        None,
+        Some("testbot@relay.example"),
+        None,
+    )
+    .expect("should succeed with a nip05");
+    let content: serde_json::Value =
+        serde_json::from_str(&event.content).expect("kind:0 content is JSON");
+    assert_eq!(
+        content.get("nip05").and_then(|v| v.as_str()),
+        Some("testbot@relay.example")
+    );
+}
+
+#[test]
 fn profile_event_rejects_invalid_auth_tag() {
     let agent_keys = nostr::Keys::generate();
     // Structurally valid JSON array but with a bogus signature — verification must fail.
     let bad_json = format!(r#"["auth","{}","","{}"]"#, "a".repeat(64), "b".repeat(128));
-    let result = build_profile_event(&agent_keys, "TestBot", None, None, Some(&bad_json));
+    let result = build_profile_event(&agent_keys, "TestBot", None, None, None, Some(&bad_json));
     assert!(result.is_err(), "should reject an invalid auth tag");
     assert!(
         result.unwrap_err().contains("verification failed"),
         "error message should mention verification failure"
     );
 }
+
+// ── relay_error_details: the relay's own refusal, parsed once ─────────────
+//
+// Callers that must classify a refusal (the managed-agent membership
+// preflight) read the body's fields, never a rendered string split on ": ".
+// A change to how `relay_error_message` renders must not silently change
+// what those callers branch on.
+
+/// Answer one request with `status`, `body`, and a JSON content type.
+async fn serve_once(status: &'static str, body: String) -> String {
+    use std::io::{Read as _, Write as _};
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    std::thread::spawn(move || {
+        if let Ok((mut stream, _)) = listener.accept() {
+            let mut buf = [0u8; 4096];
+            let _ = stream.read(&mut buf);
+            let len = body.len();
+            let response = format!(
+                "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {len}\r\nConnection: close\r\n\r\n{body}"
+            );
+            let _ = stream.write_all(response.as_bytes());
+            let _ = stream.flush();
+        }
+    });
+    format!("http://{addr}/")
+}
+
+#[tokio::test]
+async fn a_4xx_json_body_keeps_the_relays_own_error_and_message() {
+    // The bridge's membership refusal: a machine reason AND a human sentence.
+    let url = serve_once(
+        "403 Forbidden",
+        r#"{"error":"relay_membership_required","message":"You must be a relay member to access this relay"}"#
+            .to_string(),
+    )
+    .await;
+    let response = reqwest::Client::new().get(&url).send().await.unwrap();
+    let details = super::relay_error_details(response).await;
+
+    let refusal = details.refusal.expect("a 4xx JSON body is a refusal");
+    // Compared against the only constructor: `RelayRefusal`'s fields are
+    // private precisely so no door can fill them without the bound.
+    assert_eq!(
+        refusal,
+        super::RelayRefusal::new(
+            Some("relay_membership_required".to_string()),
+            Some("You must be a relay member to access this relay".to_string()),
+        )
+    );
+    assert_eq!(
+        refusal.message(),
+        "You must be a relay member to access this relay",
+        "the human sentence is what a card shows"
+    );
+    assert!(
+        refusal.haystack().contains("relay_membership_required"),
+        "the machine reason must stay reachable for classification"
+    );
+    // The rendered string is unchanged for every existing caller.
+    assert_eq!(
+        details.error,
+        "relay returned 403 Forbidden: You must be a relay member to access this relay"
+    );
+}
+
+#[tokio::test]
+async fn an_error_only_body_reports_that_error_as_both() {
+    // How `api_error` renders every ingest rejection: `error`, no `message`.
+    let url = serve_once(
+        "400 Bad Request",
+        r#"{"error":"invalid: actor not authorized: must be admin or owner"}"#.to_string(),
+    )
+    .await;
+    let response = reqwest::Client::new().get(&url).send().await.unwrap();
+    let details = super::relay_error_details(response).await;
+
+    let refusal = details.refusal.expect("a 4xx JSON body is a refusal");
+    assert_eq!(
+        refusal.message(),
+        "invalid: actor not authorized: must be admin or owner",
+        "with no human sentence the machine reason is the message"
+    );
+    assert_eq!(
+        refusal,
+        super::RelayRefusal::new(
+            Some("invalid: actor not authorized: must be admin or owner".to_string()),
+            None,
+        ),
+        "an error-only body leaves the human-sentence half empty"
+    );
+}
+
+#[tokio::test]
+async fn an_outage_is_never_a_refusal() {
+    use crate::relay_admission::{reset_rate_limit_gate, TEST_SERIAL};
+
+    // A 5xx says nothing about the request.
+    let url = serve_once(
+        "500 Internal Server Error",
+        r#"{"error":"internal server error"}"#.to_string(),
+    )
+    .await;
+    let response = reqwest::Client::new().get(&url).send().await.unwrap();
+    let details = super::relay_error_details(response).await;
+    assert!(
+        details.refusal.is_none(),
+        "a 5xx must never be read as the relay's answer: {details:?}"
+    );
+
+    // Neither does a quota window, even though 429 is a 4xx.
+    let _serial = TEST_SERIAL.lock().await;
+    reset_rate_limit_gate();
+    let url = serve_once(
+        "429 Too Many Requests",
+        r#"{"error":"rate-limited: quota exceeded; retry in 4s"}"#.to_string(),
+    )
+    .await;
+    let response = reqwest::Client::new().get(&url).send().await.unwrap();
+    let details = super::relay_error_details(response).await;
+    assert!(
+        details.refusal.is_none(),
+        "a 429 must never be read as the relay's answer: {details:?}"
+    );
+    reset_rate_limit_gate();
+}
+
+// ── Managed-agent profile sync: the pre-publish read is advisory ──────────
+//
+// Gated off Windows like the other stub-relay tests: `build_app_state()`
+// pulls native DLLs unavailable in the Windows CI runner.
+
+#[cfg(not(target_os = "windows"))]
+#[path = "profile_sync_tests.rs"]
+mod profile_sync_stub_relay;

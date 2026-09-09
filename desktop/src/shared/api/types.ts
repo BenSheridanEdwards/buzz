@@ -374,6 +374,32 @@ export type ManagedAgent = {
    * `"allowlist"`. Preserved across mode toggles.
    */
   respondToAllowlist: string[];
+  /**
+   * Last relay-membership check for this agent on the active workspace relay.
+   * `null` when the relay is open (no membership needed) or no check ran yet.
+   */
+  relayMembership: ManagedAgentRelayMembership | null;
+};
+
+/**
+ * Outcome of the desktop's attempt to register a managed agent as a member of
+ * a closed relay (`BUZZ_REQUIRE_RELAY_MEMBERSHIP`). `not_member` means the
+ * relay enforces membership, the agent is not listed, and the current identity
+ * could not add it; the card then shows the npub and the operator command.
+ */
+export type ManagedAgentRelayMembership = {
+  state: "member" | "not_member" | "unknown";
+  /** ISO timestamp of the check. */
+  checkedAt: string;
+  /** Human-readable detail for `not_member` / `unknown`. */
+  detail: string | null;
+  /**
+   * Whose pubkey (hex) the detail is about, when that is not the agent.
+   * Set only when the relay refused the workspace identity at the roster
+   * read, so the card shows the user's npub and the operator command for it
+   * instead of blaming an agent the relay was never asked about.
+   */
+  subjectPubkey: string | null;
 };
 
 /** Inbound author gate mode. Mirrors buzz-acp's --respond-to CLI flag. */
@@ -538,6 +564,12 @@ export type AcpRuntimeCatalogEntry = {
   definitionEnv?: Record<string, string>;
   /** Spawn-time parallelism cap; absent for uncapped harnesses. */
   maxParallelism?: number;
+  /**
+   * Parallelism a new record stores when the form leaves it blank. The
+   * app-wide default unless the harness overrides it (Hermes: 1). Shown as
+   * the blank-field placeholder so the stored value is never a surprise.
+   */
+  defaultParallelism: number;
 };
 
 /** An AcpRuntimeCatalogEntry that is confirmed available — command and binaryPath are non-null. */

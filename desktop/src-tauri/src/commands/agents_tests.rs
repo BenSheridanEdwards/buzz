@@ -227,6 +227,94 @@ fn production_delete_orchestration_restores_bestie_when_agent_save_fails() {
     .unwrap_or_else(|error| panic!("read restored assignment: {error}")));
 }
 
+/// The four cases of `create_managed_agent`'s summary rebuild, which decides
+/// whether the create's own reply carries the `relay_membership` the Phase 3a
+/// preflight just wrote.
+///
+/// The rebuild used to key off the backend rather than off whether Phase 3a
+/// ran, so a provider-backed create whose deploy failed ran the preflight and
+/// then answered with the pre-preflight summary: `relay_membership: None`,
+/// and no "Not a relay member" card until the mutation's `onSettled` refetch
+/// landed. That is the second row below, and it is the row the old predicate
+/// got wrong. The last row is where the two predicates also differ but the
+/// answer does not: the spawn-error branch rebuilt from disk already, and the
+/// only writes between it and here are to the retention DB and the relay,
+/// never to the agent record.
+#[test]
+fn the_summary_is_rebuilt_exactly_when_something_could_have_changed_it() {
+    // (spawns_after_create, spawn_error.is_none(), rebuild)
+    let cases = [
+        // Phase 3a ran (no spawn), deploy succeeded: preflight + backend id.
+        (false, true, true),
+        // Phase 3a ran, deploy failed: the preflight's write is still there.
+        (false, false, true),
+        // Phase 3b spawned and succeeded: the spawn refreshed the record.
+        (true, true, true),
+        // Phase 3b spawned and failed: the error path already rebuilt and
+        // returned that summary, and nothing since could have changed it.
+        (true, false, false),
+    ];
+    for (spawns_after_create, spawn_error_is_none, expected) in cases {
+        assert_eq!(
+            summary_needs_rebuild(spawns_after_create, spawn_error_is_none),
+            expected,
+            "spawns_after_create={spawns_after_create} spawn_error_is_none={spawn_error_is_none}"
+        );
+    }
+}
+
+/// Deleting an agent clears its relay-membership sidecar row, and only its
+/// own: the row is derived state keyed by a pubkey, so leaving it behind
+/// hands the next reader of `relay-membership.json` a membership record for
+/// an agent that no longer exists, and grows the file without bound.
+/// `run_managed_agent_deletion` owns this so no removal path can forget it.
+#[test]
+fn production_delete_orchestration_clears_the_relay_membership_sidecar() {
+    use crate::managed_agents::{
+        load_relay_memberships, record_relay_membership, relay_membership_for,
+        ManagedAgentRelayMembership, RelayMembershipState,
+    };
+
+    let dir = tempfile::tempdir().unwrap_or_else(|error| panic!("temp dir: {error}"));
+    let doomed = "a".repeat(64);
+    let survivor = "b".repeat(64);
+    const RELAY: &str = "ws://localhost:3000";
+    for pubkey in [&doomed, &survivor] {
+        record_relay_membership(
+            dir.path(),
+            pubkey,
+            RELAY,
+            Some(ManagedAgentRelayMembership {
+                state: RelayMembershipState::NotMember,
+                checked_at: "t".to_string(),
+                detail: None,
+                subject_pubkey: None,
+            }),
+        )
+        .unwrap_or_else(|error| panic!("seed membership: {error}"));
+    }
+
+    let mut record = bare_agent_record(None, None, None);
+    record.pubkey.clone_from(&doomed);
+    let mut records = vec![record];
+    run_managed_agent_deletion(dir.path(), &doomed, &mut records, |records| {
+        records.retain(|record| record.pubkey != doomed);
+        Ok::<(), String>(())
+    })
+    .unwrap_or_else(|error| panic!("deletion: {error}"));
+
+    let store = load_relay_memberships(dir.path());
+    assert_eq!(
+        relay_membership_for(&store, &doomed, RELAY),
+        None,
+        "the deleted agent's derived membership row must go with its record"
+    );
+    assert!(
+        relay_membership_for(&store, &survivor, RELAY).is_some(),
+        "another agent's row must survive"
+    );
+}
+
 /// Deploy resolver falls back to global when both definition and record have none.
 #[test]
 fn deploy_resolver_falls_back_to_global_when_definition_and_record_have_none() {
@@ -367,7 +455,66 @@ fn profile_with_about(
         display_name: name.map(str::to_string),
         picture: picture.map(str::to_string),
         about: about.map(str::to_string),
+        nip05: None,
     }
+}
+
+fn profile_with_nip05(name: Option<&str>, nip05: Option<&str>) -> crate::relay::AgentProfileInfo {
+    crate::relay::AgentProfileInfo {
+        display_name: name.map(str::to_string),
+        picture: None,
+        about: None,
+        nip05: nip05.map(str::to_string),
+    }
+}
+
+#[test]
+fn profile_needs_sync_when_nip05_diverges() {
+    let existing = profile_with_nip05(Some("Duncan"), Some("duncan-a1f3@relay.example"));
+    assert!(profile_needs_sync(
+        Some(&existing),
+        "Duncan",
+        None,
+        None,
+        Some("duncan@relay.example")
+    ));
+}
+
+#[test]
+fn profile_needs_sync_when_expected_nip05_absent_but_published() {
+    let existing = profile_with_nip05(Some("Duncan"), Some("duncan@relay.example"));
+    assert!(profile_needs_sync(
+        Some(&existing),
+        "Duncan",
+        None,
+        None,
+        None
+    ));
+}
+
+#[test]
+fn profile_needs_sync_when_nip05_missing_but_expected() {
+    // An agent published before handles existed: the reconcile must add one.
+    let existing = profile_with_nip05(Some("Duncan"), None);
+    assert!(profile_needs_sync(
+        Some(&existing),
+        "Duncan",
+        None,
+        None,
+        Some("duncan@relay.example")
+    ));
+}
+
+#[test]
+fn profile_in_sync_when_nip05_matches() {
+    let existing = profile_with_nip05(Some("Duncan"), Some("duncan@relay.example"));
+    assert!(!profile_needs_sync(
+        Some(&existing),
+        "Duncan",
+        None,
+        None,
+        Some("duncan@relay.example")
+    ));
 }
 
 #[test]
@@ -376,6 +523,7 @@ fn profile_needs_sync_when_missing() {
         None,
         "Duncan",
         Some("https://x/a.png"),
+        None,
         None
     ));
 }
@@ -407,7 +555,7 @@ fn unpinned_reconcile_relay_resolves_the_execution_time_workspace() {
 
 #[test]
 fn profile_needs_sync_when_missing_even_without_expected_avatar() {
-    assert!(profile_needs_sync(None, "Duncan", None, None));
+    assert!(profile_needs_sync(None, "Duncan", None, None, None));
 }
 
 #[test]
@@ -417,6 +565,7 @@ fn profile_needs_sync_when_name_diverges() {
         Some(&existing),
         "Duncan",
         Some("https://x/a.png"),
+        None,
         None
     ));
 }
@@ -428,6 +577,7 @@ fn profile_needs_sync_when_picture_diverges() {
         Some(&existing),
         "Duncan",
         Some("https://x/new.png"),
+        None,
         None
     ));
 }
@@ -439,6 +589,7 @@ fn profile_in_sync_when_name_and_picture_match() {
         Some(&existing),
         "Duncan",
         Some("https://x/a.png"),
+        None,
         None
     ));
 }
@@ -446,7 +597,13 @@ fn profile_in_sync_when_name_and_picture_match() {
 #[test]
 fn profile_in_sync_when_both_avatars_absent() {
     let existing = profile(Some("Duncan"), None);
-    assert!(!profile_needs_sync(Some(&existing), "Duncan", None, None));
+    assert!(!profile_needs_sync(
+        Some(&existing),
+        "Duncan",
+        None,
+        None,
+        None
+    ));
 }
 
 #[test]
@@ -457,13 +614,20 @@ fn profile_needs_sync_when_existing_name_is_none() {
         "Duncan",
         Some("https://x/a.png"),
         None,
+        None,
     ));
 }
 
 #[test]
 fn profile_needs_sync_when_expected_avatar_absent_but_published() {
     let existing = profile(Some("Duncan"), Some("https://x/a.png"));
-    assert!(profile_needs_sync(Some(&existing), "Duncan", None, None));
+    assert!(profile_needs_sync(
+        Some(&existing),
+        "Duncan",
+        None,
+        None,
+        None
+    ));
 }
 
 #[test]
@@ -473,14 +637,21 @@ fn profile_needs_sync_when_about_diverges() {
         Some(&existing),
         "Duncan",
         None,
-        Some("New description.")
+        Some("New description."),
+        None
     ));
 }
 
 #[test]
 fn profile_needs_sync_when_expected_about_absent_but_published() {
     let existing = profile_with_about(Some("Duncan"), None, Some("Stale description."));
-    assert!(profile_needs_sync(Some(&existing), "Duncan", None, None));
+    assert!(profile_needs_sync(
+        Some(&existing),
+        "Duncan",
+        None,
+        None,
+        None
+    ));
 }
 
 #[test]
@@ -490,7 +661,8 @@ fn profile_in_sync_when_about_matches() {
         Some(&existing),
         "Duncan",
         None,
-        Some("A helpful desktop agent.")
+        Some("A helpful desktop agent."),
+        None
     ));
 }
 
@@ -499,7 +671,13 @@ fn profile_in_sync_when_about_none_equals_published_empty_string() {
     // None vs "" must be treated as equal — otherwise every reconcile of an
     // about-less agent would republish forever.
     let existing = profile_with_about(Some("Duncan"), None, Some(""));
-    assert!(!profile_needs_sync(Some(&existing), "Duncan", None, None));
+    assert!(!profile_needs_sync(
+        Some(&existing),
+        "Duncan",
+        None,
+        None,
+        None
+    ));
 }
 
 #[test]

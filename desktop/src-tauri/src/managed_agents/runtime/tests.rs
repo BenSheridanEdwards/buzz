@@ -1244,3 +1244,67 @@ fn make_pair_runtime_placeholder() -> crate::managed_agents::ManagedAgentPairRun
     };
     crate::managed_agents::ManagedAgentPairRuntime::starting(process)
 }
+
+// ── Summary mcp_command: the sidecar the agent will really receive ──────────
+//
+// `build_managed_agent_summary` is the second consumer of the "attached only
+// if it resolves" derivation (the restart snapshot is the first). Asserting on
+// `KnownAcpRuntime.mcp_command` — the static catalog field — proves nothing
+// about this call site, so these drive the summary builder itself.
+
+fn summary_record(command: &str) -> crate::managed_agents::ManagedAgentRecord {
+    let mut record = minimal_record(&"ab".repeat(32));
+    // Pin the harness so the descriptor resolver cannot fall back to the
+    // default command and quietly read a different catalog entry.
+    record.agent_command = command.to_string();
+    record.agent_command_override = Some(command.to_string());
+    record
+}
+
+fn summary_mcp_command(
+    command: &str,
+    resolve_sidecar: impl FnOnce(&'static str) -> Option<std::path::PathBuf>,
+) -> String {
+    let app = tauri::test::mock_builder()
+        .manage(crate::app_state::build_app_state())
+        .build(tauri::test::mock_context(tauri::test::noop_assets()))
+        .expect("mock app should build");
+    super::build_managed_agent_summary_with(
+        app.handle(),
+        &summary_record(command),
+        &std::collections::HashMap::new(),
+        &[],
+        &[],
+        &Default::default(),
+        &Default::default(),
+        resolve_sidecar,
+    )
+    .expect("summary should build")
+    .mcp_command
+}
+
+/// The summary reports a configured sidecar only when it resolves. Reverting
+/// this call site to the plain catalog lookup reports "buzz-dev-mcp" under an
+/// absent resolver and fails here.
+#[test]
+fn summary_mcp_command_reports_only_a_resolvable_sidecar() {
+    assert_eq!(
+        summary_mcp_command("codex-acp", |_| None),
+        "",
+        "a codex agent whose sidecar does not resolve must report no sidecar"
+    );
+    assert_eq!(
+        summary_mcp_command("codex-acp", |name| Some(std::path::PathBuf::from(format!(
+            "/usr/local/bin/{name}"
+        )))),
+        "buzz-dev-mcp",
+        "a resolvable sidecar is reported under its catalog name"
+    );
+    assert_eq!(
+        summary_mcp_command("goose", |name| Some(std::path::PathBuf::from(format!(
+            "/usr/local/bin/{name}"
+        )))),
+        "",
+        "a harness with no configured sidecar reports none either way"
+    );
+}

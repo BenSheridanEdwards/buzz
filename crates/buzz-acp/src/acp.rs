@@ -502,8 +502,23 @@ impl AcpClient {
         // Per-runtime environment defaults (e.g. Hermes MCP-startup isolation).
         // Applied first so both persona `extra_env` (below, via `Command::env`
         // key replacement) and inherited parent env (via the parent-presence
-        // check) override them.
-        for &(key, value) in crate::config::default_agent_env(command) {
+        // check) override them. A Hermes record that carries `HERMES_HOME`
+        // (in either layer, including an ambient one this harness process
+        // inherited) is profile-backed and keeps its configured MCP servers;
+        // see `config::default_agent_env`.
+        //
+        // Both layers apply the same emptiness test: `hermes_profile_backed`
+        // trims the `extra_env` value, so the parent one is trimmed here too.
+        // Without that, a parent `HERMES_HOME="   "` would be profile-backed
+        // while the identical value in the record would not, and the two
+        // layers would disagree about the same string.
+        let hermes_profile_backed = crate::config::hermes_profile_backed(
+            extra_env,
+            crate::config::hermes_home_is_profile_backing(
+                std::env::var_os(crate::config::HERMES_HOME_ENV).as_deref(),
+            ),
+        );
+        for &(key, value) in crate::config::default_agent_env(command, hermes_profile_backed) {
             if std::env::var_os(key).is_none() {
                 cmd.env(key, value);
             }
@@ -629,7 +644,7 @@ impl AcpClient {
             .pointer("/_meta/steering/supported")
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
-        tracing::debug!(target: "acp::init", "initialize response: {result}");
+        tracing::debug!(target: "buzz_acp::acp::init", "initialize response: {result}");
         Ok(result)
     }
 
@@ -690,7 +705,7 @@ impl AcpClient {
             .as_str()
             .ok_or_else(|| AcpError::Protocol("session/new response missing sessionId".into()))?
             .to_owned();
-        tracing::info!(target: "acp::session", "session created: {session_id}");
+        tracing::info!(target: "buzz_acp::acp::session", "session created: {session_id}");
         Ok(SessionNewResponse {
             session_id,
             raw: result,
@@ -841,7 +856,7 @@ impl AcpClient {
             "params": params,
         });
 
-        tracing::debug!(target: "acp::wire", "→ {}", &serde_json::to_string(&msg).unwrap_or_default());
+        tracing::debug!(target: "buzz_acp::acp::wire", "→ {}", &serde_json::to_string(&msg).unwrap_or_default());
         if let Err(e) = self.write_ndjson(&msg).await {
             self.last_prompt_id = None;
             self.current_hard_deadline = None;
@@ -1084,7 +1099,7 @@ impl AcpClient {
                 let response = permission_response_cancelled(&perm_id);
                 self.write_ndjson(&response).await?;
                 tracing::debug!(
-                    target: "acp::cancel",
+                    target: "buzz_acp::acp::cancel",
                     "responded cancelled to pending permission id={perm_id}"
                 );
             }
@@ -1094,7 +1109,7 @@ impl AcpClient {
 
         // Step 2: send session/cancel notification (no id)
         self.session_cancel(session_id).await?;
-        tracing::info!(target: "acp::cancel", "sent session/cancel for {session_id}");
+        tracing::info!(target: "buzz_acp::acp::cancel", "sent session/cancel for {session_id}");
         // Use a fixed 30s idle timeout during cleanup — the cancel notification
         // needs time to propagate and the agent may go silent while winding down.
         // The separate hard_deadline bounds agents that keep producing output
@@ -1162,7 +1177,7 @@ impl AcpClient {
             "params": params,
         });
 
-        tracing::debug!(target: "acp::wire", "→ {}", &serde_json::to_string(&msg).unwrap_or_default());
+        tracing::debug!(target: "buzz_acp::acp::wire", "→ {}", &serde_json::to_string(&msg).unwrap_or_default());
 
         // Wrap write + read in a single timeout so a hung agent can't block forever.
         // We cannot use an async block that borrows `self` mutably across two awaits
@@ -1204,7 +1219,7 @@ impl AcpClient {
                 Err(_) | Ok(None) => break,
                 Ok(Some(Ok(_))) => {
                     // Consumed one buffered line; loop to drain more.
-                    tracing::debug!(target: "acp::wire", "drained stale buffered line");
+                    tracing::debug!(target: "buzz_acp::acp::wire", "drained stale buffered line");
                 }
                 Ok(Some(Err(_))) => break,
             }
@@ -1227,7 +1242,7 @@ impl AcpClient {
             "params": params,
         });
 
-        tracing::debug!(target: "acp::wire", "→ (notification) {}", &serde_json::to_string(&msg).unwrap_or_default());
+        tracing::debug!(target: "buzz_acp::acp::wire", "→ (notification) {}", &serde_json::to_string(&msg).unwrap_or_default());
         self.write_ndjson(&msg).await?;
         Ok(())
     }
@@ -1269,7 +1284,7 @@ impl AcpClient {
             }
 
             // Only log and reset idle after we have a valid non-empty line.
-            tracing::debug!(target: "acp::wire", "← {trimmed}");
+            tracing::debug!(target: "buzz_acp::acp::wire", "← {trimmed}");
 
             let msg: serde_json::Value = match serde_json::from_str(trimmed) {
                 Ok(v) => v,
@@ -1282,7 +1297,7 @@ impl AcpClient {
                         }),
                     );
                     tracing::warn!(
-                        target: "acp::wire",
+                        target: "buzz_acp::acp::wire",
                         "failed to parse line as JSON: {e} — skipping"
                     );
                     continue;
@@ -1328,7 +1343,7 @@ impl AcpClient {
                             // agent process is dead and continuing would hang.
                             self.write_ndjson(&err_resp).await?;
                         }
-                        tracing::debug!(target: "acp::wire", "ignoring unknown method: {other}");
+                        tracing::debug!(target: "buzz_acp::acp::wire", "ignoring unknown method: {other}");
                     }
                 }
             }
@@ -1514,7 +1529,7 @@ impl AcpClient {
                                 "params": params,
                             });
                             tracing::debug!(
-                                target: "acp::wire",
+                                target: "buzz_acp::acp::wire",
                                 "→ {}",
                                 serde_json::to_string(&msg).unwrap_or_default()
                             );
@@ -1592,7 +1607,7 @@ impl AcpClient {
                         continue;
                     }
 
-                    tracing::debug!(target: "acp::wire", "← {trimmed}");
+                    tracing::debug!(target: "buzz_acp::acp::wire", "← {trimmed}");
 
                     let msg: serde_json::Value = match serde_json::from_str(trimmed) {
                         Ok(v) => v,
@@ -1605,7 +1620,7 @@ impl AcpClient {
                                 }),
                             );
                             tracing::warn!(
-                                target: "acp::wire",
+                                target: "buzz_acp::acp::wire",
                                 "failed to parse line as JSON: {e} — skipping"
                             );
                             continue;
@@ -1776,7 +1791,7 @@ impl AcpClient {
                                     // agent process is dead and continuing would hang.
                                     self.write_ndjson(&err_resp).await?;
                                 }
-                                tracing::debug!(target: "acp::wire", "ignoring unknown method: {other}");
+                                tracing::debug!(target: "buzz_acp::acp::wire", "ignoring unknown method: {other}");
                             }
                         }
                     }
@@ -1809,7 +1824,13 @@ impl AcpClient {
         match update_type {
             "agent_message_chunk" => {
                 if let Some(text) = update["content"]["text"].as_str() {
-                    tracing::info!(target: "acp::stream", "{text}");
+                    // Debug, not info: the desktop runs its managed agents with
+                    // `RUST_LOG=buzz_acp=info` and persists the child's stdout to
+                    // a per-agent log file on disk, so an info-level chunk would
+                    // write every reply the agent sends into a DM to that file in
+                    // plaintext. The desktop transcript renders these chunks from
+                    // the observer stream, not from this line.
+                    tracing::debug!(target: "buzz_acp::acp::stream", "{text}");
                 }
                 self.turn_media.record_chunk(&update["content"]);
                 false
@@ -1823,7 +1844,17 @@ impl AcpClient {
                     .get("kind")
                     .and_then(|v| v.as_str())
                     .unwrap_or("unknown");
-                tracing::info!(target: "acp::tool", "tool_call: {title} ({kind})");
+                // Debug, not info, for the same reason as the reply chunk
+                // above: the desktop persists this child's stdout to a
+                // per-agent log file under `RUST_LOG=buzz_acp=info`, and
+                // engines build these titles by interpolating the tool
+                // arguments. Hermes puts the shell command, the file path,
+                // the grep pattern or the search query (model text derived
+                // from the user's message) straight into the title. The
+                // desktop transcript renders tool cards from the observer
+                // stream, not from this line. `tool_call_update` below stays
+                // at info: it carries only an id and a status.
+                tracing::debug!(target: "buzz_acp::acp::tool", "tool_call: {title} ({kind})");
                 true
             }
             "tool_call_update" => {
@@ -1832,16 +1863,16 @@ impl AcpClient {
                     .and_then(|v| v.as_str())
                     .unwrap_or("?");
                 let status = update.get("status").and_then(|v| v.as_str()).unwrap_or("?");
-                tracing::info!(target: "acp::tool", "tool_call_update: {tool_id} → {status}");
+                tracing::info!(target: "buzz_acp::acp::tool", "tool_call_update: {tool_id} → {status}");
                 false
             }
             "plan" => {
-                tracing::info!(target: "acp::plan", "plan update received");
+                tracing::info!(target: "buzz_acp::acp::plan", "plan update received");
                 false
             }
             "agent_thought_chunk" => {
                 if let Some(text) = update["content"]["text"].as_str() {
-                    tracing::debug!(target: "acp::thought", "{text}");
+                    tracing::debug!(target: "buzz_acp::acp::thought", "{text}");
                 }
                 false
             }
@@ -1853,7 +1884,7 @@ impl AcpClient {
                     .map(|cmds| cmds.iter().filter_map(|c| c["name"].as_str()).collect())
                     .unwrap_or_default();
                 tracing::info!(
-                    target: "acp::update",
+                    target: "buzz_acp::acp::update",
                     "available_commands_update: {} commands [{}]",
                     names.len(),
                     names.join(", ")
@@ -1878,14 +1909,14 @@ impl AcpClient {
                     match goose_meta.get("activeRunId") {
                         Some(serde_json::Value::String(run_id)) => {
                             tracing::debug!(
-                                target: "acp::update",
+                                target: "buzz_acp::acp::update",
                                 "session_info_update: activeRunId={run_id}"
                             );
                             self.active_run_id = Some(run_id.clone());
                         }
                         Some(serde_json::Value::Null) => {
                             tracing::debug!(
-                                target: "acp::update",
+                                target: "buzz_acp::acp::update",
                                 "session_info_update: activeRunId cleared"
                             );
                             self.active_run_id = None;
@@ -1902,7 +1933,7 @@ impl AcpClient {
             }
             "keepalive" => false,
             other => {
-                tracing::debug!(target: "acp::update", "session/update: {other}");
+                tracing::debug!(target: "buzz_acp::acp::update", "session/update: {other}");
                 false
             }
         }
@@ -1944,7 +1975,7 @@ impl AcpClient {
             Some(p) => p,
             None => {
                 tracing::debug!(
-                    target: "acp::usage",
+                    target: "buzz_acp::acp::usage",
                     "_goose/unstable/session/update: missing params"
                 );
                 return;
@@ -1954,7 +1985,7 @@ impl AcpClient {
             Ok(notif) => {
                 if let GooseSessionUpdateVariant::UsageUpdate(payload) = &notif.update {
                     tracing::debug!(
-                        target: "acp::usage",
+                        target: "buzz_acp::acp::usage",
                         session_id = %notif.session_id,
                         input = ?payload.accumulated_input_tokens,
                         output = ?payload.accumulated_output_tokens,
@@ -1970,7 +2001,7 @@ impl AcpClient {
             }
             Err(e) => {
                 tracing::debug!(
-                    target: "acp::usage",
+                    target: "buzz_acp::acp::usage",
                     "_goose/unstable/session/update: deserialization error: {e}"
                 );
             }
@@ -2003,7 +2034,7 @@ impl AcpClient {
             .ok_or_else(|| AcpError::Protocol("permission request missing options".into()))?;
 
         tracing::debug!(
-            target: "acp::permission",
+            target: "buzz_acp::acp::permission",
             "session/request_permission id={id}, {} options",
             options.len()
         );
@@ -2018,14 +2049,14 @@ impl AcpClient {
                 .as_str()
                 .ok_or_else(|| AcpError::Protocol("allow_once option missing optionId".into()))?;
             tracing::info!(
-                target: "acp::permission",
+                target: "buzz_acp::acp::permission",
                 "auto-approving permission id={id} with allow_once optionId={option_id:?}"
             );
             permission_response_selected(&id, option_id)
         } else {
             // No allow_once — fall back to reject_once.
             tracing::warn!(
-                target: "acp::permission",
+                target: "buzz_acp::acp::permission",
                 "no allow_once option found in permission request id={id}, falling back to reject_once"
             );
             let reject = options
@@ -2076,7 +2107,7 @@ impl AcpClient {
                     .standard_usage
                     .record_prompt_usage(session_id, usage, adapter),
                 Err(_) if result.get("usage").is_some() => tracing::debug!(
-                    target: "acp::usage",
+                    target: "buzz_acp::acp::usage",
                     "session/prompt response contained malformed standard usage"
                 ),
                 Err(_) => {}
@@ -3288,6 +3319,60 @@ mod tests {
         (client, dir)
     }
 
+    /// Serializes the spawn tests that must observe a specific process
+    /// environment, so their scrubbing cannot interleave. Async-aware: the
+    /// guard is held across the probe spawn's `.await`.
+    ///
+    /// It serializes *these* tests against each other and nothing else: the
+    /// scrub still mutates process-global state while the rest of the binary
+    /// runs. That is safe only because no other test in this crate reads
+    /// `HERMES_HOME` or `HERMES_ACP_SKIP_CONFIGURED_MCP`. Anything new that
+    /// does must take this lock too — it is not a process-wide env lock.
+    static HERMES_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    /// Remove the Hermes env layering keys from this process for the lifetime
+    /// of the guard, restoring them on drop.
+    ///
+    /// A spawned child inherits the harness's environment, so a runner that
+    /// carries a sticky `HERMES_HOME` (a dev box with a Hermes profile) or an
+    /// explicit `HERMES_ACP_SKIP_CONFIGURED_MCP` would otherwise make the
+    /// spawn defaults unobservable. Skipping the assertions there is what the
+    /// guard replaces: the test must protect the seam on every machine, not
+    /// only on a clean one.
+    #[cfg(unix)]
+    struct ScrubbedHermesEnv {
+        saved: Vec<(&'static str, Option<std::ffi::OsString>)>,
+        _lock: tokio::sync::MutexGuard<'static, ()>,
+    }
+
+    #[cfg(unix)]
+    impl ScrubbedHermesEnv {
+        async fn acquire() -> Self {
+            let lock = HERMES_ENV_LOCK.lock().await;
+            let saved = ["HERMES_HOME", "HERMES_ACP_SKIP_CONFIGURED_MCP"]
+                .into_iter()
+                .map(|key| {
+                    let previous = std::env::var_os(key);
+                    std::env::remove_var(key);
+                    (key, previous)
+                })
+                .collect();
+            Self { saved, _lock: lock }
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for ScrubbedHermesEnv {
+        fn drop(&mut self) {
+            for (key, value) in self.saved.drain(..) {
+                match value {
+                    Some(value) => std::env::set_var(key, value),
+                    None => std::env::remove_var(key),
+                }
+            }
+        }
+    }
+
     /// Spawn a probe script whose file name carries a runtime identity (e.g.
     /// `hermes-acp`) and return the value of `var` as the child observed it.
     /// `<unset>` means the child did not receive the var.
@@ -3337,11 +3422,9 @@ mod tests {
     #[tokio::test]
     async fn spawn_applies_runtime_env_defaults_with_extra_env_precedence() {
         const VAR: &str = "HERMES_ACP_SKIP_CONFIGURED_MCP";
-        if std::env::var_os(VAR).is_some() {
-            // Inherited parent values win over both layers; the default and
-            // override behavior below is unobservable in such an environment.
-            return;
-        }
+        // Inherited parent values win over both layers, so the runner's own
+        // environment is scrubbed for the duration rather than skipped over.
+        let _env = ScrubbedHermesEnv::acquire().await;
 
         assert_eq!(
             spawn_named_and_read_child_env("hermes-acp", VAR, &[]).await,
@@ -3357,6 +3440,102 @@ mod tests {
             spawn_named_and_read_child_env("other-agent", VAR, &[]).await,
             "<unset>",
             "non-Hermes spawns must not receive Hermes defaults"
+        );
+    }
+
+    /// A Hermes record that carries `HERMES_HOME` is profile-backed: the
+    /// profile's MCP servers are the agent's own tools, so the isolation
+    /// default flips to `0`. An explicit persona value still wins, and the
+    /// profile env never leaks the Hermes default onto other harnesses.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn spawn_keeps_configured_mcp_for_profile_backed_hermes() {
+        const VAR: &str = "HERMES_ACP_SKIP_CONFIGURED_MCP";
+        // The record's `HERMES_HOME` must be the only one in play: a runner
+        // that exports its own would decide the flag before `extra_env` is
+        // read, and the assertions below would prove nothing.
+        let _env = ScrubbedHermesEnv::acquire().await;
+        let profile_env = |pairs: &[(&str, &str)]| -> Vec<(String, String)> {
+            pairs
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect()
+        };
+
+        assert_eq!(
+            spawn_named_and_read_child_env(
+                "hermes-acp",
+                VAR,
+                &profile_env(&[("HERMES_HOME", "/tmp/hermes-profile")]),
+            )
+            .await,
+            "0",
+            "profile-backed Hermes spawns must default {VAR}=0"
+        );
+        assert_eq!(
+            spawn_named_and_read_child_env(
+                "hermes-acp",
+                VAR,
+                &profile_env(&[("HERMES_HOME", "/tmp/hermes-profile"), (VAR, "1")]),
+            )
+            .await,
+            "1",
+            "an explicit extra_env entry must still override the profile-backed default"
+        );
+        assert_eq!(
+            spawn_named_and_read_child_env(
+                "hermes-acp",
+                VAR,
+                &profile_env(&[("HERMES_HOME", "")]),
+            )
+            .await,
+            "1",
+            "a blank HERMES_HOME is not a profile"
+        );
+        assert_eq!(
+            spawn_named_and_read_child_env(
+                "other-agent",
+                VAR,
+                &profile_env(&[("HERMES_HOME", "/tmp/hermes-profile")]),
+            )
+            .await,
+            "<unset>",
+            "HERMES_HOME on a non-Hermes spawn must not produce Hermes defaults"
+        );
+    }
+
+    /// The parent layer and the record layer apply the SAME emptiness test to
+    /// `HERMES_HOME`, so the profile-backed decision cannot depend on which
+    /// layer happened to carry the value.
+    ///
+    /// This binds the spawn site, not just `hermes_home_is_profile_backing`:
+    /// an inherited whitespace-only `HERMES_HOME` is not a profile, so the
+    /// child still gets the isolation default. Replacing the trimmed check at
+    /// the spawn with a bare `!value.is_empty()` reads `"   "` as a profile
+    /// and hands the child `0` instead.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn spawn_treats_a_blank_inherited_hermes_home_as_no_profile() {
+        const VAR: &str = "HERMES_ACP_SKIP_CONFIGURED_MCP";
+        // Restores whatever this runner had on drop, including the value set
+        // below, and holds the lock for the whole test.
+        let _env = ScrubbedHermesEnv::acquire().await;
+
+        for blank in ["   ", "\t"] {
+            std::env::set_var(crate::config::HERMES_HOME_ENV, blank);
+            assert_eq!(
+                spawn_named_and_read_child_env("hermes-acp", VAR, &[]).await,
+                "1",
+                "an inherited HERMES_HOME of {blank:?} is not a profile"
+            );
+        }
+
+        // The same variable with real content is a profile, from the same layer.
+        std::env::set_var(crate::config::HERMES_HOME_ENV, "/tmp/hermes-profile");
+        assert_eq!(
+            spawn_named_and_read_child_env("hermes-acp", VAR, &[]).await,
+            "0",
+            "an inherited HERMES_HOME with a path is profile-backed"
         );
     }
 
