@@ -1044,8 +1044,33 @@ pub struct PublishedMedia {
     pub delivery: Option<AudioDelivery>,
 }
 
+/// Normalise a spoken reply into an `alt` transcript: one line, bounded.
+///
+/// `alt` is what the desktop and mobile voice-note cards fold open, so it has
+/// to read as a sentence rather than a wrapped reply. Whitespace is collapsed
+/// and the text is capped, since a tag value rides in every copy of the event.
+fn transcript_alt(text: &str) -> Option<String> {
+    const MAX_TRANSCRIPT_BYTES: usize = 1000;
+    let mut flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if flat.is_empty() {
+        return None;
+    }
+    if flat.len() > MAX_TRANSCRIPT_BYTES {
+        let mut cut = MAX_TRANSCRIPT_BYTES;
+        while !flat.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        flat.truncate(cut);
+        flat.push('\u{2026}');
+    }
+    Some(flat)
+}
+
 /// Build the `imeta` tag for one published file.
-pub fn imeta_tag(item: &PublishedMedia) -> Vec<String> {
+///
+/// `transcript` is the turn's spoken text; it is attached as `alt` on audio
+/// only, which is the field both clients read for the transcript row.
+pub fn imeta_tag(item: &PublishedMedia, transcript: Option<&str>) -> Vec<String> {
     let d = &item.descriptor;
     let mut tag = vec![
         "imeta".to_string(),
@@ -1061,6 +1086,11 @@ pub fn imeta_tag(item: &PublishedMedia) -> Vec<String> {
         // The relay cross-checks this against the stored duration; echo its
         // own value verbatim.
         tag.push(format!("duration {duration}"));
+    }
+    if matches!(item.kind, MediaKind::Audio) {
+        if let Some(alt) = transcript.and_then(transcript_alt) {
+            tag.push(format!("alt {alt}"));
+        }
     }
     tag.push(format!("filename {}", item.filename));
     tag
@@ -1094,9 +1124,15 @@ fn markdown_link_text(name: &str) -> String {
 }
 
 /// Compose the single kind-9 body and tag set for a reply's uploads.
-pub fn compose_message(items: &[PublishedMedia]) -> (String, Vec<Vec<String>>) {
+pub fn compose_message(
+    items: &[PublishedMedia],
+    transcript: Option<&str>,
+) -> (String, Vec<Vec<String>>) {
     let body = items.iter().map(body_line).collect::<Vec<_>>().join("\n");
-    let tags = items.iter().map(imeta_tag).collect();
+    let tags = items
+        .iter()
+        .map(|item| imeta_tag(item, transcript))
+        .collect();
     (body, tags)
 }
 
@@ -1108,6 +1144,8 @@ pub struct MediaPublisher<'a> {
     pub audio_support: &'a AudioSupportCache,
     /// ffmpeg binary, when one was found at startup.
     pub ffmpeg: Option<&'a Path>,
+    /// The turn's reply text, attached to published audio as its transcript.
+    pub transcript: Option<&'a str>,
 }
 
 /// Outcome of publishing one reply's media.
@@ -1535,7 +1573,7 @@ impl MediaPublisher<'_> {
         target: &ReplyTarget,
         items: &[PublishedMedia],
     ) -> Result<String, String> {
-        let (content, media_tags) = compose_message(items);
+        let (content, media_tags) = compose_message(items, self.transcript);
         let thread_ref = buzz_sdk::ThreadRef {
             root_event_id: target.root_event_id,
             parent_event_id: target.root_event_id,
@@ -2576,11 +2614,61 @@ mod tests {
     }
 
     #[test]
+    fn a_voice_note_carries_its_spoken_words_as_alt() {
+        // `alt` is the field both clients fold open as the transcript row.
+        // Without it a voice note arrives as an unlabelled play button.
+        let voice = published(MediaKind::Audio, "voice-note-1.mp3", Some(2.9));
+        let tag = imeta_tag(&voice, Some("Hello Chief, Sky here."));
+        assert!(
+            tag.contains(&"alt Hello Chief, Sky here.".to_string()),
+            "audio must carry the spoken text as alt; got {tag:?}"
+        );
+    }
+
+    #[test]
+    fn a_transcript_is_flattened_and_never_attached_to_a_non_audio_file() {
+        let voice = published(MediaKind::Audio, "voice-note-1.mp3", Some(2.9));
+        let tag = imeta_tag(&voice, Some("  first line\n\n  second line  "));
+        assert!(
+            tag.contains(&"alt first line second line".to_string()),
+            "a wrapped reply must flatten to one line; got {tag:?}"
+        );
+
+        // An image's alt would be a lie: the text was never about the image.
+        let image = published(MediaKind::Image, "shot.png", None);
+        assert!(
+            !imeta_tag(&image, Some("Hello Chief"))
+                .iter()
+                .any(|part| part.starts_with("alt ")),
+            "only audio carries a transcript"
+        );
+    }
+
+    #[test]
+    fn an_empty_or_blank_transcript_adds_no_alt() {
+        let voice = published(MediaKind::Audio, "voice-note-1.mp3", Some(2.9));
+        for text in ["", "   ", "\n\t "] {
+            assert!(
+                !imeta_tag(&voice, Some(text))
+                    .iter()
+                    .any(|part| part.starts_with("alt ")),
+                "blank text must not produce an empty alt"
+            );
+        }
+        assert!(
+            !imeta_tag(&voice, None)
+                .iter()
+                .any(|part| part.starts_with("alt ")),
+            "no transcript means no alt"
+        );
+    }
+
+    #[test]
     fn imeta_and_body_follow_the_client_contract() {
         let url = format!("https://relay.example/media/{}.bin", "a".repeat(64));
         let voice = published(MediaKind::Audio, "voice-note-1700.mp3", Some(3.25));
         assert_eq!(
-            imeta_tag(&voice),
+            imeta_tag(&voice, None),
             vec![
                 "imeta".to_string(),
                 format!("url {url}"),
@@ -2598,14 +2686,14 @@ mod tests {
         ));
 
         let image = published(MediaKind::Image, "shot.png", None);
-        assert!(imeta_tag(&image).contains(&"dim 16x16".to_string()));
+        assert!(imeta_tag(&image, None).contains(&"dim 16x16".to_string()));
         assert_eq!(body_line(&image), format!("![image]({url})"));
         let video = published(MediaKind::Video, "clip.mp4", Some(1.0));
         assert_eq!(body_line(&video), format!("![video]({url})"));
         let file = published(MediaKind::File, "doc.pdf", None);
         assert_eq!(body_line(&file), format!("[doc.pdf]({url})"));
 
-        let (body, tags) = compose_message(&[voice, image]);
+        let (body, tags) = compose_message(&[voice, image], None);
         assert_eq!(body.lines().count(), 2);
         assert_eq!(tags.len(), 2);
         assert_eq!(voice_note_filename("mp4", 12), "voice-note-12.mp4");
@@ -2775,6 +2863,7 @@ mod tests {
             rest: &rest,
             audio_support: &cache,
             ffmpeg: None,
+            transcript: None,
         };
         let keys = Keys::generate();
         let trigger = nostr::EventBuilder::new(nostr::Kind::Custom(9), "say hi")
@@ -2877,6 +2966,7 @@ mod tests {
             rest: &rest,
             audio_support: &cache,
             ffmpeg: None,
+            transcript: None,
         };
         let keys = Keys::generate();
         let trigger = nostr::EventBuilder::new(nostr::Kind::Custom(9), "x")
@@ -2928,6 +3018,7 @@ mod tests {
             rest: &rest,
             audio_support: &cache,
             ffmpeg: None,
+            transcript: None,
         };
         let keys = Keys::generate();
         let trigger = nostr::EventBuilder::new(nostr::Kind::Custom(9), "x")
@@ -2967,6 +3058,7 @@ mod tests {
             rest: &rest,
             audio_support: &cache,
             ffmpeg: None,
+            transcript: None,
         };
         let keys = Keys::generate();
         let trigger = nostr::EventBuilder::new(nostr::Kind::Custom(9), "x")
@@ -3022,6 +3114,7 @@ mod tests {
             rest: &rest,
             audio_support: &cache,
             ffmpeg: None,
+            transcript: None,
         };
         let keys = Keys::generate();
         let trigger = nostr::EventBuilder::new(nostr::Kind::Custom(9), "x")

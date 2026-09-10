@@ -2391,6 +2391,11 @@ async fn publish_reply_media_now(
         workspace_refused: workspace.err(),
         home,
     };
+    // The reply text the engine spoke doubles as the audio's transcript, so a
+    // voice note arrives with the words already attached instead of the
+    // listener having to play it to find out what it says. Taken before
+    // `capture` moves into the blocking task below.
+    let transcript = capture.text().trim().to_string();
     // Canonicalising, staging, and decoding inline data are disk work; keep
     // them off the runtime threads.
     let resolution = {
@@ -2409,6 +2414,7 @@ async fn publish_reply_media_now(
         rest: &ctx.rest_client,
         audio_support: &ctx.audio_support,
         ffmpeg: ctx.ffmpeg.as_deref(),
+        transcript: (!transcript.is_empty()).then_some(transcript.as_str()),
     };
     let deadline = tokio::time::Instant::now() + crate::media_publish::OUTBOUND_DEADLINE;
     publisher
