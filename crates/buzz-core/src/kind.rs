@@ -491,6 +491,17 @@ pub const KIND_STREAM_MESSAGE_SCHEDULED: u32 = 40006;
 pub const KIND_STREAM_REMINDER: u32 = 40007;
 /// A diff/patch message showing file changes (unified diff format).
 pub const KIND_STREAM_MESSAGE_DIFF: u32 = 40008;
+/// Transcript of a voice note, published by an agent that transcribed it.
+///
+/// A voice note only carries a transcript when its author put one in the imeta
+/// `alt` field, and a person recording in a client has no way to do that: the
+/// speech-to-text credential lives with the agents, not in the composer. So the
+/// agent that transcribed the clip to answer it publishes the words here,
+/// tagged `e` with the voice note's id, and clients render it on that message.
+///
+/// Stored, not ephemeral: the transcript has to still be there when the
+/// conversation is reopened days later.
+pub const KIND_VOICE_NOTE_TRANSCRIPT: u32 = 40009;
 /// Canvas (shared document) for a channel.
 pub const KIND_CANVAS: u32 = 40100;
 /// System message for channel state changes (join, leave, rename, etc.).
