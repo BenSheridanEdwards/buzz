@@ -756,3 +756,55 @@ test("splitOutgoingTags is the inverse of mergeOutgoingTags", () => {
   assert.deepEqual(mentionTags, []);
   assert.deepEqual(linkPreviewTags, []);
 });
+
+test("imeta: a voice note's transcript is emitted as the alt field", () => {
+  const [tag] = buildImetaTags([
+    {
+      url: "https://blossom/voice.mp3",
+      type: "audio/mpeg",
+      sha256: "a".repeat(64),
+      size: 4096,
+      uploaded: 0,
+      duration: 3,
+      transcript: "Yes Chief, your voice note came through.",
+    },
+  ]);
+  assert.ok(
+    tag.includes("alt Yes Chief, your voice note came through."),
+    `expected an alt field carrying the transcript, got: ${JSON.stringify(tag)}`,
+  );
+});
+
+test("imeta: a blob with no transcript emits no alt field", () => {
+  const [tag] = buildImetaTags([
+    {
+      url: "https://blossom/voice.mp3",
+      type: "audio/mpeg",
+      sha256: "a".repeat(64),
+      size: 4096,
+      uploaded: 0,
+      duration: 3,
+    },
+  ]);
+  assert.ok(
+    !tag.some((field) => String(field).startsWith("alt ")),
+    `expected no alt field, got: ${JSON.stringify(tag)}`,
+  );
+});
+
+test("imeta: alt round-trips back into transcript when reading tags", () => {
+  const media = imetaMediaFromTags([
+    [
+      "imeta",
+      "url https://blossom/voice.mp3",
+      "m audio/mpeg",
+      `x ${"a".repeat(64)}`,
+      "duration 3",
+      "alt Yes Chief, your voice note came through.",
+    ],
+  ]);
+  assert.equal(
+    media[0]?.transcript,
+    "Yes Chief, your voice note came through.",
+  );
+});

@@ -553,6 +553,14 @@ export type BlobDescriptor = {
   image?: string;
   /** Original filename captured client-side. */
   filename?: string;
+  /**
+   * Spoken words of an audio blob, transcribed by the relay on upload.
+   *
+   * The relay cannot tag the event (we sign it), so it returns the transcript
+   * here and the composer projects it into imeta `alt`, which both clients
+   * already read to render the transcript row.
+   */
+  transcript?: string;
 };
 
 export async function uploadMedia(

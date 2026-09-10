@@ -335,6 +335,33 @@ pub struct CliArgs {
     )]
     pub subscribe: SubscribeMode,
 
+    /// Hermes transcribe endpoint for inbound voice notes. Empty disables it.
+    ///
+    /// Loopback by default: buzz-acp runs on the same host as Hermes, so the
+    /// subscription credential never leaves that machine and nothing is
+    /// exposed to reach it.
+    #[arg(long, env = "BUZZ_ACP_TRANSCRIBE_ENDPOINT", default_value = "")]
+    pub transcribe_endpoint: String,
+
+    /// Hermes profile the transcription is billed to. Empty uses the
+    /// endpoint's default profile.
+    #[arg(long, env = "BUZZ_ACP_TRANSCRIBE_PROFILE", default_value = "")]
+    pub transcribe_profile: String,
+
+    /// Session token for the Hermes transcribe endpoint.
+    ///
+    /// Hermes requires it on every `/api/` route even on a loopback bind, so
+    /// that a stray local process cannot drive the dashboard. This is a
+    /// machine-local shared secret between two of the operator's own
+    /// processes, not a provider credential.
+    #[arg(
+        long,
+        env = "BUZZ_ACP_TRANSCRIBE_TOKEN",
+        default_value = "",
+        hide_env_values = true
+    )]
+    pub transcribe_token: String,
+
     #[arg(long, env = "BUZZ_ACP_KINDS", value_delimiter = ',')]
     pub kinds: Option<Vec<u32>>,
 
@@ -557,6 +584,12 @@ pub struct Config {
     pub team_instructions: Option<String>,
     pub initial_message: Option<String>,
     pub subscribe_mode: SubscribeMode,
+    /// Hermes transcribe endpoint for inbound voice notes; empty disables it.
+    pub transcribe_endpoint: String,
+    /// Hermes profile the transcription is billed to.
+    pub transcribe_profile: String,
+    /// Session token for the Hermes transcribe endpoint.
+    pub transcribe_token: String,
     pub dedup_mode: DedupMode,
     /// How ACP provider sessions are scoped in channels (channel vs thread).
     pub session_policy: crate::scope::SessionPolicy,
@@ -1241,6 +1274,9 @@ impl Config {
                 .map(str::to_string),
             initial_message: args.initial_message,
             subscribe_mode: args.subscribe,
+            transcribe_endpoint: args.transcribe_endpoint.clone(),
+            transcribe_profile: args.transcribe_profile.clone(),
+            transcribe_token: args.transcribe_token.clone(),
             dedup_mode: args.dedup,
             session_policy: args.session_policy,
             multiple_event_handling: args.multiple_event_handling,
@@ -1620,6 +1656,9 @@ mod tests {
             team_instructions: None,
             initial_message: None,
             subscribe_mode: mode,
+            transcribe_endpoint: String::new(),
+            transcribe_profile: String::new(),
+            transcribe_token: String::new(),
             dedup_mode: DedupMode::Queue,
             session_policy: crate::scope::SessionPolicy::Channel,
             multiple_event_handling: MultipleEventHandling::Queue,

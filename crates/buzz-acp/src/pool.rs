@@ -762,6 +762,12 @@ impl ChannelInfoResolver {
 }
 
 pub struct PromptContext {
+    /// Hermes transcribe endpoint for inbound voice notes; empty disables it.
+    pub transcribe_endpoint: String,
+    /// Hermes profile the transcription is billed to.
+    pub transcribe_profile: String,
+    /// Session token for the Hermes transcribe endpoint.
+    pub transcribe_token: String,
     pub mcp_servers: Vec<McpServer>,
     pub initial_message: Option<String>,
     pub idle_timeout: Duration,
@@ -3157,6 +3163,26 @@ pub async fn run_prompt_task(
         // sections so the section headers the observer trimmer keys on are
         // unchanged. Every failure is named in the section (rule 1).
         let inbound = collect_batch_attachments(&ctx, b, &turn_id).await;
+        // A person's own voice note reaches the relay with no transcript in
+        // its imeta, and its signature forbids adding one after the fact, so
+        // the words are published as their own event pointing back at it.
+        // Detached: the answer must not wait on someone else's speech-to-text.
+        if !ctx.transcribe_endpoint.trim().is_empty() && !inbound.is_empty() {
+            let rest = ctx.rest_client.clone();
+            let channel_id = b.channel_id;
+            let endpoint = ctx.transcribe_endpoint.clone();
+            let profile = ctx.transcribe_profile.clone();
+            let token = ctx.transcribe_token.clone();
+            let outcomes = crate::attachments::InboundAttachments {
+                outcomes: inbound.outcomes.clone(),
+            };
+            tokio::spawn(async move {
+                publish_inbound_transcripts(
+                    &rest, channel_id, &outcomes, &endpoint, &profile, &token,
+                )
+                .await;
+            });
+        }
         if let Some(section) = inbound.section() {
             sections.push(section);
         }
@@ -5596,6 +5622,71 @@ pub(crate) async fn post_text_message(
         Ok(Ok(_)) => {}
         Ok(Err(e)) => tracing::warn!(channel = %channel_id, "{what} failed: {e}"),
         Err(_) => tracing::warn!(channel = %channel_id, "{what} timed out"),
+    }
+}
+
+/// Transcribe every inbound voice note on this batch and publish the words as
+/// their own event, so a person's own recording shows a transcript.
+///
+/// The note's author signed it, so its imeta `alt` cannot be amended after the
+/// fact; the transcript is a separate event tagged `e` with the note's id.
+/// Published best-effort and never awaited by the answer: a turn that cannot
+/// produce a transcript answers exactly as it did before.
+async fn publish_inbound_transcripts(
+    rest: &crate::relay::RestClient,
+    channel_id: Uuid,
+    inbound: &crate::attachments::InboundAttachments,
+    endpoint: &str,
+    profile: &str,
+    token: &str,
+) {
+    for outcome in &inbound.outcomes {
+        let crate::attachments::AttachmentOutcome::Stored { event_id, local } = outcome else {
+            continue;
+        };
+        if !crate::inbound_transcript::should_transcribe(endpoint, local.is_audio, local.size) {
+            continue;
+        }
+        let Ok(target) = nostr::EventId::from_hex(event_id) else {
+            continue;
+        };
+        let Some(text) = crate::inbound_transcript::transcribe_clip(
+            endpoint,
+            profile,
+            token,
+            &local.path,
+            &local.mime_type,
+        )
+        .await
+        else {
+            continue;
+        };
+        let builder = match buzz_sdk::build_voice_note_transcript(channel_id, target, &text) {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::debug!(channel = %channel_id, "inbound transcript: build failed: {e}");
+                continue;
+            }
+        };
+        let event = match builder.sign_with_keys(&rest.keys) {
+            Ok(e) => e,
+            Err(e) => {
+                tracing::debug!(channel = %channel_id, "inbound transcript: sign failed: {e}");
+                continue;
+            }
+        };
+        match tokio::time::timeout(Duration::from_secs(5), rest.submit_event(&event)).await {
+            Ok(Ok(_)) => tracing::info!(
+                target: "acp::media",
+                channel = %channel_id,
+                note = %event_id,
+                "published a transcript for an inbound voice note"
+            ),
+            Ok(Err(e)) => {
+                tracing::debug!(channel = %channel_id, "inbound transcript publish failed: {e}")
+            }
+            Err(_) => tracing::debug!(channel = %channel_id, "inbound transcript publish timed out"),
+        }
     }
 }
 
@@ -11199,6 +11290,9 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
         use crate::relay::RestClient;
         PromptContext {
             mcp_servers: vec![],
+            transcribe_endpoint: String::new(),
+            transcribe_profile: String::new(),
+            transcribe_token: String::new(),
             initial_message: None,
             idle_timeout: Duration::from_secs(60),
             max_turn_duration: Duration::from_secs(120),
