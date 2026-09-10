@@ -1051,7 +1051,14 @@ pub struct PublishedMedia {
 /// and the text is capped, since a tag value rides in every copy of the event.
 fn transcript_alt(text: &str) -> Option<String> {
     const MAX_TRANSCRIPT_BYTES: usize = 1000;
-    let mut flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    // A `MEDIA:` line is a directive to the harness, not speech. Publishing one
+    // as the transcript shows the listener a file path where the words belong.
+    let spoken = text
+        .lines()
+        .filter(|line| !line.trim_start().starts_with("MEDIA:"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let mut flat = spoken.split_whitespace().collect::<Vec<_>>().join(" ");
     if flat.is_empty() {
         return None;
     }
@@ -2641,6 +2648,36 @@ mod tests {
                 .iter()
                 .any(|part| part.starts_with("alt ")),
             "only audio carries a transcript"
+        );
+    }
+
+    #[test]
+    fn a_media_directive_never_becomes_the_transcript() {
+        // The engine emits `MEDIA:<path>` to ask the harness to publish a file.
+        // It is not speech, and it leaked into `alt` as a file path.
+        let voice = published(MediaKind::Audio, "voice-note-1.mp3", Some(2.9));
+        let tag = imeta_tag(
+            &voice,
+            Some("Here you go, Chief.\nMEDIA:/Users/chief/OUTBOX/sky-short-voice.mp3"),
+        );
+        assert!(
+            tag.contains(&"alt Here you go, Chief.".to_string()),
+            "the spoken words alone belong in alt; got {tag:?}"
+        );
+        assert!(
+            !tag.iter().any(|part| part.contains("MEDIA:")),
+            "no directive may reach the transcript; got {tag:?}"
+        );
+    }
+
+    #[test]
+    fn a_reply_that_is_only_a_media_directive_adds_no_alt() {
+        let voice = published(MediaKind::Audio, "voice-note-1.mp3", Some(2.9));
+        assert!(
+            !imeta_tag(&voice, Some("MEDIA:/Users/chief/OUTBOX/a.mp3"))
+                .iter()
+                .any(|part| part.starts_with("alt ")),
+            "a directive-only reply has no words to show"
         );
     }
 
