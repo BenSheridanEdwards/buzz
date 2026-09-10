@@ -1049,15 +1049,25 @@ pub struct PublishedMedia {
 /// `alt` is what the desktop and mobile voice-note cards fold open, so it has
 /// to read as a sentence rather than a wrapped reply. Whitespace is collapsed
 /// and the text is capped, since a tag value rides in every copy of the event.
+/// Reply text with the engine's `MEDIA:` directives removed.
+///
+/// A `MEDIA:<path>` line asks the harness to publish a file; it is machinery,
+/// never something a reader should see. Anything that turns reply text into
+/// user-visible content has to drop them first.
+pub fn text_without_media_directives(text: &str) -> String {
+    text.lines()
+        .filter(|line| !line.trim_start().starts_with("MEDIA:"))
+        .collect::<Vec<_>>()
+        .join("\n")
+        .trim()
+        .to_string()
+}
+
 fn transcript_alt(text: &str) -> Option<String> {
     const MAX_TRANSCRIPT_BYTES: usize = 1000;
     // A `MEDIA:` line is a directive to the harness, not speech. Publishing one
     // as the transcript shows the listener a file path where the words belong.
-    let spoken = text
-        .lines()
-        .filter(|line| !line.trim_start().starts_with("MEDIA:"))
-        .collect::<Vec<_>>()
-        .join(" ");
+    let spoken = text_without_media_directives(text);
     let mut flat = spoken.split_whitespace().collect::<Vec<_>>().join(" ");
     if flat.is_empty() {
         return None;
@@ -2648,6 +2658,29 @@ mod tests {
                 .iter()
                 .any(|part| part.starts_with("alt ")),
             "only audio carries a transcript"
+        );
+    }
+
+    #[test]
+    fn media_directives_never_reach_reader_visible_text() {
+        // The text-reply fallback publishes this verbatim when the engine
+        // published nothing itself, so a directive here lands in the channel
+        // as the agent's message. It did: a file path appeared as her reply.
+        assert_eq!(
+            text_without_media_directives(
+                "Here you go, Chief.\nMEDIA:/Users/chief/OUTBOX/sky-short-note.mp3"
+            ),
+            "Here you go, Chief."
+        );
+        assert_eq!(
+            text_without_media_directives("MEDIA:/Users/chief/OUTBOX/a.mp3"),
+            "",
+            "a directive-only reply leaves nothing to publish"
+        );
+        assert_eq!(
+            text_without_media_directives("  MEDIA:/x/a.mp3\nreal words"),
+            "real words",
+            "an indented directive is still a directive"
         );
     }
 

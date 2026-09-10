@@ -3538,6 +3538,10 @@ pub async fn run_prompt_task(
                 // Read before `publish_reply_media` takes the capture.
                 let reply_text = agent.acp.peek_turn_text().trim().to_string();
                 publish_reply_media(&ctx, &mut agent, batch.as_ref(), &turn_id, turn_dir_guard);
+                // `MEDIA:` lines are directives to the harness, not words for
+                // a reader. Publishing one verbatim put a file path in the
+                // channel where the reply should have been.
+                let reply_text = crate::media_publish::text_without_media_directives(&reply_text);
                 if !reply_text.is_empty() {
                     publish_text_reply_fallback(&ctx, batch.as_ref(), reply_text);
                 }
