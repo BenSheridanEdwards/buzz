@@ -5,6 +5,7 @@ import 'package:flutter/foundation.dart';
 import '../../shared/relay/relay.dart';
 import '../../shared/custom_emoji/custom_emoji.dart';
 import 'channel_window.dart';
+import 'package:buzz/features/channels/voice_note_transcript_overlay.dart';
 
 enum SystemEventType {
   memberJoined,
@@ -385,6 +386,14 @@ List<TimelineMessage> formatTimeline(
     }
   }
 
+  // Transcripts an agent published for voice notes whose author could not
+  // supply one. Folded onto the note's imeta `alt` below, so the card and its
+  // transcript row need no change. Mirrors the desktop overlay.
+  final transcripts = indexVoiceNoteTranscripts(
+    events,
+    deletedEventIds: deletedIds,
+  );
+
   // 3. Aggregate reactions: targetId → { emoji → { pubkey → eventId } }.
   final reactionMap = <String, Map<String, Map<String, String>>>{};
   final reactionEmojiUrls = <String, Map<String, String>>{};
@@ -486,7 +495,10 @@ List<TimelineMessage> formatTimeline(
         event.kind == EventKind.streamMessageV2 ||
         event.kind == EventKind.streamMessageDiff) {
       final edit = edits[event.id];
-      final effectiveTags = edit?.tags ?? event.tags;
+      final effectiveTags = applyTranscriptToTags(
+        edit?.tags ?? event.tags,
+        transcripts[event.id],
+      );
       // Include both notify (`p`) and reference-only (`mention`) tags —
       // mirrors desktop's resolveMentionNames, so names in messages sent
       // "without inviting" still render as mentions.
