@@ -29,6 +29,8 @@ import 'package:buzz/shared/relay/relay.dart';
 import 'package:buzz/shared/theme/theme.dart';
 import 'package:buzz/shared/widgets/anchored_popover_menu.dart';
 import 'package:buzz/shared/widgets/mobile_tab_footer_backdrop.dart';
+import 'package:buzz/shared/huddle/huddle_media.dart';
+import 'package:buzz/shared/huddle/huddle_session.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 final _pngBytes = Uint8List.fromList([
@@ -193,6 +195,7 @@ Widget _buildComposeBar({
   String composeBarKey = 'compose-bar',
   VoiceNoteRecorder Function()? voiceNoteRecorderFactory,
   VoiceNotePlayerController Function()? voiceNotePlayerFactory,
+  HuddleMedia Function()? huddleMediaFactory,
   bool relayAcceptsAudio = false,
   http.Client? relayInfoClient,
 }) {
@@ -213,6 +216,8 @@ Widget _buildComposeBar({
           voiceNotePlayerFactory,
         ),
       photoLibraryProvider.overrideWithValue(photoLibrary),
+      if (huddleMediaFactory != null)
+        huddleMediaFactoryProvider.overrideWithValue(huddleMediaFactory),
       currentPubkeyProvider.overrideWith((ref) => currentPubkey),
       channelMembersProvider(
         'channel-1',
@@ -460,6 +465,21 @@ class _FakeVoiceNoteUploadService extends MediaUploadService {
       filename: voiceNote.name.replaceFirst('.m4a', '.$extension'),
     );
   }
+}
+
+/// A HuddleMedia that only answers openSystemSettings; every other member
+/// is unreachable from the composer notice under test.
+final class _SettingsProbeMedia implements HuddleMedia {
+  int opened = 0;
+
+  @override
+  Future<bool> openSystemSettings() async {
+    opened++;
+    return true;
+  }
+
+  @override
+  dynamic noSuchMethod(Invocation invocation) => super.noSuchMethod(invocation);
 }
 
 class _FakeVoiceNoteRecorder implements VoiceNoteRecorder {
@@ -5152,6 +5172,71 @@ void main() {
       );
       expect(recorder.started, isFalse);
       expect(find.byKey(const ValueKey('voice-note-recorder')), findsNothing);
+    });
+
+    testWidgets(
+      'a refused microphone shows a styled notice with a way to Settings',
+      (tester) async {
+        final recorder = _DelayedVoiceNoteRecorder();
+        final media = _SettingsProbeMedia();
+        await tester.pumpWidget(
+          _buildComposeBar(
+            uploadService: _FakeVoiceNoteUploadService(),
+            voiceNoteRecorderFactory: () => recorder,
+            huddleMediaFactory: () => media,
+            onSend: (_, _, {mediaTags = const <List<String>>[]}) async {},
+          ),
+        );
+        await _tapMic(tester);
+        recorder.startup.completeError(
+          StateError('Microphone access is required to record a voice note.'),
+        );
+        await tester.pumpAndSettle();
+
+        // A container, not a bare red line.
+        expect(find.byKey(const ValueKey('composer-notice')), findsOneWidget);
+        expect(
+          find.text('Microphone access is required to record a voice note.'),
+          findsOneWidget,
+        );
+        // The permission lives in system settings, so the notice must offer
+        // the way there rather than strand the user (Rule 6).
+        final open = find.byKey(
+          const ValueKey('composer-notice-open-settings'),
+        );
+        expect(open, findsOneWidget);
+        await tester.tap(open);
+        await tester.pump();
+        expect(media.opened, 1);
+      },
+    );
+
+    testWidgets('a non-microphone notice offers no Settings action', (
+      tester,
+    ) async {
+      final recorder = _FakeVoiceNoteRecorder();
+      final uploadService = _FakeVoiceNoteUploadService()
+        ..file = XFile('/tmp/extra.txt');
+      await tester.pumpWidget(
+        _buildComposeBar(
+          uploadService: uploadService,
+          voiceNoteRecorderFactory: () => recorder,
+          huddleMediaFactory: _SettingsProbeMedia.new,
+          onSend: (_, _, {mediaTags = const <List<String>>[]}) async {},
+        ),
+      );
+      await _tapMic(tester);
+      await tester.tap(find.byKey(const ValueKey('voice-note-recorder-send')));
+      await tester.pumpAndSettle();
+      await _openAttachmentMenu(tester);
+      await tester.tap(find.text('Files'));
+      await tester.pumpAndSettle();
+
+      expect(find.byKey(const ValueKey('composer-notice')), findsOneWidget);
+      expect(
+        find.byKey(const ValueKey('composer-notice-open-settings')),
+        findsNothing,
+      );
     });
 
     testWidgets('voice note stays the only attachment like desktop', (
