@@ -4776,11 +4776,8 @@ void main() {
         ),
       );
 
-      await _expandComposer(tester);
-      await _openAttachmentMenu(tester);
-      await tester.tap(find.text('Voice note'));
-      await tester.pumpAndSettle();
-      await tester.tap(find.byKey(const ValueKey('voice-note-recorder-stop')));
+      await _tapMic(tester);
+      await tester.tap(find.byKey(const ValueKey('voice-note-recorder-send')));
       await tester.pumpAndSettle();
       await tester.tap(
         find
@@ -4897,12 +4894,9 @@ void main() {
           ),
         );
 
-        await _expandComposer(tester);
-        await _openAttachmentMenu(tester);
-        await tester.tap(find.text('Voice note'));
-        await tester.pumpAndSettle();
+        await _tapMic(tester);
         await tester.tap(
-          find.byKey(const ValueKey('voice-note-recorder-stop')),
+          find.byKey(const ValueKey('voice-note-recorder-send')),
         );
         await tester.pumpAndSettle();
         await tester.tap(
