@@ -477,6 +477,7 @@ double? effectiveFontSizeForText(
 }
 
 void main() {
+  _threadPhantomKeyboardTests();
   setUp(() async {
     SharedPreferences.setMockInitialValues({});
     _testPrefs = await SharedPreferences.getInstance();
@@ -14970,4 +14971,170 @@ class _TestNavigatorObserver extends NavigatorObserver {
     pushCount += 1;
     super.didPush(route, previousRoute);
   }
+}
+
+// ---------------------------------------------------------------------------
+// #40: the thread view opened while the channel composer still owned the
+// keyboard kept a keyboard-sized inset after the keyboard closed, so the
+// composer floated mid-screen over the conversation with empty space below.
+// ---------------------------------------------------------------------------
+
+void _threadPhantomKeyboardTests() {
+  Future<Finder> pumpThreadUnderAndroid(
+    WidgetTester tester, {
+    required bool keyboardUpAtPush,
+  }) async {
+    tester.view.physicalSize = const Size(390, 844);
+    tester.view.devicePixelRatio = 1;
+    addTearDown(() {
+      tester.view.resetPhysicalSize();
+      tester.view.resetDevicePixelRatio();
+      tester.view.resetViewInsets();
+    });
+    final rootEvent = _textMsg(
+      id: 'thread-root',
+      pubkey: 'alice',
+      content: 'Thread root',
+      createdAt: 1000,
+    );
+    final replies = [
+      for (var i = 0; i < 3; i++)
+        _textMsg(
+          id: 'reply-$i',
+          pubkey: 'bob',
+          content: 'Reply $i',
+          createdAt: 1100 + i,
+          extraTags: const [
+            ['e', 'thread-root', '', 'reply'],
+          ],
+        ),
+    ];
+    await tester.pumpWidget(
+      _buildTestable(
+        messages: [rootEvent],
+        threadReplies: {'thread-root': replies},
+        users: const {
+          'alice': UserProfile(pubkey: 'alice', displayName: 'Alice'),
+          'bob': UserProfile(pubkey: 'bob', displayName: 'Bob'),
+        },
+      ),
+    );
+    await tester.pumpAndSettle();
+    // The channel composer owns the keyboard at the moment of the push.
+    if (keyboardUpAtPush) {
+      tester.view.viewInsets = const FakeViewPadding(bottom: 300);
+      await tester.pump();
+    }
+    final threadHead = formatTimeline([rootEvent]).single;
+    Navigator.of(tester.element(find.byType(ChannelDetailPage))).push(
+      MaterialPageRoute<void>(
+        builder: (_) => ThreadDetailPage(
+          threadHead: threadHead,
+          allMessages: [threadHead],
+          channelId: _channelId,
+          currentPubkey: 'self',
+          isMember: true,
+          isArchived: false,
+        ),
+      ),
+    );
+    await tester.pumpAndSettle();
+    await tester.pump(androidImeMetricsSettleDelay);
+    await tester.pump(const Duration(milliseconds: 50));
+    return find.byKey(const ValueKey('thread-composer-dock'));
+  }
+
+  testWidgets(
+    'a thread never lifts for a keyboard it does not own, even if the inset '
+    'never reports closing',
+    (tester) async {
+      // Android can keep reporting the previous route's IME inset after the
+      // keyboard is visually gone. A thread has no focused field when it
+      // opens, so that inset is never its own: capturing it at first build
+      // is what pinned the composer mid-screen over a blank band (#40).
+      final previousPlatform = debugDefaultTargetPlatformOverride;
+      debugDefaultTargetPlatformOverride = TargetPlatform.android;
+      try {
+        final dock = await pumpThreadUnderAndroid(
+          tester,
+          keyboardUpAtPush: true,
+        );
+        expect(dock, findsOneWidget);
+        expect(
+          tester.getBottomLeft(dock).dy,
+          closeTo(844, 1),
+          reason:
+              'nothing on this thread has focus, so a reported keyboard inset '
+              'belongs to the route underneath and must not lift the composer',
+        );
+        // The timeline must not reserve the phantom band either: that is
+        // what pushed the message text and the Latest pill up mid-screen.
+        final list = tester.widget<ScrollablePositionedList>(
+          find.byKey(const ValueKey('thread-message-list')),
+        );
+        expect(
+          list.padding!.bottom,
+          lessThan(300),
+          reason: 'the timeline must not pad for a keyboard it does not own',
+        );
+      } finally {
+        debugDefaultTargetPlatformOverride = previousPlatform;
+      }
+    },
+  );
+
+  testWidgets(
+    'a thread lifts for its own keyboard and rests again once it closes',
+    (tester) async {
+      final previousPlatform = debugDefaultTargetPlatformOverride;
+      debugDefaultTargetPlatformOverride = TargetPlatform.android;
+      try {
+        final dock = await pumpThreadUnderAndroid(
+          tester,
+          keyboardUpAtPush: false,
+        );
+        expect(tester.getBottomLeft(dock).dy, closeTo(844, 1));
+
+        // The thread's own composer takes focus and the keyboard rises.
+        final before = tester.getSize(dock).height;
+        final hint = find.text('Reply in thread\u2026');
+        expect(hint, findsOneWidget, reason: 'hint present');
+        final hintRect = tester.getRect(hint);
+        final dockRect = tester.getRect(dock);
+        await tester.tap(hint, warnIfMissed: false);
+        await tester.pump();
+        await tester.pump(const Duration(milliseconds: 300));
+        await tester.pumpAndSettle();
+        expect(
+          find.byType(TextField),
+          findsWidgets,
+          reason:
+              'tapping the hint must expand the composer (dock was $before, '
+              'hint at $hintRect, dock at $dockRect)',
+        );
+        await tester.showKeyboard(find.byType(TextField).last);
+        await tester.pumpAndSettle();
+        tester.view.viewInsets = const FakeViewPadding(bottom: 300);
+        await tester.pump();
+        await tester.pump(androidImeMetricsSettleDelay);
+        await tester.pump(const Duration(milliseconds: 50));
+        expect(
+          tester.getBottomLeft(dock).dy,
+          lessThan(844 - 100),
+          reason: 'the composer owns this keyboard and must sit above it',
+        );
+
+        // Focus leaves and the keyboard closes: back to the bottom.
+        FocusManager.instance.primaryFocus?.unfocus();
+        await tester.pump();
+        tester.view.viewInsets = FakeViewPadding.zero;
+        await tester.pump();
+        await tester.pump(androidImeMetricsSettleDelay);
+        await tester.pump(const Duration(milliseconds: 50));
+        expect(tester.getBottomLeft(dock).dy, closeTo(844, 1));
+      } finally {
+        debugDefaultTargetPlatformOverride = previousPlatform;
+      }
+    },
+  );
 }

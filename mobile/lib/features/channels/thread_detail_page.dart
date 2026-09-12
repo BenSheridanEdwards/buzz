@@ -263,7 +263,11 @@ class ThreadDetailPage extends HookConsumerWidget {
     final composerHasFocus = useListenable(composerFocusNode).hasFocus;
     final viewportHeight = useListenable(listViewport.height).value;
     final previousViewportHeight = useRef(viewportHeight);
-    final settledImeLift = usesFixedAndroidImeViewport
+    // A thread opens with nothing focused, so a keyboard inset reported at
+    // that moment belongs to the route underneath. Only the thread's own
+    // composer can own the keyboard; until it has focus, no inset is applied
+    // to the timeline (and none to the composer, see AndroidImeLift below).
+    final settledImeLift = usesFixedAndroidImeViewport && composerHasFocus
         ? (settledImeBottomInset.value -
                   MediaQuery.viewPaddingOf(context).bottom)
               .clamp(0.0, double.infinity)
@@ -926,6 +930,7 @@ class ThreadDetailPage extends HookConsumerWidget {
             ),
           if (isMember && !isArchived)
             AndroidImeLift(
+              ownsKeyboard: composerHasFocus,
               child: Align(
                 alignment: Alignment.bottomCenter,
                 child: ComposerDockSizeReporter(
