@@ -21,6 +21,7 @@ export const productionBuildIdentity = Object.freeze({
 export function demoBuildConfig(
   rawName,
   buildId = randomBytes(8).toString("hex"),
+  iconDir = process.env.BUZZ_DEMO_ICON_DIR || undefined,
 ) {
   if (typeof rawName !== "string") throw new Error("Demo name must be text");
   const name = rawName.trim().replace(/\s+/g, " ");
@@ -64,7 +65,24 @@ export function demoBuildConfig(
       productName,
       identifier: `${PRODUCTION_IDENTIFIER}.demo.${slug}`,
       plugins: { "deep-link": { desktop: { schemes: [`buzz-demo-${slug}`] } } },
-      bundle: { targets: ["app"] },
+      bundle: {
+        targets: ["app"],
+        // A demo may carry its own identity. The directory is relative to
+        // src-tauri and must hold the same five files tauri.conf.json lists,
+        // so the demo's icon replaces the production one wholesale rather
+        // than mixing the two.
+        ...(iconDir
+          ? {
+              icon: [
+                `${iconDir}/32x32.png`,
+                `${iconDir}/128x128.png`,
+                `${iconDir}/128x128@2x.png`,
+                `${iconDir}/icon.icns`,
+                "icons/icon.ico",
+              ],
+            }
+          : {}),
+      },
     },
   };
 }
