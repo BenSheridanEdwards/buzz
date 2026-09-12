@@ -292,7 +292,22 @@ fn read_bounded(path: &Path, limit: u64) -> std::io::Result<Vec<u8>> {
     Ok(bytes)
 }
 
+/// Directories inside a profile that may hold its avatar, in precedence order.
+///
+/// Hermes writes the avatar under `assets/`; every profile in a real fleet
+/// has one there. Some profiles also carry a copy at the root, which was the
+/// only place this looked and is why a profile with the canonical layout
+/// alone came through with no avatar (#36). The root still wins when both
+/// exist so nothing changes for a profile that has one.
+const AVATAR_DIRS: [&str; 2] = ["", "assets"];
+
 fn read_avatar_data_url(dir: &Path) -> Option<String> {
+    AVATAR_DIRS
+        .iter()
+        .find_map(|sub| read_avatar_data_url_in(&dir.join(sub)))
+}
+
+fn read_avatar_data_url_in(dir: &Path) -> Option<String> {
     AVATAR_CANDIDATES.iter().find_map(|(file_name, mime)| {
         let candidate = dir.join(file_name);
         let metadata = std::fs::metadata(&candidate).ok()?;
@@ -587,6 +602,45 @@ mod tests {
         assert_eq!(
             profile.avatar_data_url.as_deref(),
             Some("data:image/jpeg;base64,/9j/4A==")
+        );
+    }
+
+    #[test]
+    fn reads_the_avatar_from_the_assets_directory() {
+        // The canonical Hermes layout: SOUL at the root, avatar under assets/.
+        let temp = tempfile::tempdir().expect("tempdir");
+        let echo = temp.path().join("echo");
+        write(&echo, "SOUL.md", b"# SOUL.md \xe2\x80\x94 Echo\n");
+        write(&echo, "config.yaml", b"model: x\n");
+        write(
+            &echo.join("assets"),
+            "avatar.png",
+            &[0x89, 0x50, 0x4E, 0x47],
+        );
+
+        let profiles = scan(temp.path());
+        assert_eq!(profiles.len(), 1);
+        assert_eq!(
+            profiles[0].avatar_data_url.as_deref(),
+            Some("data:image/png;base64,iVBORw=="),
+            "an avatar under assets/ must be offered"
+        );
+    }
+
+    #[test]
+    fn a_root_avatar_still_wins_over_the_assets_one() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let sky = temp.path().join("sky");
+        write(&sky, "SOUL.md", b"# SOUL.md \xe2\x80\x94 Sky\n");
+        write(&sky, "config.yaml", b"model: x\n");
+        write(&sky, "avatar.jpg", &[0xFF, 0xD8, 0xFF, 0xE0]);
+        write(&sky.join("assets"), "avatar.png", &[0x89, 0x50, 0x4E, 0x47]);
+
+        let profiles = scan(temp.path());
+        assert_eq!(
+            profiles[0].avatar_data_url.as_deref(),
+            Some("data:image/jpeg;base64,/9j/4A=="),
+            "the root copy keeps precedence so existing profiles are unchanged"
         );
     }
 
