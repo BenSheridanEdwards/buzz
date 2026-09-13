@@ -165,7 +165,10 @@ mod tests {
     #[test]
     fn profile_scoping_appends_and_respects_an_existing_query() {
         assert_eq!(endpoint_url("http://h/api", ""), "http://h/api");
-        assert_eq!(endpoint_url("http://h/api", " sky "), "http://h/api?profile=sky");
+        assert_eq!(
+            endpoint_url("http://h/api", " sky "),
+            "http://h/api?profile=sky"
+        );
         assert_eq!(
             endpoint_url("http://h/api?x=1", "echo"),
             "http://h/api?x=1&profile=echo"
@@ -174,7 +177,10 @@ mod tests {
 
     #[test]
     fn normalize_folds_newlines_into_one_line() {
-        assert_eq!(normalize("hello\nthere  chief\n").as_deref(), Some("hello there chief"));
+        assert_eq!(
+            normalize("hello\nthere  chief\n").as_deref(),
+            Some("hello there chief")
+        );
     }
 
     #[test]
@@ -250,5 +256,104 @@ mod e2e {
         )
         .await;
         assert!(out.is_none(), "an unauthenticated call must not transcribe");
+    }
+
+    /// The relay half of the pipeline, against a real relay: a transcript for
+    /// a note is stored and comes back with the channel window's aux closure,
+    /// it never counts as a reply, and one dressed up as a reply is refused.
+    ///
+    /// Needs `BUZZ_ACP_E2E_RELAY_URL` (http(s) base), `BUZZ_ACP_E2E_PRIVATE_KEY`
+    /// (a relay member) and `BUZZ_ACP_E2E_CHANNEL_ID` (a channel that member
+    /// can post in). Point it at the test relay, never production.
+    #[tokio::test]
+    #[ignore = "needs a running relay and a member key"]
+    async fn e2e_relay_stores_a_transcript_as_an_annotation_not_a_reply() {
+        let relay = env("BUZZ_ACP_E2E_RELAY_URL");
+        let key = env("BUZZ_ACP_E2E_PRIVATE_KEY");
+        let channel = env("BUZZ_ACP_E2E_CHANNEL_ID");
+        assert!(
+            !relay.is_empty() && !key.is_empty() && !channel.is_empty(),
+            "e2e env not set"
+        );
+        let channel_id = uuid::Uuid::parse_str(&channel).expect("channel id");
+        let rest = crate::relay::RestClient {
+            http: reqwest::Client::new(),
+            base_url: relay.trim_end_matches('/').to_string(),
+            keys: nostr::Keys::parse(&key).expect("member key"),
+            auth_tag_json: None,
+        };
+
+        let note = buzz_sdk::build_message(
+            channel_id,
+            "e2e stand-in for a voice note",
+            None,
+            &[],
+            false,
+            &[],
+            &[],
+        )
+        .expect("note builder")
+        .sign_with_keys(&rest.keys)
+        .expect("sign note");
+        rest.submit_event(&note)
+            .await
+            .expect("the note is accepted");
+
+        let transcript = buzz_sdk::build_voice_note_transcript(
+            channel_id,
+            note.id,
+            "hello from the relay round trip",
+        )
+        .expect("transcript builder")
+        .sign_with_keys(&rest.keys)
+        .expect("sign transcript");
+        rest.submit_event(&transcript)
+            .await
+            .expect("the transcript is accepted");
+
+        let disguised = nostr::EventBuilder::new(
+            nostr::Kind::Custom(buzz_core::kind::KIND_VOICE_NOTE_TRANSCRIPT as u16),
+            "not a reply",
+        )
+        .tags([
+            nostr::Tag::parse(["h", &channel]).unwrap(),
+            nostr::Tag::parse(["e", &note.id.to_hex(), "", "reply"]).unwrap(),
+        ])
+        .sign_with_keys(&rest.keys)
+        .expect("sign disguised");
+        let refused = rest.submit_event(&disguised).await;
+        assert!(
+            matches!(&refused, Err(e) if e.to_string().contains("400")),
+            "a transcript with a reply marker must be refused: {refused:?}"
+        );
+
+        let window = rest
+            .query_raw(&[serde_json::json!({
+                "#h": [channel],
+                "kinds": [buzz_core::kind::KIND_STREAM_MESSAGE],
+                "limit": 5,
+                "top_level": true,
+                "include_aux": true,
+                "include_summaries": true,
+            })])
+            .await
+            .expect("channel window");
+        let events = window.as_array().expect("window is an array");
+        let transcript_hex = transcript.id.to_hex();
+        assert!(
+            events.iter().any(|e| e["id"] == transcript_hex),
+            "the aux closure must carry the transcript"
+        );
+        let note_hex = note.id.to_hex();
+        let counted_as_thread = events.iter().any(|e| {
+            e["kind"] == buzz_core::kind::KIND_THREAD_SUMMARY
+                && e["tags"]
+                    .as_array()
+                    .is_some_and(|tags| tags.iter().any(|t| t[0] == "e" && t[1] == note_hex))
+        });
+        assert!(
+            !counted_as_thread,
+            "a transcript must not give the note a thread summary"
+        );
     }
 }
