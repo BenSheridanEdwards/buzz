@@ -407,12 +407,15 @@ fn extract_page_offset(raw: &Value, limit: Option<i64>) -> Option<i64> {
 const BRIDGE_WINDOW_DEFAULT_LIMIT: u32 = 50;
 const BRIDGE_WINDOW_MAX_LIMIT: u32 = 200;
 
-/// Aux closure kinds: reactions, deletions (NIP-09 + NIP-29), edits.
-const WINDOW_AUX_KINDS: [u32; 4] = [
+/// Aux closure kinds: reactions, deletions (NIP-09 + NIP-29), edits, and
+/// voice note transcripts (an annotation a client folds onto its note, so a
+/// cold load has to carry it with the row).
+const WINDOW_AUX_KINDS: [u32; 5] = [
     buzz_core::kind::KIND_DELETION,
     buzz_core::kind::KIND_REACTION,
     buzz_core::kind::KIND_NIP29_DELETE_EVENT,
     buzz_core::kind::KIND_STREAM_MESSAGE_EDIT,
+    buzz_core::kind::KIND_VOICE_NOTE_TRANSCRIPT,
 ];
 /// Second-hop kinds: deletions targeting aux events (delete-of-a-reaction).
 const WINDOW_AUX_DELETE_KINDS: [u32; 2] = [
@@ -2627,6 +2630,14 @@ mod postgres_tests {
                 "a Redis outage must yield Some(Err(500)), not a fake-empty success: {other:?}"
             ),
         }
+    }
+
+    #[test]
+    fn aux_closure_carries_voice_note_transcripts() {
+        // A transcript is folded onto its note by the client, so a cold load
+        // that skipped it would show the note without its words until the
+        // next live delivery.
+        assert!(WINDOW_AUX_KINDS.contains(&buzz_core::kind::KIND_VOICE_NOTE_TRANSCRIPT));
     }
 
     #[test]
