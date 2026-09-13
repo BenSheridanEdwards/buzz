@@ -165,7 +165,10 @@ mod tests {
     #[test]
     fn profile_scoping_appends_and_respects_an_existing_query() {
         assert_eq!(endpoint_url("http://h/api", ""), "http://h/api");
-        assert_eq!(endpoint_url("http://h/api", " sky "), "http://h/api?profile=sky");
+        assert_eq!(
+            endpoint_url("http://h/api", " sky "),
+            "http://h/api?profile=sky"
+        );
         assert_eq!(
             endpoint_url("http://h/api?x=1", "echo"),
             "http://h/api?x=1&profile=echo"
@@ -174,7 +177,10 @@ mod tests {
 
     #[test]
     fn normalize_folds_newlines_into_one_line() {
-        assert_eq!(normalize("hello\nthere  chief\n").as_deref(), Some("hello there chief"));
+        assert_eq!(
+            normalize("hello\nthere  chief\n").as_deref(),
+            Some("hello there chief")
+        );
     }
 
     #[test]
