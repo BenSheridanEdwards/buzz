@@ -5809,6 +5809,19 @@ fn reply_text_needs_own_message(media_message_carries_text: bool, reply_text: &s
     !media_message_carries_text && !reply_text.is_empty()
 }
 
+/// Thread tags for a reply the harness posts on the engine's behalf: the
+/// thread root as both root and parent, so the reply sits flat at layer 1
+/// whether the trigger was the root or a message inside the thread. The
+/// media reply (`MediaPublisher::publish_message`) anchors the same way.
+fn harness_reply_thread_tags(channel_id: Uuid, trigger: &nostr::Event) -> crate::queue::ThreadTags {
+    let target = crate::media_publish::ReplyTarget::for_trigger(channel_id, trigger);
+    crate::queue::ThreadTags {
+        root_event_id: Some(target.root_event_id.to_hex()),
+        parent_event_id: Some(target.root_event_id.to_hex()),
+        mentioned_pubkeys: Vec::new(),
+    }
+}
+
 /// Wait out [`TEXT_REPLY_SETTLE`], then post `text` unless the engine already
 /// published a message for this turn itself.
 async fn publish_text_reply_after_settle(
@@ -5821,14 +5834,11 @@ async fn publish_text_reply_after_settle(
     if agent_published_message_since(&ctx.rest_client, channel_id, trigger.created_at).await {
         return;
     }
-    // Anchor exactly like a media reply: the harness owns the reply
-    // destination and a threaded reply is the intended shape.
-    let target = crate::media_publish::ReplyTarget::for_trigger(channel_id, trigger);
-    let thread_tags = crate::queue::ThreadTags {
-        root_event_id: Some(target.root_event_id.to_hex()),
-        parent_event_id: Some(trigger.id.to_hex()),
-        mentioned_pubkeys: Vec::new(),
-    };
+    // Anchor exactly like a media reply, and like the rule the prompt gives
+    // the engine: a human-facing reply stays at layer 1, parent = root. With
+    // the trigger as parent, an answer to a message written inside a thread
+    // became a reply to that reply, and every exchange nested one deeper.
+    let thread_tags = harness_reply_thread_tags(channel_id, trigger);
     tracing::info!(
         target: "buzz_acp::pool::prompt",
         channel = %channel_id,
@@ -13351,6 +13361,41 @@ done"#
 #[cfg(test)]
 mod text_reply_fallback_tests {
     use super::*;
+
+    fn event_with_tags(tags: Vec<Vec<&str>>) -> nostr::Event {
+        let tags: Vec<nostr::Tag> = tags
+            .into_iter()
+            .map(|t| nostr::Tag::parse(t).unwrap())
+            .collect();
+        nostr::EventBuilder::new(nostr::Kind::Custom(9), "hi")
+            .tags(tags)
+            .sign_with_keys(&nostr::Keys::generate())
+            .unwrap()
+    }
+
+    #[test]
+    fn a_reply_to_a_message_inside_a_thread_stays_at_layer_one() {
+        // Chief writes inside a thread; the answer must hang off the thread
+        // root, not off his message, or every exchange nests one deeper.
+        let root = "ab".repeat(32);
+        let trigger = event_with_tags(vec![
+            vec!["h", "chan"],
+            vec!["e", &root, "", "root"],
+            vec!["e", &root, "", "reply"],
+        ]);
+        let tags = harness_reply_thread_tags(Uuid::new_v4(), &trigger);
+        assert_eq!(tags.root_event_id.as_deref(), Some(root.as_str()));
+        assert_eq!(tags.parent_event_id.as_deref(), Some(root.as_str()));
+    }
+
+    #[test]
+    fn a_reply_to_a_top_level_message_opens_its_thread() {
+        let trigger = event_with_tags(vec![vec!["h", "chan"]]);
+        let tags = harness_reply_thread_tags(Uuid::new_v4(), &trigger);
+        let id = trigger.id.to_hex();
+        assert_eq!(tags.root_event_id.as_deref(), Some(id.as_str()));
+        assert_eq!(tags.parent_event_id.as_deref(), Some(id.as_str()));
+    }
 
     #[test]
     fn words_ride_on_the_media_message() {
