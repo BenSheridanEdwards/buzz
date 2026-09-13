@@ -183,6 +183,7 @@ describe("useHermesProfilePicker", () => {
         OPENAI_API_KEY: "sk",
         HERMES_HOME: rawBond.path,
         HERMES_ACP_SKIP_CONFIGURED_MCP: "0",
+        BUZZ_ACP_TRANSCRIBE_PROFILE: "bond",
       },
       parallelism: "1",
     });
@@ -224,6 +225,7 @@ describe("useHermesProfilePicker", () => {
     const inheritedEnvVars = {
       HERMES_HOME: rawBond.path,
       HERMES_ACP_SKIP_CONFIGURED_MCP: "0",
+      BUZZ_ACP_TRANSCRIBE_PROFILE: "bond",
     };
     const mounted = mountPicker({
       // The instance layer is empty: instances are never seeded from their
@@ -298,6 +300,7 @@ describe("useHermesProfilePicker", () => {
     assert.deepEqual(applied[0].envVars, {
       HERMES_HOME: rawSky.path,
       HERMES_ACP_SKIP_CONFIGURED_MCP: "0",
+      BUZZ_ACP_TRANSCRIBE_PROFILE: "sky",
     });
     mounted.unmount();
   });

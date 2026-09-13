@@ -1083,11 +1083,22 @@ fn transcript_alt(text: &str) -> Option<String> {
     Some(flat)
 }
 
+/// What a published voice note says about itself beyond the bytes.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct AudioNoteHints<'a> {
+    /// The turn's spoken text, attached as `alt`: the field both clients
+    /// read for the transcript row.
+    pub transcript: Option<&'a str>,
+    /// The rate this voice is meant to be heard at, attached as
+    /// `playback_speed`: the rate both clients start the note at.
+    pub playback_speed: Option<f64>,
+}
+
 /// Build the `imeta` tag for one published file.
 ///
-/// `transcript` is the turn's spoken text; it is attached as `alt` on audio
-/// only, which is the field both clients read for the transcript row.
-pub fn imeta_tag(item: &PublishedMedia, transcript: Option<&str>) -> Vec<String> {
+/// `hints` apply to audio only; an image or a document never carries a
+/// transcript or a playback rate.
+pub fn imeta_tag(item: &PublishedMedia, hints: AudioNoteHints<'_>) -> Vec<String> {
     let d = &item.descriptor;
     let mut tag = vec![
         "imeta".to_string(),
@@ -1105,8 +1116,11 @@ pub fn imeta_tag(item: &PublishedMedia, transcript: Option<&str>) -> Vec<String>
         tag.push(format!("duration {duration}"));
     }
     if matches!(item.kind, MediaKind::Audio) {
-        if let Some(alt) = transcript.and_then(transcript_alt) {
+        if let Some(alt) = hints.transcript.and_then(transcript_alt) {
             tag.push(format!("alt {alt}"));
+        }
+        if let Some(speed) = hints.playback_speed.filter(|s| s.is_finite()) {
+            tag.push(format!("playback_speed {speed}"));
         }
     }
     tag.push(format!("filename {}", item.filename));
@@ -1143,13 +1157,10 @@ fn markdown_link_text(name: &str) -> String {
 /// Compose the single kind-9 body and tag set for a reply's uploads.
 pub fn compose_message(
     items: &[PublishedMedia],
-    transcript: Option<&str>,
+    hints: AudioNoteHints<'_>,
 ) -> (String, Vec<Vec<String>>) {
     let body = items.iter().map(body_line).collect::<Vec<_>>().join("\n");
-    let tags = items
-        .iter()
-        .map(|item| imeta_tag(item, transcript))
-        .collect();
+    let tags = items.iter().map(|item| imeta_tag(item, hints)).collect();
     (body, tags)
 }
 
@@ -1163,6 +1174,9 @@ pub struct MediaPublisher<'a> {
     pub ffmpeg: Option<&'a Path>,
     /// The turn's reply text, attached to published audio as its transcript.
     pub transcript: Option<&'a str>,
+    /// The agent's configured voice rate, attached to published audio as
+    /// its `playback_speed` hint.
+    pub playback_speed: Option<f64>,
 }
 
 /// Outcome of publishing one reply's media.
@@ -1590,7 +1604,13 @@ impl MediaPublisher<'_> {
         target: &ReplyTarget,
         items: &[PublishedMedia],
     ) -> Result<String, String> {
-        let (content, media_tags) = compose_message(items, self.transcript);
+        let (content, media_tags) = compose_message(
+            items,
+            AudioNoteHints {
+                transcript: self.transcript,
+                playback_speed: self.playback_speed,
+            },
+        );
         let thread_ref = buzz_sdk::ThreadRef {
             root_event_id: target.root_event_id,
             parent_event_id: target.root_event_id,
@@ -2630,12 +2650,52 @@ mod tests {
         }
     }
 
+    fn words(text: &str) -> AudioNoteHints<'_> {
+        AudioNoteHints {
+            transcript: Some(text),
+            playback_speed: None,
+        }
+    }
+
+    #[test]
+    fn a_voice_note_carries_its_voice_rate_as_playback_speed() {
+        // Both clients start the note at this rate, so a voice tuned to
+        // 1.1x sounds the same on every device without a tap.
+        let voice = published(MediaKind::Audio, "voice-note-1.mp3", Some(2.9));
+        let hints = AudioNoteHints {
+            transcript: Some("Hello Chief."),
+            playback_speed: Some(1.1),
+        };
+        let tag = imeta_tag(&voice, hints);
+        assert!(
+            tag.contains(&"playback_speed 1.1".to_string()),
+            "audio must carry the rate hint; got {tag:?}"
+        );
+        // No hint configured: nothing published, so clients fall back to 1x.
+        assert!(!imeta_tag(&voice, words("Hello Chief."))
+            .iter()
+            .any(|p| p.starts_with("playback_speed")));
+        // An image never carries a rate.
+        let image = published(MediaKind::Image, "shot.png", None);
+        assert!(!imeta_tag(&image, hints)
+            .iter()
+            .any(|p| p.starts_with("playback_speed")));
+        // A rate that is not a number is dropped rather than published.
+        let broken = AudioNoteHints {
+            transcript: None,
+            playback_speed: Some(f64::NAN),
+        };
+        assert!(!imeta_tag(&voice, broken)
+            .iter()
+            .any(|p| p.starts_with("playback_speed")));
+    }
+
     #[test]
     fn a_voice_note_carries_its_spoken_words_as_alt() {
         // `alt` is the field both clients fold open as the transcript row.
         // Without it a voice note arrives as an unlabelled play button.
         let voice = published(MediaKind::Audio, "voice-note-1.mp3", Some(2.9));
-        let tag = imeta_tag(&voice, Some("Hello Chief, Sky here."));
+        let tag = imeta_tag(&voice, words("Hello Chief, Sky here."));
         assert!(
             tag.contains(&"alt Hello Chief, Sky here.".to_string()),
             "audio must carry the spoken text as alt; got {tag:?}"
@@ -2645,7 +2705,7 @@ mod tests {
     #[test]
     fn a_transcript_is_flattened_and_never_attached_to_a_non_audio_file() {
         let voice = published(MediaKind::Audio, "voice-note-1.mp3", Some(2.9));
-        let tag = imeta_tag(&voice, Some("  first line\n\n  second line  "));
+        let tag = imeta_tag(&voice, words("  first line\n\n  second line  "));
         assert!(
             tag.contains(&"alt first line second line".to_string()),
             "a wrapped reply must flatten to one line; got {tag:?}"
@@ -2654,7 +2714,7 @@ mod tests {
         // An image's alt would be a lie: the text was never about the image.
         let image = published(MediaKind::Image, "shot.png", None);
         assert!(
-            !imeta_tag(&image, Some("Hello Chief"))
+            !imeta_tag(&image, words("Hello Chief"))
                 .iter()
                 .any(|part| part.starts_with("alt ")),
             "only audio carries a transcript"
@@ -2691,7 +2751,7 @@ mod tests {
         let voice = published(MediaKind::Audio, "voice-note-1.mp3", Some(2.9));
         let tag = imeta_tag(
             &voice,
-            Some("Here you go, Chief.\nMEDIA:/Users/chief/OUTBOX/sky-short-voice.mp3"),
+            words("Here you go, Chief.\nMEDIA:/Users/chief/OUTBOX/sky-short-voice.mp3"),
         );
         assert!(
             tag.contains(&"alt Here you go, Chief.".to_string()),
@@ -2707,7 +2767,7 @@ mod tests {
     fn a_reply_that_is_only_a_media_directive_adds_no_alt() {
         let voice = published(MediaKind::Audio, "voice-note-1.mp3", Some(2.9));
         assert!(
-            !imeta_tag(&voice, Some("MEDIA:/Users/chief/OUTBOX/a.mp3"))
+            !imeta_tag(&voice, words("MEDIA:/Users/chief/OUTBOX/a.mp3"))
                 .iter()
                 .any(|part| part.starts_with("alt ")),
             "a directive-only reply has no words to show"
@@ -2719,14 +2779,14 @@ mod tests {
         let voice = published(MediaKind::Audio, "voice-note-1.mp3", Some(2.9));
         for text in ["", "   ", "\n\t "] {
             assert!(
-                !imeta_tag(&voice, Some(text))
+                !imeta_tag(&voice, words(text))
                     .iter()
                     .any(|part| part.starts_with("alt ")),
                 "blank text must not produce an empty alt"
             );
         }
         assert!(
-            !imeta_tag(&voice, None)
+            !imeta_tag(&voice, AudioNoteHints::default())
                 .iter()
                 .any(|part| part.starts_with("alt ")),
             "no transcript means no alt"
@@ -2738,7 +2798,7 @@ mod tests {
         let url = format!("https://relay.example/media/{}.bin", "a".repeat(64));
         let voice = published(MediaKind::Audio, "voice-note-1700.mp3", Some(3.25));
         assert_eq!(
-            imeta_tag(&voice, None),
+            imeta_tag(&voice, AudioNoteHints::default()),
             vec![
                 "imeta".to_string(),
                 format!("url {url}"),
@@ -2756,14 +2816,14 @@ mod tests {
         ));
 
         let image = published(MediaKind::Image, "shot.png", None);
-        assert!(imeta_tag(&image, None).contains(&"dim 16x16".to_string()));
+        assert!(imeta_tag(&image, AudioNoteHints::default()).contains(&"dim 16x16".to_string()));
         assert_eq!(body_line(&image), format!("![image]({url})"));
         let video = published(MediaKind::Video, "clip.mp4", Some(1.0));
         assert_eq!(body_line(&video), format!("![video]({url})"));
         let file = published(MediaKind::File, "doc.pdf", None);
         assert_eq!(body_line(&file), format!("[doc.pdf]({url})"));
 
-        let (body, tags) = compose_message(&[voice, image], None);
+        let (body, tags) = compose_message(&[voice, image], AudioNoteHints::default());
         assert_eq!(body.lines().count(), 2);
         assert_eq!(tags.len(), 2);
         assert_eq!(voice_note_filename("mp4", 12), "voice-note-12.mp4");
@@ -2934,6 +2994,7 @@ mod tests {
             audio_support: &cache,
             ffmpeg: None,
             transcript: None,
+            playback_speed: None,
         };
         let keys = Keys::generate();
         let trigger = nostr::EventBuilder::new(nostr::Kind::Custom(9), "say hi")
@@ -3037,6 +3098,7 @@ mod tests {
             audio_support: &cache,
             ffmpeg: None,
             transcript: None,
+            playback_speed: None,
         };
         let keys = Keys::generate();
         let trigger = nostr::EventBuilder::new(nostr::Kind::Custom(9), "x")
@@ -3089,6 +3151,7 @@ mod tests {
             audio_support: &cache,
             ffmpeg: None,
             transcript: None,
+            playback_speed: None,
         };
         let keys = Keys::generate();
         let trigger = nostr::EventBuilder::new(nostr::Kind::Custom(9), "x")
@@ -3129,6 +3192,7 @@ mod tests {
             audio_support: &cache,
             ffmpeg: None,
             transcript: None,
+            playback_speed: None,
         };
         let keys = Keys::generate();
         let trigger = nostr::EventBuilder::new(nostr::Kind::Custom(9), "x")
@@ -3185,6 +3249,7 @@ mod tests {
             audio_support: &cache,
             ffmpeg: None,
             transcript: None,
+            playback_speed: None,
         };
         let keys = Keys::generate();
         let trigger = nostr::EventBuilder::new(nostr::Kind::Custom(9), "x")

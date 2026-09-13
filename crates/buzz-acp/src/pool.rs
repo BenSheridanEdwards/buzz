@@ -768,6 +768,8 @@ pub struct PromptContext {
     pub transcribe_profile: String,
     /// Session token for the Hermes transcribe endpoint.
     pub transcribe_token: String,
+    /// Playback rate hint published on this agent's voice notes.
+    pub voice_playback_speed: Option<f64>,
     pub mcp_servers: Vec<McpServer>,
     pub initial_message: Option<String>,
     pub idle_timeout: Duration,
@@ -2429,6 +2431,7 @@ async fn publish_reply_media_now(
         audio_support: &ctx.audio_support,
         ffmpeg: ctx.ffmpeg.as_deref(),
         transcript: (!transcript.is_empty()).then_some(transcript.as_str()),
+        playback_speed: ctx.voice_playback_speed,
     };
     let deadline = tokio::time::Instant::now() + crate::media_publish::OUTBOUND_DEADLINE;
     publisher
@@ -11344,6 +11347,7 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
             transcribe_endpoint: String::new(),
             transcribe_profile: String::new(),
             transcribe_token: String::new(),
+            voice_playback_speed: None,
             initial_message: None,
             idle_timeout: Duration::from_secs(60),
             max_turn_duration: Duration::from_secs(120),

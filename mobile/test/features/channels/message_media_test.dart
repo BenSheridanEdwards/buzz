@@ -92,6 +92,24 @@ void main() {
       expect(entry.filename, 'voice-note.m4a');
       expect(entry.size, 42);
       expect(entry.isAudio, isTrue);
+      expect(entry.playbackSpeed, isNull);
+    });
+
+    test("parses the sender's playback speed hint, dropping a broken one", () {
+      ImetaEntry withSpeed(String value) => parseImetaTags([
+        [
+          'imeta',
+          'url https://example.com/media/voice-note.m4a',
+          'm audio/mp4',
+          'playback_speed $value',
+        ],
+      ]).values.single;
+
+      expect(withSpeed('1.1').playbackSpeed, 1.1);
+      expect(withSpeed('0.9').playbackSpeed, 0.9);
+      expect(withSpeed('fast').playbackSpeed, isNull);
+      expect(withSpeed('NaN').playbackSpeed, isNull);
+      expect(withSpeed('Infinity').playbackSpeed, isNull);
     });
   });
 }

@@ -6,14 +6,19 @@ import {
   isAudioAttachment,
   isVoiceNoteAttachment,
   isVoiceNoteFile,
+  formatVoiceNotePlaybackRate,
   nextVoiceNotePlaybackRate,
+  OWN_VOICE_NOTE_RATE_STEP,
   readTranscriptPreference,
+  RECEIVED_VOICE_NOTE_RATE_STEP,
   resolveAudioAttachment,
   resolveTranscriptOpen,
   summarizeWaveform,
   transcriptDefaultOpen,
   VOICE_NOTE_MAX_DURATION_SECONDS,
-  VOICE_NOTE_PLAYBACK_RATES,
+  VOICE_NOTE_MAX_PLAYBACK_RATE,
+  VOICE_NOTE_MIN_PLAYBACK_RATE,
+  voiceNoteDefaultPlaybackRate,
   VOICE_NOTE_TRANSCRIPT_STORAGE_KEY,
   voiceNoteBarHeight,
   voiceNoteTranscript,
@@ -148,21 +153,88 @@ test("voice notes have a five-minute recording limit", () => {
   );
 });
 
-test("nextVoiceNotePlaybackRate cycles 1x, 1.5x, 2x and back", () => {
-  assert.deepEqual([...VOICE_NOTE_PLAYBACK_RATES], [1, 1.5, 2]);
-  assert.equal(nextVoiceNotePlaybackRate(1), 1.5);
-  assert.equal(nextVoiceNotePlaybackRate(1.5), 2);
-  assert.equal(nextVoiceNotePlaybackRate(2), 1);
-  // A rate outside the cycle (the retired 0.5x) resumes from 1x.
-  assert.equal(nextVoiceNotePlaybackRate(0.5), 1);
-  assert.equal(nextVoiceNotePlaybackRate(99), 1);
+test("your own notes step by a quarter to 2x, then back to 1x", () => {
+  const own = { ownNote: true, defaultRate: 1 };
+  assert.equal(nextVoiceNotePlaybackRate(1, own), 1.25);
+  assert.equal(nextVoiceNotePlaybackRate(1.25, own), 1.5);
+  assert.equal(nextVoiceNotePlaybackRate(1.5, own), 1.75);
+  assert.equal(nextVoiceNotePlaybackRate(1.75, own), 2);
+  assert.equal(nextVoiceNotePlaybackRate(2, own), 1);
+  assert.equal(OWN_VOICE_NOTE_RATE_STEP, 0.25);
 });
 
-test("transcripts default open in DMs and folded in channels", () => {
-  assert.equal(transcriptDefaultOpen("dm"), true);
-  assert.equal(transcriptDefaultOpen("channel"), false);
-  assert.equal(resolveTranscriptOpen("dm", undefined), true);
-  assert.equal(resolveTranscriptOpen("channel", undefined), false);
+test("received notes step by a tenth and wrap to the voice's default", () => {
+  const sky = { ownNote: false, defaultRate: 1.1 };
+  assert.equal(nextVoiceNotePlaybackRate(1.1, sky), 1.2);
+  // No float tail: 1.1 + 0.1 is 1.2, not 1.2000000000000002.
+  assert.equal(nextVoiceNotePlaybackRate(1.2, sky), 1.3);
+  assert.equal(nextVoiceNotePlaybackRate(1.9, sky), 2);
+  assert.equal(nextVoiceNotePlaybackRate(2, sky), 1.1);
+  // A voice hinted slower than 1x steps up from there.
+  const slow = { ownNote: false, defaultRate: 0.8 };
+  assert.equal(nextVoiceNotePlaybackRate(0.8, slow), 0.9);
+  assert.equal(nextVoiceNotePlaybackRate(0.9, slow), 1);
+  assert.equal(RECEIVED_VOICE_NOTE_RATE_STEP, 0.1);
+  assert.equal(VOICE_NOTE_MAX_PLAYBACK_RATE, 2);
+});
+
+test("a rate the pill could not have produced resets to the default", () => {
+  const own = { ownNote: true, defaultRate: 1 };
+  assert.equal(nextVoiceNotePlaybackRate(Number.NaN, own), 1);
+  assert.equal(nextVoiceNotePlaybackRate(0.25, own), 1);
+  assert.equal(nextVoiceNotePlaybackRate(99, own), 1);
+  const sky = { ownNote: false, defaultRate: 1.1 };
+  assert.equal(nextVoiceNotePlaybackRate(Number.POSITIVE_INFINITY, sky), 1.1);
+});
+
+test("the starting rate is 1x for your notes and the hint for received ones", () => {
+  assert.equal(voiceNoteDefaultPlaybackRate({ playbackSpeed: 1.1 }, true), 1);
+  assert.equal(
+    voiceNoteDefaultPlaybackRate({ playbackSpeed: 1.1 }, false),
+    1.1,
+  );
+  assert.equal(
+    voiceNoteDefaultPlaybackRate({ playbackSpeed: 0.8 }, false),
+    0.8,
+  );
+  assert.equal(voiceNoteDefaultPlaybackRate({}, false), 1);
+  assert.equal(voiceNoteDefaultPlaybackRate(undefined, false), 1);
+});
+
+test("an unusable speed hint falls back to 1x", () => {
+  for (const playbackSpeed of [
+    0,
+    0.4,
+    2.1,
+    4,
+    -1,
+    Number.NaN,
+    Number.POSITIVE_INFINITY,
+  ]) {
+    assert.equal(
+      voiceNoteDefaultPlaybackRate({ playbackSpeed }, false),
+      1,
+      `hint ${playbackSpeed}`,
+    );
+  }
+  assert.equal(VOICE_NOTE_MIN_PLAYBACK_RATE, 0.5);
+  // A hint with a float tail is shown as the sender meant it.
+  assert.equal(
+    voiceNoteDefaultPlaybackRate({ playbackSpeed: 1.1000000001 }, false),
+    1.1,
+  );
+});
+
+test("the pill label never shows a float tail", () => {
+  assert.equal(formatVoiceNotePlaybackRate(1), "1×");
+  assert.equal(formatVoiceNotePlaybackRate(1.25), "1.25×");
+  assert.equal(formatVoiceNotePlaybackRate(1.1 + 0.1), "1.2×");
+  assert.equal(formatVoiceNotePlaybackRate(2), "2×");
+});
+
+test("transcripts start folded everywhere", () => {
+  assert.equal(transcriptDefaultOpen(), false);
+  assert.equal(resolveTranscriptOpen(undefined), false);
 });
 
 test("transcript preference round-trips through storage", () => {
@@ -176,12 +248,12 @@ test("transcript preference round-trips through storage", () => {
   writeTranscriptPreference(false, storage);
   assert.equal(store.get(VOICE_NOTE_TRANSCRIPT_STORAGE_KEY), "closed");
   assert.equal(readTranscriptPreference(storage), false);
-  // The remembered choice wins over the DM default.
-  assert.equal(resolveTranscriptOpen("dm", storage), false);
+  assert.equal(resolveTranscriptOpen(storage), false);
 
+  // Opening one transcript keeps the next ones open: the choice sticks.
   writeTranscriptPreference(true, storage);
   assert.equal(readTranscriptPreference(storage), true);
-  assert.equal(resolveTranscriptOpen("channel", storage), true);
+  assert.equal(resolveTranscriptOpen(storage), true);
 
   store.set(VOICE_NOTE_TRANSCRIPT_STORAGE_KEY, "garbage");
   assert.equal(readTranscriptPreference(storage), null);
@@ -198,8 +270,7 @@ test("a throwing localStorage never breaks the transcript default", () => {
   };
   assert.equal(readTranscriptPreference(throwing), null);
   assert.doesNotThrow(() => writeTranscriptPreference(true, throwing));
-  assert.equal(resolveTranscriptOpen("dm", throwing), true);
-  assert.equal(resolveTranscriptOpen("channel", throwing), false);
+  assert.equal(resolveTranscriptOpen(throwing), false);
 });
 
 test("the transcript is the voice note's own alt text, never the body", () => {

@@ -33,77 +33,62 @@ const VOICE_NOTE = new Map([
   ],
 ]);
 
-function channelList(unreadTick) {
-  // A fresh array of fresh objects, the way the channels query hands one out
-  // on every channel update (unread counts, names, membership).
-  return [
-    { id: "channel-1", channelType: "public", name: "general", unreadTick },
-    { id: "dm-1", channelType: "dm", name: "alice", unreadTick },
-  ];
-}
-
 const renderTranscript = () => null;
 
-test("the card identity survives a channel-list update", async () => {
+test("the card identity survives an unrelated rerender", async () => {
   const { renderHook } = await import("@testing-library/react");
   const { useVoiceNoteCardContext } = await import(
     "./useVoiceNoteCardContext.ts"
   );
 
   const { result, rerender } = renderHook(
-    ({ channels }) =>
-      useVoiceNoteCardContext({
-        channelId: "channel-1",
-        channels,
+    ({ tick }) => {
+      void tick;
+      return useVoiceNoteCardContext({
         imetaByUrl: VOICE_NOTE,
+        ownNote: false,
         renderTranscript,
         sender: "Alice",
-      }),
-    { initialProps: { channels: channelList(0) } },
+      });
+    },
+    { initialProps: { tick: 0 } },
   );
 
   const first = result.current;
-  assert.equal(first?.conversation, "channel");
+  assert.equal(first?.ownNote, false);
+  assert.equal(first?.sender, "Alice");
 
-  rerender({ channels: channelList(1) });
+  rerender({ tick: 1 });
   assert.equal(
     result.current,
     first,
-    "a channel update elsewhere must not give every voice-note row a new card",
+    "a rerender that changes nothing the card shows must keep its identity",
   );
 });
 
-test("the conversation still follows the channel it belongs to", async () => {
+test("the card knows when the viewer recorded the note", async () => {
   const { renderHook } = await import("@testing-library/react");
   const { useVoiceNoteCardContext } = await import(
     "./useVoiceNoteCardContext.ts"
   );
 
   const { result, rerender } = renderHook(
-    ({ channelId }) =>
+    ({ ownNote }) =>
       useVoiceNoteCardContext({
-        channelId,
-        channels: channelList(0),
         imetaByUrl: VOICE_NOTE,
+        ownNote,
         renderTranscript,
         sender: "Alice",
       }),
-    { initialProps: { channelId: "channel-1" } },
+    { initialProps: { ownNote: true } },
   );
-  assert.equal(result.current?.conversation, "channel");
+  assert.equal(result.current?.ownNote, true);
 
-  rerender({ channelId: "dm-1" });
-  assert.equal(result.current?.conversation, "dm");
-
-  rerender({ channelId: null });
-  assert.equal(
-    result.current?.conversation,
-    "channel",
-    "an unknown conversation falls back to the channel presentation",
-  );
+  rerender({ ownNote: false });
+  assert.equal(result.current?.ownNote, false);
 });
 
-test("a message with no voice note has no card", async () => {
+test("a message without a voice note has no card", async () => {
   const { renderHook } = await import("@testing-library/react");
   const { useVoiceNoteCardContext } = await import(
     "./useVoiceNoteCardContext.ts"
@@ -111,14 +96,17 @@ test("a message with no voice note has no card", async () => {
 
   const { result } = renderHook(() =>
     useVoiceNoteCardContext({
-      channelId: "channel-1",
-      channels: channelList(0),
       imetaByUrl: new Map([
         [
-          "https://relay.example/media/pic.png",
-          { filename: "pic.png", m: "image/png" },
+          "https://relay.example/media/photo.jpg",
+          {
+            filename: "photo.jpg",
+            m: "image/jpeg",
+            url: "https://relay.example/media/photo.jpg",
+          },
         ],
       ]),
+      ownNote: false,
       renderTranscript,
       sender: "Alice",
     }),

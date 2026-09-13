@@ -91,18 +91,18 @@ class _VoiceNotePlaybackRateButton extends StatelessWidget {
   const _VoiceNotePlaybackRateButton({
     super.key,
     required this.rate,
+    required this.next,
     required this.onPressed,
   });
 
   final double rate;
+
+  /// The rate one tap moves to, named in the hint.
+  final double next;
   final VoidCallback onPressed;
 
   @override
   Widget build(BuildContext context) {
-    final next = nextVoiceNotePlaybackRate(
-      rate,
-      rates: voiceNoteMobilePlaybackRates,
-    );
     return Semantics(
       container: true,
       button: true,

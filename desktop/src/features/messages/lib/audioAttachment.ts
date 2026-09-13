@@ -4,6 +4,12 @@ export type AudioAttachmentImetaEntry = {
   duration?: number;
   filename?: string;
   m?: string;
+  /**
+   * `playback_speed`: the rate the sender's voice is meant to be heard at.
+   * An agent's harness writes it from the voice's own configuration, so a
+   * voice tuned to 1.1x starts there on every device.
+   */
+  playbackSpeed?: number;
   size?: number;
 };
 
@@ -68,19 +74,66 @@ export function formatVoiceNoteDuration(seconds: number): string {
   return `${minutes}:${String(rounded % 60).padStart(2, "0")}`;
 }
 
-export const VOICE_NOTE_PLAYBACK_RATES = [1, 1.5, 2] as const;
+/** Fastest a voice note plays; past it the pill wraps to the default. */
+export const VOICE_NOTE_MAX_PLAYBACK_RATE = 2;
+/** Slowest a sender's hint can ask for. */
+export const VOICE_NOTE_MIN_PLAYBACK_RATE = 0.5;
+/** Your own notes step by a quarter: 1, 1.25, 1.5, 1.75, 2, then 1 again. */
+export const OWN_VOICE_NOTE_RATE_STEP = 0.25;
+/** Received notes step by a tenth so a voice can be tuned finely. */
+export const RECEIVED_VOICE_NOTE_RATE_STEP = 0.1;
 
-export function nextVoiceNotePlaybackRate(currentRate: number): number {
-  const currentIndex = VOICE_NOTE_PLAYBACK_RATES.indexOf(
-    currentRate as (typeof VOICE_NOTE_PLAYBACK_RATES)[number],
-  );
-  return VOICE_NOTE_PLAYBACK_RATES[
-    (currentIndex + 1) % VOICE_NOTE_PLAYBACK_RATES.length
-  ];
+function roundRate(rate: number): number {
+  return Math.round(rate * 100) / 100;
 }
 
-/** Where a received voice note is shown; decides the transcript default. */
-export type VoiceNoteConversationContext = "dm" | "channel";
+/**
+ * The rate a voice note starts at. Your own notes always start at 1x; a
+ * received note starts at the sender's `playback_speed` hint when it carries
+ * a sane one, else 1x.
+ */
+export function voiceNoteDefaultPlaybackRate(
+  entry: Pick<AudioAttachmentImetaEntry, "playbackSpeed"> | undefined,
+  ownNote: boolean,
+): number {
+  if (ownNote) return 1;
+  const hint = entry?.playbackSpeed;
+  if (typeof hint !== "number" || !Number.isFinite(hint)) return 1;
+  if (
+    hint < VOICE_NOTE_MIN_PLAYBACK_RATE ||
+    hint > VOICE_NOTE_MAX_PLAYBACK_RATE
+  ) {
+    return 1;
+  }
+  return roundRate(hint);
+}
+
+/**
+ * The rate after one tap on the speed pill: one step faster, wrapping to
+ * `defaultRate` past 2x. A rate the pill could not have produced (not
+ * finite, or below the slowest hint) also resets to the default.
+ */
+export function nextVoiceNotePlaybackRate(
+  currentRate: number,
+  { ownNote, defaultRate }: { ownNote: boolean; defaultRate: number },
+): number {
+  if (
+    !Number.isFinite(currentRate) ||
+    currentRate < VOICE_NOTE_MIN_PLAYBACK_RATE
+  ) {
+    return defaultRate;
+  }
+  const step = ownNote
+    ? OWN_VOICE_NOTE_RATE_STEP
+    : RECEIVED_VOICE_NOTE_RATE_STEP;
+  const next = roundRate(currentRate + step);
+  return next > VOICE_NOTE_MAX_PLAYBACK_RATE ? defaultRate : next;
+}
+
+/** Pill label: `1×`, `1.25×`, `1.1×`; never a float tail like `1.1000000001`. */
+export function formatVoiceNotePlaybackRate(rate: number): string {
+  return `${roundRate(rate)}×`;
+}
 
 export const VOICE_NOTE_TRANSCRIPT_STORAGE_KEY =
   "buzz.voiceNote.transcriptOpen";
@@ -95,11 +148,14 @@ function defaultTranscriptStorage(): TranscriptPreferenceStorage | undefined {
   }
 }
 
-/** Transcripts start open in DMs and folded in channels. */
-export function transcriptDefaultOpen(
-  context: VoiceNoteConversationContext,
-): boolean {
-  return context === "dm";
+/**
+ * Every transcript starts folded: the words are there for when you want
+ * them, never in the way of the note. Opening one is remembered
+ * (`writeTranscriptPreference`), so a reader who wants them open keeps them
+ * open.
+ */
+export function transcriptDefaultOpen(): boolean {
+  return false;
 }
 
 /**
@@ -134,12 +190,11 @@ export function writeTranscriptPreference(
   }
 }
 
-/** The transcript starts from the remembered choice, else the context default. */
+/** The transcript starts from the remembered choice, else folded. */
 export function resolveTranscriptOpen(
-  context: VoiceNoteConversationContext,
   storage: TranscriptPreferenceStorage | undefined = defaultTranscriptStorage(),
 ): boolean {
-  return readTranscriptPreference(storage) ?? transcriptDefaultOpen(context);
+  return readTranscriptPreference(storage) ?? transcriptDefaultOpen();
 }
 
 /**

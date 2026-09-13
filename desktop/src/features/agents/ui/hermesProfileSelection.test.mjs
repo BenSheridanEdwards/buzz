@@ -36,6 +36,7 @@ const bond = {
   description: "Executor of the Fleet",
   path: "/Users/me/.hermes/profiles/bond",
   avatarDataUrl: "data:image/jpeg;base64,/9j/4A==",
+  voicePlaybackSpeed: null,
 };
 
 const sky = {
@@ -44,6 +45,7 @@ const sky = {
   description: null,
   path: "/Users/me/.hermes/profiles/sky",
   avatarDataUrl: null,
+  voicePlaybackSpeed: 1.1,
 };
 
 function emptyDraft(overrides = {}) {
@@ -99,23 +101,43 @@ describe("env var round-trip", () => {
   it("pins the profile without touching unrelated variables", () => {
     const next = hermesProfileEnvVars(
       { OPENAI_API_KEY: "sk", HERMES_ACP_SKIP_CONFIGURED_MCP: "1" },
-      bond.path,
+      bond,
     );
     assert.deepEqual(next, {
       OPENAI_API_KEY: "sk",
       HERMES_HOME: bond.path,
       HERMES_ACP_SKIP_CONFIGURED_MCP: "0",
+      BUZZ_ACP_TRANSCRIBE_PROFILE: "bond",
     });
+  });
+
+  it("carries the profile's voice rate and drops a previous one", () => {
+    // Sky's voice is tuned to 1.1x; every note she sends starts there.
+    const tuned = hermesProfileEnvVars({}, sky);
+    assert.equal(tuned.BUZZ_ACP_VOICE_PLAYBACK_SPEED, "1.1");
+    assert.equal(tuned.BUZZ_ACP_TRANSCRIBE_PROFILE, "sky");
+    // Switching to Bond, whose voice is untuned, must not keep Sky's rate.
+    const switched = hermesProfileEnvVars(tuned, bond);
+    assert.equal(switched.BUZZ_ACP_VOICE_PLAYBACK_SPEED, undefined);
+    assert.equal(switched.BUZZ_ACP_TRANSCRIBE_PROFILE, "bond");
+    // A hand-typed lowercase rate is replaced, not left as a second row.
+    const retyped = hermesProfileEnvVars(
+      { buzz_acp_voice_playback_speed: "2" },
+      sky,
+    );
+    assert.equal(retyped.buzz_acp_voice_playback_speed, undefined);
+    assert.equal(retyped.BUZZ_ACP_VOICE_PLAYBACK_SPEED, "1.1");
   });
 
   it("rewrites a hand-typed lowercase key to the canonical spelling", () => {
     // POSIX env is case-sensitive and `merged_user_env` passes keys verbatim to
     // Command::env, so a pin left under `hermes_home` is a pin the agent never
     // sees while the picker happily shows it as selected.
-    const next = hermesProfileEnvVars({ hermes_home: "/old" }, bond.path);
+    const next = hermesProfileEnvVars({ hermes_home: "/old" }, bond);
     assert.deepEqual(next, {
       HERMES_HOME: bond.path,
       HERMES_ACP_SKIP_CONFIGURED_MCP: "0",
+      BUZZ_ACP_TRANSCRIBE_PROFILE: "bond",
     });
     assert.equal(next.hermes_home, undefined);
     assert.equal(selectedHermesProfilePath(next), bond.path);
@@ -124,11 +146,12 @@ describe("env var round-trip", () => {
   it("collapses every case variant of the MCP flag onto one key", () => {
     const next = hermesProfileEnvVars(
       { Hermes_Acp_Skip_Configured_Mcp: "1" },
-      bond.path,
+      bond,
     );
     assert.deepEqual(next, {
       HERMES_HOME: bond.path,
       HERMES_ACP_SKIP_CONFIGURED_MCP: "0",
+      BUZZ_ACP_TRANSCRIBE_PROFILE: "bond",
     });
   });
 
@@ -137,6 +160,8 @@ describe("env var round-trip", () => {
       OPENAI_API_KEY: "sk",
       HERMES_HOME: bond.path,
       hermes_acp_skip_configured_mcp: "0",
+      BUZZ_ACP_TRANSCRIBE_PROFILE: "bond",
+      BUZZ_ACP_VOICE_PLAYBACK_SPEED: "1.1",
     });
     assert.deepEqual(cleared, { OPENAI_API_KEY: "sk" });
     assert.equal(selectedHermesProfilePath(cleared), "");
@@ -208,6 +233,7 @@ describe("applyHermesProfileToDraft", () => {
       envVars: {
         HERMES_HOME: bond.path,
         HERMES_ACP_SKIP_CONFIGURED_MCP: "0",
+        BUZZ_ACP_TRANSCRIBE_PROFILE: "bond",
       },
       parallelism: "1",
     });
@@ -365,6 +391,7 @@ describe("hermes instance override layer", () => {
   const inherited = {
     HERMES_HOME: bond.path,
     HERMES_ACP_SKIP_CONFIGURED_MCP: "0",
+    BUZZ_ACP_TRANSCRIBE_PROFILE: "bond",
     OPENAI_API_KEY: "definition-key",
   };
 
@@ -389,7 +416,7 @@ describe("hermes instance override layer", () => {
   });
 
   it("writes no override when the pick is what the definition already gives", () => {
-    const nextEffective = hermesProfileEnvVars({ ...inherited }, bond.path);
+    const nextEffective = hermesProfileEnvVars({ ...inherited }, bond);
     assert.deepEqual(
       hermesInstanceEnvVarsForPick({ FOO: "1" }, inherited, nextEffective),
       { FOO: "1" },
@@ -397,15 +424,20 @@ describe("hermes instance override layer", () => {
   });
 
   it("writes an override only for a genuine change", () => {
-    const nextEffective = hermesProfileEnvVars({ ...inherited }, sky.path);
+    const nextEffective = hermesProfileEnvVars({ ...inherited }, sky);
     assert.deepEqual(
       hermesInstanceEnvVarsForPick({ FOO: "1" }, inherited, nextEffective),
-      { FOO: "1", HERMES_HOME: sky.path },
+      {
+        FOO: "1",
+        HERMES_HOME: sky.path,
+        BUZZ_ACP_TRANSCRIBE_PROFILE: "sky",
+        BUZZ_ACP_VOICE_PLAYBACK_SPEED: "1.1",
+      },
     );
   });
 
   it("removes an override that returns to the inherited profile", () => {
-    const nextEffective = hermesProfileEnvVars({ ...inherited }, bond.path);
+    const nextEffective = hermesProfileEnvVars({ ...inherited }, bond);
     assert.deepEqual(
       hermesInstanceEnvVarsForPick(
         { HERMES_HOME: sky.path, HERMES_ACP_SKIP_CONFIGURED_MCP: "1" },
@@ -417,15 +449,16 @@ describe("hermes instance override layer", () => {
   });
 
   it("keeps the whole pin on an instance with no definition underneath", () => {
-    const nextEffective = hermesProfileEnvVars({}, bond.path);
+    const nextEffective = hermesProfileEnvVars({}, bond);
     assert.deepEqual(hermesInstanceEnvVarsForPick({}, {}, nextEffective), {
       HERMES_HOME: bond.path,
       HERMES_ACP_SKIP_CONFIGURED_MCP: "0",
+      BUZZ_ACP_TRANSCRIBE_PROFILE: "bond",
     });
   });
 
   it("never copies unrelated definition env vars into the override layer", () => {
-    const nextEffective = hermesProfileEnvVars({ ...inherited }, sky.path);
+    const nextEffective = hermesProfileEnvVars({ ...inherited }, sky);
     const override = hermesInstanceEnvVarsForPick({}, inherited, nextEffective);
     assert.equal(override.OPENAI_API_KEY, undefined);
   });
@@ -523,6 +556,7 @@ describe("fromRawHermesProfile", () => {
         description: null,
         path: "/p",
         avatarDataUrl: null,
+        voicePlaybackSpeed: null,
       },
     );
     assert.deepEqual(
@@ -532,6 +566,7 @@ describe("fromRawHermesProfile", () => {
         description: "D",
         path: "/p",
         avatar_data_url: "data:image/png;base64,iVBORw==",
+        voice_playback_speed: 1.1,
       }),
       {
         slug: "s",
@@ -539,7 +574,22 @@ describe("fromRawHermesProfile", () => {
         description: "D",
         path: "/p",
         avatarDataUrl: "data:image/png;base64,iVBORw==",
+        voicePlaybackSpeed: 1.1,
       },
     );
+  });
+
+  it("drops a voice rate that is not a finite number", () => {
+    for (const voice_playback_speed of [null, Number.NaN, "1.1", undefined]) {
+      assert.equal(
+        fromRawHermesProfile({
+          slug: "s",
+          name: "N",
+          path: "/p",
+          voice_playback_speed,
+        }).voicePlaybackSpeed,
+        null,
+      );
+    }
   });
 });
