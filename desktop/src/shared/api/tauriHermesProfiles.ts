@@ -15,6 +15,11 @@ export type HermesProfile = {
   path: string;
   /** Inline `data:image/...;base64,` avatar when the profile ships one. */
   avatarDataUrl: string | null;
+  /**
+   * `voice.playback_speed` from the profile's `config.yaml`: the rate this
+   * voice is meant to be heard at. Null when the profile sets none.
+   */
+  voicePlaybackSpeed: number | null;
 };
 
 type RawHermesProfile = {
@@ -23,6 +28,7 @@ type RawHermesProfile = {
   description?: string | null;
   path: string;
   avatar_data_url?: string | null;
+  voice_playback_speed?: number | null;
 };
 
 export function fromRawHermesProfile(raw: RawHermesProfile): HermesProfile {
@@ -32,6 +38,11 @@ export function fromRawHermesProfile(raw: RawHermesProfile): HermesProfile {
     description: raw.description ?? null,
     path: raw.path,
     avatarDataUrl: raw.avatar_data_url ?? null,
+    voicePlaybackSpeed:
+      typeof raw.voice_playback_speed === "number" &&
+      Number.isFinite(raw.voice_playback_speed)
+        ? raw.voice_playback_speed
+        : null,
   };
 }
 
