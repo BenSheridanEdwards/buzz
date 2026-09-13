@@ -1318,7 +1318,7 @@ impl MediaPublisher<'_> {
                         .map(|bytes| blossom::sha256_hex(&bytes))
                         .unwrap_or_else(|_| "unknown".into());
                     tracing::warn!(
-                        target: "acp::media",
+                        target: "buzz_acp::media",
                         file = %file.path.display(),
                         sha256 = %sha,
                         "upload cut at the publish deadline; any blob the relay stored for it is orphaned"
@@ -1331,7 +1331,7 @@ impl MediaPublisher<'_> {
             match attempt {
                 Ok(item) => {
                     tracing::info!(
-                        target: "acp::media",
+                        target: "buzz_acp::media",
                         file = %file.path.display(),
                         via = %file.origin,
                         delivery = item.delivery.map(AudioDelivery::label).unwrap_or("upload"),
@@ -1343,7 +1343,7 @@ impl MediaPublisher<'_> {
                 }
                 Err(reason) => {
                     tracing::warn!(
-                        target: "acp::media",
+                        target: "buzz_acp::media",
                         file = %file.path.display(),
                         via = %file.origin,
                         "upload failed: {reason}"
@@ -1358,7 +1358,7 @@ impl MediaPublisher<'_> {
         match self.publish_message(target, &report.published).await {
             Ok(event_id) => {
                 tracing::info!(
-                    target: "acp::media",
+                    target: "buzz_acp::media",
                     event = %event_id,
                     channel = %target.channel_id,
                     "published {} attachment(s) in one kind-9",
@@ -1367,7 +1367,7 @@ impl MediaPublisher<'_> {
                 report.event_id = Some(event_id);
             }
             Err(reason) => {
-                tracing::warn!(target: "acp::media", "kind-9 publish failed: {reason}");
+                tracing::warn!(target: "buzz_acp::media", "kind-9 publish failed: {reason}");
                 report
                     .failed
                     .push(format!("kind-9 publish failed: {reason}"));
@@ -1409,7 +1409,7 @@ impl MediaPublisher<'_> {
             match attempt {
                 Ok(item) => {
                     tracing::info!(
-                        target: "acp::media",
+                        target: "buzz_acp::media",
                         file = %file.path.display(),
                         "audio delivered as {} ({})",
                         delivery.label(),
@@ -1419,7 +1419,7 @@ impl MediaPublisher<'_> {
                 }
                 Err(AudioAttemptError::FallThrough(reason)) => {
                     tracing::warn!(
-                        target: "acp::media",
+                        target: "buzz_acp::media",
                         file = %file.path.display(),
                         "{} not possible ({reason}); trying the next delivery",
                         delivery.label()
@@ -1502,7 +1502,7 @@ impl MediaPublisher<'_> {
                         Ok(()) => out,
                         Err(e) => {
                             tracing::debug!(
-                                target: "acp::media",
+                                target: "buzz_acp::media",
                                 "mp3 {} failed: {e}",
                                 if reencode { "re-encode" } else { "copy" }
                             );

@@ -619,7 +619,7 @@ pub fn prune_turn_dirs(
         }
         excess -= 1;
         if let Err(e) = std::fs::remove_dir_all(&stale) {
-            tracing::debug!(target: "acp::media", "prune {} failed: {e}", stale.display());
+            tracing::debug!(target: "buzz_acp::media", "prune {} failed: {e}", stale.display());
         }
     }
     Ok(())
@@ -680,7 +680,7 @@ fn private_dir_builder() -> std::fs::DirBuilder {
 fn check_private_dir(dir: &Path) -> std::io::Result<()> {
     let refuse = |detail: String, class: &str| -> std::io::Error {
         tracing::error!(
-            target: "acp::media",
+            target: "buzz_acp::media",
             dir = %dir.display(),
             "attachment storage refused: {detail}"
         );
@@ -719,7 +719,7 @@ fn check_private_dir(dir: &Path) -> std::io::Result<()> {
         if mode & 0o077 != 0 {
             std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
             tracing::warn!(
-                target: "acp::media",
+                target: "buzz_acp::media",
                 dir = %dir.display(),
                 "attachment directory was mode {mode:o}; tightened to 700"
             );
@@ -1052,7 +1052,7 @@ fn prune_abandoned_scratch(base: &Path, keep: &Path) {
         if stale {
             if let Err(e) = std::fs::remove_dir_all(&path) {
                 tracing::debug!(
-                    target: "acp::media",
+                    target: "buzz_acp::media",
                     "removing abandoned publish scratch {} failed: {e}",
                     path.display()
                 );
@@ -1065,7 +1065,7 @@ impl Drop for PublishScratch {
     fn drop(&mut self) {
         if let Err(e) = std::fs::remove_dir_all(self.dir.path()) {
             tracing::debug!(
-                target: "acp::media",
+                target: "buzz_acp::media",
                 "removing publish scratch {} failed: {e}",
                 self.dir.path().display()
             );
@@ -1225,7 +1225,7 @@ pub async fn collect_inbound_attachments(
         Ok(handle) => handle,
         Err(e) => {
             tracing::error!(
-                target: "acp::media",
+                target: "buzz_acp::media",
                 dir = %turn_dir.display(),
                 "this turn's attachment directory could not be opened: {e}"
             );
@@ -1297,7 +1297,7 @@ pub async fn collect_inbound_attachments(
                 }),
                 Err(reason) => {
                     tracing::warn!(
-                        target: "acp::media",
+                        target: "buzz_acp::media",
                         event = %event_id,
                         filename = %attachment.filename,
                         "attachment fetch failed: {reason}"
