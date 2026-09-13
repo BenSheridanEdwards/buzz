@@ -488,18 +488,18 @@ async fn probe_audio_support(rest: &RestClient) -> bool {
     {
         Ok(resp) => resp,
         Err(e) => {
-            tracing::warn!(target: "acp::media", "NIP-11 probe failed: {e}");
+            tracing::warn!(target: "buzz_acp::media", "NIP-11 probe failed: {e}");
             return false;
         }
     };
     if !resp.status().is_success() {
-        tracing::warn!(target: "acp::media", "NIP-11 probe returned HTTP {}", resp.status());
+        tracing::warn!(target: "buzz_acp::media", "NIP-11 probe returned HTTP {}", resp.status());
         return false;
     }
     match resp.json::<serde_json::Value>().await {
         Ok(doc) => nip11_advertises_audio(&doc),
         Err(e) => {
-            tracing::warn!(target: "acp::media", "NIP-11 probe returned invalid JSON: {e}");
+            tracing::warn!(target: "buzz_acp::media", "NIP-11 probe returned invalid JSON: {e}");
             false
         }
     }

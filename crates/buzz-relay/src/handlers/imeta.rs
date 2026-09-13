@@ -8,14 +8,42 @@ use buzz_media::validation::mime_to_ext;
 /// Shared between REST (send_message) and WebSocket (handle_event) paths.
 /// Returns Ok(()) if all tags are valid, or a human-readable error string.
 pub fn validate_imeta_tags(tags: &[Vec<String>], media_base_url: &str) -> Result<(), String> {
+    // `playback_speed`: the rate a voice note is meant to be heard at, set by
+    // the sender's harness from the voice's own configuration; clients start
+    // the note there. Bounded to what they honour so a stray value cannot be
+    // stored and then ignored everywhere.
     const ALLOWED_IMETA_KEYS: &[&str] = &[
-        "url", "m", "x", "size", "dim", "blurhash", "alt", "thumb", "fallback", "duration",
-        "bitrate", "image", "filename",
+        "url",
+        "m",
+        "x",
+        "size",
+        "dim",
+        "blurhash",
+        "alt",
+        "thumb",
+        "fallback",
+        "duration",
+        "bitrate",
+        "image",
+        "filename",
+        "playback_speed",
     ];
     const SINGLETON_KEYS: &[&str] = &[
-        "url", "m", "x", "size", "dim", "blurhash", "thumb", "alt", "duration", "bitrate", "image",
+        "url",
+        "m",
+        "x",
+        "size",
+        "dim",
+        "blurhash",
+        "thumb",
+        "alt",
+        "duration",
+        "bitrate",
+        "image",
         "filename",
+        "playback_speed",
     ];
+    const PLAYBACK_SPEED_RANGE: std::ops::RangeInclusive<f64> = 0.5..=2.0;
     // Previewable media MIME types — these get the strict url-extension
     // consistency check below (their ext is derived from the MIME). Generic
     // files carry arbitrary MIME types whose ext can't be derived from the MIME
@@ -121,6 +149,16 @@ pub fn validate_imeta_tags(tags: &[Vec<String>], media_base_url: &str) -> Result
                 "bitrate" if value.parse::<u64>().map_or(true, |b| b == 0) => {
                     return Err("imeta bitrate must be a positive integer".into());
                 }
+                "playback_speed" => match value.parse::<f64>() {
+                    Ok(speed) if speed.is_finite() && PLAYBACK_SPEED_RANGE.contains(&speed) => {}
+                    _ => {
+                        return Err(format!(
+                            "imeta playback_speed must be a number between {} and {}",
+                            PLAYBACK_SPEED_RANGE.start(),
+                            PLAYBACK_SPEED_RANGE.end()
+                        ))
+                    }
+                },
                 "image" => {
                     const IMAGE_EXTS: &[&str] = &["jpg", "png", "gif", "webp"];
                     if !is_local_media_url(value, media_base_url) {
@@ -582,6 +620,43 @@ mod tests {
         ];
         let err = validate_imeta_tags(&[tag], BASE).unwrap_err();
         assert!(err.contains("url hash does not match x"), "{err}");
+    }
+
+    #[test]
+    fn test_imeta_audio_carries_a_playback_speed_in_the_honoured_range() {
+        // An agent's voice note carries the rate its voice is tuned to; the
+        // relay was refusing the whole message as `disallowed imeta key`.
+        let with_speed = |speed: &str| {
+            vec![
+                "imeta".into(),
+                format!("url /media/{HASH}.mp3"),
+                "m audio/mpeg".into(),
+                format!("x {HASH}"),
+                "size 141688".into(),
+                "duration 11.78".into(),
+                format!("playback_speed {speed}"),
+                "filename voice-note-1.mp3".into(),
+            ]
+        };
+        for ok in ["1.1", "0.5", "2", "1.25"] {
+            assert!(
+                validate_imeta_tags(&[with_speed(ok)], BASE).is_ok(),
+                "playback_speed {ok} must be accepted"
+            );
+        }
+        for bad in ["0.4", "2.01", "-1", "NaN", "inf", "fast", ""] {
+            let err = validate_imeta_tags(&[with_speed(bad)], BASE).unwrap_err();
+            assert!(
+                err.contains("playback_speed"),
+                "playback_speed {bad:?} must be refused by name; got {err}"
+            );
+        }
+        let mut twice = with_speed("1.1");
+        twice.push("playback_speed 1.2".into());
+        assert_eq!(
+            validate_imeta_tags(&[twice], BASE).unwrap_err(),
+            "duplicate imeta key: playback_speed"
+        );
     }
 
     #[test]

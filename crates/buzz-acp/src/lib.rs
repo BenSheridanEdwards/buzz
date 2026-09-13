@@ -2824,7 +2824,7 @@ async fn tokio_main() -> Result<()> {
         // is the host temp directory plus the agent's pubkey. The path is on
         // the log line beside it.
         tracing::error!(
-            target: "acp::media",
+            target: "buzz_acp::media",
             base = %attachment_base.display(),
             "attachment root refused: {e}; attachments are disabled"
         );
@@ -2832,7 +2832,7 @@ async fn tokio_main() -> Result<()> {
     });
     let ffmpeg = crate::ffmpeg::find_ffmpeg();
     tracing::info!(
-        target: "acp::media",
+        target: "buzz_acp::media",
         attachment_dir = %attachment_dir.as_deref().map(|p| p.display().to_string()).unwrap_or_else(|_| "disabled".into()),
         ffmpeg = ffmpeg.as_deref().map(|p| p.display().to_string()).unwrap_or_else(|| "none".into()),
         "attachment handling ready"

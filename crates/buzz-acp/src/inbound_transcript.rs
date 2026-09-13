@@ -28,7 +28,10 @@ use std::time::Duration;
 const MAX_CLIP_BYTES: u64 = 25 * 1024 * 1024;
 
 /// How long to wait on Hermes before giving up on the transcript.
-const TRANSCRIBE_TIMEOUT: Duration = Duration::from_secs(30);
+/// Ceiling on one transcription call. Detached from the reply, so it can be
+/// generous: the Hermes endpoint took 36s on a 4.5s clip when its provider
+/// token was being refreshed, and a 30s ceiling threw the words away.
+const TRANSCRIBE_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Whether this attachment should be transcribed at all.
 ///
@@ -96,13 +99,16 @@ pub async fn transcribe_clip(
         .send()
         .await
         .map_err(|error| {
-            tracing::debug!(target: "acp::media", %error, "inbound transcript: request failed")
+            // Warn: a timeout or a refused call is the difference between a
+            // note with its words and a note without, and it has to be
+            // findable in the log.
+            tracing::warn!(target: "buzz_acp::media", %error, "inbound transcript: request failed")
         })
         .ok()?;
 
     if !response.status().is_success() {
-        tracing::debug!(
-            target: "acp::media",
+        tracing::warn!(
+            target: "buzz_acp::media",
             status = %response.status(),
             "inbound transcript: endpoint declined the clip"
         );

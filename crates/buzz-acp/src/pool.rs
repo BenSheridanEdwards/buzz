@@ -2165,7 +2165,7 @@ async fn collect_batch_attachments(
         }
         Err(e) => {
             tracing::warn!(
-                target: "acp::media",
+                target: "buzz_acp::media",
                 "attachment directory unavailable: {e}"
             );
             crate::attachments::InboundAttachments::unavailable(
@@ -2241,7 +2241,7 @@ fn publish_reply_media(
             // Heartbeat and initial-message replies have no channel to post
             // into; say so rather than losing the reference silently.
             tracing::warn!(
-                target: "acp::media",
+                target: "buzz_acp::media",
                 blocks = capture.blocks().len(),
                 "reply named media outside a channel turn; only channel turns can attach files"
             );
@@ -2302,7 +2302,7 @@ fn publish_reply_media(
         };
         if !report.is_clean() {
             tracing::warn!(
-                target: "acp::media",
+                target: "buzz_acp::media",
                 channel = %channel_id,
                 published = report.published.len(),
                 "reply media partially failed: {}",
@@ -2381,7 +2381,7 @@ async fn publish_reply_media_now(
         Err(e) => return failed(format!("publish scratch unavailable: {e}")),
     };
     tracing::debug!(
-        target: "acp::media",
+        target: "buzz_acp::media",
         scratch = %scratch.dir().display(),
         "reply media staging into a private directory"
     );
@@ -2396,7 +2396,7 @@ async fn publish_reply_media_now(
     );
     if let Err(reason) = &workspace {
         tracing::error!(
-            target: "acp::media",
+            target: "buzz_acp::media",
             cwd = %ctx.cwd,
             "the working directory is not an outbound root: {reason}; only this turn's own directory is"
         );
@@ -3202,7 +3202,7 @@ pub async fn run_prompt_task(
             let stored = inbound.stored().count();
             let total = inbound.outcomes.len();
             tracing::info!(
-                target: "acp::media",
+                target: "buzz_acp::media",
                 channel = %b.channel_id,
                 stored,
                 failed = total - stored,
@@ -5700,7 +5700,7 @@ async fn publish_inbound_transcripts(
         };
         match tokio::time::timeout(Duration::from_secs(5), rest.submit_event(&event)).await {
             Ok(Ok(_)) => tracing::info!(
-                target: "acp::media",
+                target: "buzz_acp::media",
                 channel = %channel_id,
                 note = %event_id,
                 "published a transcript for an inbound voice note"
@@ -5709,13 +5709,13 @@ async fn publish_inbound_transcripts(
             // a person notices (their note has no transcript) and it has to be
             // findable in the log.
             Ok(Err(e)) => tracing::warn!(
-                target: "acp::media",
+                target: "buzz_acp::media",
                 channel = %channel_id,
                 note = %event_id,
                 "inbound transcript publish failed: {e}"
             ),
             Err(_) => tracing::warn!(
-                target: "acp::media",
+                target: "buzz_acp::media",
                 channel = %channel_id,
                 note = %event_id,
                 "inbound transcript publish timed out"
