@@ -54,6 +54,23 @@ pub enum SubscribeMode {
     Config,
 }
 
+/// Who delivers the engine's reply to the channel.
+///
+/// `Cli`: the engine posts its own message with `buzz messages send` and is
+/// told to thread it with `--reply-to`; the harness only steps in when the
+/// engine posted nothing. `Harness`: the engine answers in its reply text and
+/// is told not to post it; the harness publishes that text (or the media it
+/// named, with the text as transcript) in the thread of the message being
+/// answered. Engines that simply answer (Hermes under ACP) want `Harness`;
+/// with `Cli` such an engine posts once itself and the harness's media reply
+/// lands as a second message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
+pub enum ReplyMode {
+    #[default]
+    Cli,
+    Harness,
+}
+
 #[derive(Debug, Clone, Copy, clap::ValueEnum)]
 pub enum DedupMode {
     Drop,
@@ -369,6 +386,12 @@ pub struct CliArgs {
     #[arg(long, env = "BUZZ_ACP_VOICE_PLAYBACK_SPEED", default_value = "")]
     pub voice_playback_speed: String,
 
+    /// Who delivers the reply: `cli` (the engine posts it with `buzz messages
+    /// send`, the default) or `harness` (the engine answers in text and the
+    /// harness posts it in the thread; the engine is told not to post).
+    #[arg(long, env = "BUZZ_ACP_REPLY_MODE", value_enum, default_value_t = ReplyMode::Cli)]
+    pub reply_mode: ReplyMode,
+
     #[arg(long, env = "BUZZ_ACP_KINDS", value_delimiter = ',')]
     pub kinds: Option<Vec<u32>>,
 
@@ -600,6 +623,8 @@ pub struct Config {
     /// Playback rate hint published on this agent's voice notes; `None`
     /// publishes no hint.
     pub voice_playback_speed: Option<f64>,
+    /// Who delivers the engine's reply; see [`ReplyMode`].
+    pub reply_mode: ReplyMode,
     pub dedup_mode: DedupMode,
     /// How ACP provider sessions are scoped in channels (channel vs thread).
     pub session_policy: crate::scope::SessionPolicy,
@@ -1314,6 +1339,7 @@ impl Config {
             transcribe_profile: args.transcribe_profile.clone(),
             transcribe_token: args.transcribe_token.clone(),
             voice_playback_speed: parse_voice_playback_speed(&args.voice_playback_speed)?,
+            reply_mode: args.reply_mode,
             dedup_mode: args.dedup,
             session_policy: args.session_policy,
             multiple_event_handling: args.multiple_event_handling,
@@ -1725,6 +1751,7 @@ mod tests {
             transcribe_profile: String::new(),
             transcribe_token: String::new(),
             voice_playback_speed: None,
+            reply_mode: ReplyMode::Cli,
             dedup_mode: DedupMode::Queue,
             session_policy: crate::scope::SessionPolicy::Channel,
             multiple_event_handling: MultipleEventHandling::Queue,

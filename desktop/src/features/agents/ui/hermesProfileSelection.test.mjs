@@ -108,6 +108,7 @@ describe("env var round-trip", () => {
       HERMES_HOME: bond.path,
       HERMES_ACP_SKIP_CONFIGURED_MCP: "0",
       BUZZ_ACP_TRANSCRIBE_PROFILE: "bond",
+      BUZZ_ACP_REPLY_MODE: "harness",
     });
   });
 
@@ -138,6 +139,7 @@ describe("env var round-trip", () => {
       HERMES_HOME: bond.path,
       HERMES_ACP_SKIP_CONFIGURED_MCP: "0",
       BUZZ_ACP_TRANSCRIBE_PROFILE: "bond",
+      BUZZ_ACP_REPLY_MODE: "harness",
     });
     assert.equal(next.hermes_home, undefined);
     assert.equal(selectedHermesProfilePath(next), bond.path);
@@ -152,6 +154,7 @@ describe("env var round-trip", () => {
       HERMES_HOME: bond.path,
       HERMES_ACP_SKIP_CONFIGURED_MCP: "0",
       BUZZ_ACP_TRANSCRIBE_PROFILE: "bond",
+      BUZZ_ACP_REPLY_MODE: "harness",
     });
   });
 
@@ -161,6 +164,7 @@ describe("env var round-trip", () => {
       HERMES_HOME: bond.path,
       hermes_acp_skip_configured_mcp: "0",
       BUZZ_ACP_TRANSCRIBE_PROFILE: "bond",
+      BUZZ_ACP_REPLY_MODE: "harness",
       BUZZ_ACP_VOICE_PLAYBACK_SPEED: "1.1",
     });
     assert.deepEqual(cleared, { OPENAI_API_KEY: "sk" });
@@ -234,6 +238,7 @@ describe("applyHermesProfileToDraft", () => {
         HERMES_HOME: bond.path,
         HERMES_ACP_SKIP_CONFIGURED_MCP: "0",
         BUZZ_ACP_TRANSCRIBE_PROFILE: "bond",
+        BUZZ_ACP_REPLY_MODE: "harness",
       },
       parallelism: "1",
     });
@@ -392,6 +397,7 @@ describe("hermes instance override layer", () => {
     HERMES_HOME: bond.path,
     HERMES_ACP_SKIP_CONFIGURED_MCP: "0",
     BUZZ_ACP_TRANSCRIBE_PROFILE: "bond",
+    BUZZ_ACP_REPLY_MODE: "harness",
     OPENAI_API_KEY: "definition-key",
   };
 
@@ -454,6 +460,7 @@ describe("hermes instance override layer", () => {
       HERMES_HOME: bond.path,
       HERMES_ACP_SKIP_CONFIGURED_MCP: "0",
       BUZZ_ACP_TRANSCRIBE_PROFILE: "bond",
+      BUZZ_ACP_REPLY_MODE: "harness",
     });
   });
 
