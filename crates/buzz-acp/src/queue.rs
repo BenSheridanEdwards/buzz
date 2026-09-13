@@ -20,7 +20,7 @@ use uuid::Uuid;
 
 use crate::prompt_project::PromptProjectInfo;
 
-use crate::config::DedupMode;
+use crate::config::{DedupMode, ReplyMode};
 use crate::scope::SessionScope;
 
 /// Maximum events queued per session scope before oldest events are dropped.
@@ -1359,6 +1359,21 @@ pub(crate) fn format_event_block(
     block
 }
 
+/// The reply instruction for a harness-delivered turn.
+///
+/// The engine answers in its reply text; the harness publishes that text, or
+/// the media it named with the text as transcript, in the thread of the
+/// message being answered. Posting it as well with the CLI is what put the
+/// same words in the channel twice, once at the top level.
+fn append_harness_reply_instruction(s: &mut String) {
+    s.push_str(
+        "\nIMPORTANT: Answer in your reply text. Do NOT run `buzz messages send` \
+         to deliver your reply: the harness posts your reply for you, in the \
+         thread of the message you are answering. Use the buzz CLI only for \
+         other actions (reactions, lookups, messages to other channels).",
+    );
+}
+
 /// Append a reply instruction when the agent is responding to a thread event.
 ///
 /// Tells the agent to default to `--reply-to <event_id>` for ordinary replies
@@ -1594,6 +1609,7 @@ fn format_context_hints(
     is_dm: bool,
     conversation_context_status: ConversationContextStatus,
     reply_anchor: Option<&str>,
+    reply_mode: ReplyMode,
 ) -> String {
     let channel_id = scope.channel_id();
     let channel_display = match channel_info {
@@ -1646,8 +1662,18 @@ fn format_context_hints(
                     s.push_str(&format!("\nParent: {parent}"));
                 }
             }
-            if let Some(event_id) = reply_anchor {
-                append_reply_instruction(&mut s, event_id);
+        }
+        // A harness-delivered reply is threaded on the trigger whether or not
+        // the DM message was itself in a thread, so the engine hears it either
+        // way; the CLI anchor stays as it was (thread replies only).
+        match reply_mode {
+            ReplyMode::Harness => append_harness_reply_instruction(&mut s),
+            ReplyMode::Cli => {
+                if thread_tags.root_event_id.is_some() {
+                    if let Some(event_id) = reply_anchor {
+                        append_reply_instruction(&mut s, event_id);
+                    }
+                }
             }
         }
         crate::prompt_framing::semantic_section("context", &s)
@@ -1684,10 +1710,12 @@ fn format_context_hints(
         }
         s.push_str(&format!("\n{ctx_hint}"));
         if let Some(event_id) = reply_anchor {
-            if thread_tags.root_event_id.is_some() {
-                append_reply_instruction(&mut s, event_id);
-            } else {
-                append_new_thread_reply_instruction(&mut s, event_id);
+            match reply_mode {
+                ReplyMode::Harness => append_harness_reply_instruction(&mut s),
+                ReplyMode::Cli if thread_tags.root_event_id.is_some() => {
+                    append_reply_instruction(&mut s, event_id)
+                }
+                ReplyMode::Cli => append_new_thread_reply_instruction(&mut s, event_id),
             }
         }
         crate::prompt_framing::semantic_section("context", &s)
@@ -1703,7 +1731,10 @@ fn format_context_hints(
             "\nHint: Use `buzz messages get --channel <UUID>` for recent messages if needed.",
         );
         if let Some(event_id) = reply_anchor {
-            append_new_thread_reply_instruction(&mut s, event_id);
+            match reply_mode {
+                ReplyMode::Harness => append_harness_reply_instruction(&mut s),
+                ReplyMode::Cli => append_new_thread_reply_instruction(&mut s, event_id),
+            }
         }
         crate::prompt_framing::semantic_section("context", &s)
     }
@@ -1847,6 +1878,8 @@ pub struct FormatPromptArgs<'a> {
     /// live session had already received. Trigger-only context does not set it.
     pub conversation_context_had_delivered_events: bool,
     pub profile_lookup: Option<&'a PromptProfileLookup>,
+    /// Who delivers the reply; decides which reply instruction the engine gets.
+    pub reply_mode: ReplyMode,
     /// When true, base_prompt and system_prompt are delivered via the system
     /// role (session/new) and omitted from the user message. When false
     /// (legacy agents), they are injected as `<base>` and `<agent-instructions>` sections.
@@ -2043,6 +2076,7 @@ pub fn format_prompt(batch: &FlushBatch, args: &FormatPromptArgs<'_>) -> Vec<Str
             args.conversation_context_had_delivered_events,
         ),
         reply_anchor.as_deref(),
+        args.reply_mode,
     ));
 
     // 3. Conversation context (thread or DM).
@@ -5327,6 +5361,97 @@ mod tests {
             prompt.contains("new top-level message"),
             "top-level human message should use the new-thread instruction"
         );
+    }
+
+    /// Harness mode: the engine answers in text and is told not to post, in
+    /// every branch a person can trigger, and the CLI anchor is never given
+    /// (that instruction is what made an ACP engine post the same words once
+    /// itself and once through the harness).
+    #[test]
+    fn test_harness_reply_mode_tells_the_engine_not_to_post_in_every_branch() {
+        const HARNESS_LINE: &str = "Do NOT run `buzz messages send`";
+        let ch = Uuid::new_v4();
+        let dm = PromptChannelInfo {
+            name: "DM".into(),
+            channel_type: "dm".into(),
+            description: None,
+            project: None,
+        };
+        let root_id = "e".repeat(64);
+        let batch_for = |event: nostr::Event| FlushBatch {
+            channel_id: ch,
+            scope: conv(ch),
+            events: vec![BatchEvent {
+                event,
+                prompt_tag: "test".into(),
+                received_at: Instant::now(),
+            }],
+            cancelled_events: vec![],
+            cancel_reason: None,
+        };
+        let threaded = || {
+            make_event_with_tags(
+                "in a thread",
+                vec![vec!["e".into(), root_id.clone(), "".into(), "reply".into()]],
+            )
+        };
+
+        // DM top level: the branch that had no instruction at all.
+        let cases: Vec<(&str, FlushBatch, Option<&PromptChannelInfo>)> = vec![
+            (
+                "dm top level",
+                batch_for(make_event("hey there")),
+                Some(&dm),
+            ),
+            ("dm thread", batch_for(threaded()), Some(&dm)),
+            (
+                "channel top level",
+                batch_for(make_event("hello world")),
+                None,
+            ),
+            ("channel thread", batch_for(threaded()), None),
+        ];
+        for (name, batch, channel_info) in cases {
+            let prompt = format_prompt(
+                &batch,
+                &FormatPromptArgs {
+                    channel_info,
+                    reply_mode: ReplyMode::Harness,
+                    ..Default::default()
+                },
+            )
+            .join("\n\n");
+            assert!(
+                prompt.contains(HARNESS_LINE),
+                "{name}: harness mode must tell the engine not to post; got {prompt}"
+            );
+            assert!(
+                !prompt.contains("--reply-to"),
+                "{name}: harness mode must not hand out a CLI reply anchor"
+            );
+        }
+    }
+
+    #[test]
+    fn test_cli_reply_mode_is_the_default_and_unchanged() {
+        let ch = Uuid::new_v4();
+        let event = make_event("hello world");
+        let event_id = event.id.to_hex();
+        let batch = FlushBatch {
+            channel_id: ch,
+            scope: conv(ch),
+            events: vec![BatchEvent {
+                event,
+                prompt_tag: "test".into(),
+                received_at: Instant::now(),
+            }],
+            cancelled_events: vec![],
+            cancel_reason: None,
+        };
+        assert_eq!(FormatPromptArgs::default().reply_mode, ReplyMode::Cli);
+        let prompt = format_prompt(&batch, &FormatPromptArgs::default()).join("\n\n");
+        assert!(prompt.contains(&format!("--reply-to {event_id}")));
+        assert!(!prompt.contains("Do NOT run `buzz messages send`"));
     }
 
     #[test]

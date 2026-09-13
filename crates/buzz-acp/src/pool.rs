@@ -770,6 +770,8 @@ pub struct PromptContext {
     pub transcribe_token: String,
     /// Playback rate hint published on this agent's voice notes.
     pub voice_playback_speed: Option<f64>,
+    /// Who delivers the engine's reply; see [`crate::config::ReplyMode`].
+    pub reply_mode: crate::config::ReplyMode,
     pub mcp_servers: Vec<McpServer>,
     pub initial_message: Option<String>,
     pub idle_timeout: Duration,
@@ -3160,6 +3162,7 @@ pub async fn run_prompt_task(
                 conversation_context: conversation_context.as_ref(),
                 conversation_context_had_delivered_events,
                 profile_lookup: profile_lookup.as_ref(),
+                reply_mode: ctx.reply_mode,
                 has_system_prompt_support: agent.has_system_prompt_support(),
                 base_prompt: standing.base_prompt,
                 system_prompt: standing.system_prompt,
@@ -11348,6 +11351,7 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
             transcribe_profile: String::new(),
             transcribe_token: String::new(),
             voice_playback_speed: None,
+            reply_mode: crate::config::ReplyMode::Cli,
             initial_message: None,
             idle_timeout: Duration::from_secs(60),
             max_turn_duration: Duration::from_secs(120),

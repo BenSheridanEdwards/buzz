@@ -32,6 +32,15 @@ export const BUZZ_TRANSCRIBE_PROFILE_ENV = "BUZZ_ACP_TRANSCRIBE_PROFILE";
  */
 export const BUZZ_VOICE_PLAYBACK_SPEED_ENV = "BUZZ_ACP_VOICE_PLAYBACK_SPEED";
 
+/**
+ * A Hermes engine answers in its reply text; buzz-acp posts that answer (or
+ * the voice note it named) in the thread of the message being answered. In
+ * the default `cli` mode the engine is told to post with `buzz messages send`
+ * as well, which put every reply in the channel twice.
+ */
+export const BUZZ_REPLY_MODE_ENV = "BUZZ_ACP_REPLY_MODE";
+export const HERMES_REPLY_MODE = "harness";
+
 /** Agent instructions seeded when a profile is picked into an empty prompt. */
 export const HERMES_PROFILE_DEFAULT_INSTRUCTIONS =
   "Your SOUL, memory, skills and tools come from your Hermes profile. Follow them.";
@@ -48,6 +57,7 @@ const HERMES_PROFILE_ENV_KEYS = [
   HERMES_SKIP_CONFIGURED_MCP_ENV,
   BUZZ_TRANSCRIBE_PROFILE_ENV,
   BUZZ_VOICE_PLAYBACK_SPEED_ENV,
+  BUZZ_REPLY_MODE_ENV,
 ] as const;
 
 /** What a pick needs from a profile to write its env vars. */
@@ -180,12 +190,16 @@ export function hermesProfileEnvVars(
 ): Record<string, string> {
   const pinned = withEnvVar(
     withEnvVar(
-      withEnvVar(envVars, HERMES_HOME_ENV, profile.path),
-      HERMES_SKIP_CONFIGURED_MCP_ENV,
-      "0",
+      withEnvVar(
+        withEnvVar(envVars, HERMES_HOME_ENV, profile.path),
+        HERMES_SKIP_CONFIGURED_MCP_ENV,
+        "0",
+      ),
+      BUZZ_TRANSCRIBE_PROFILE_ENV,
+      profile.slug,
     ),
-    BUZZ_TRANSCRIBE_PROFILE_ENV,
-    profile.slug,
+    BUZZ_REPLY_MODE_ENV,
+    HERMES_REPLY_MODE,
   );
   const speed = profile.voicePlaybackSpeed;
   return typeof speed === "number" && Number.isFinite(speed)
