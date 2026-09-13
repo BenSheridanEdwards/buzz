@@ -3348,3 +3348,67 @@ mod tests {
         );
     }
 }
+
+/// Live check against a relay: a voice note carrying the `playback_speed`
+/// hint is stored. Needs `BUZZ_ACP_E2E_RELAY_URL`, `BUZZ_ACP_E2E_PRIVATE_KEY`,
+/// `BUZZ_ACP_E2E_CHANNEL_ID` and `BUZZ_ACP_E2E_CLIP` (an mp3 under the
+/// relay's audio cap). Point it at the test relay, never production.
+#[cfg(test)]
+mod e2e {
+    use super::*;
+
+    fn env(name: &str) -> String {
+        std::env::var(name).unwrap_or_default()
+    }
+
+    #[tokio::test]
+    #[ignore = "needs a running relay, a member key and a clip"]
+    async fn e2e_relay_stores_a_voice_note_with_its_playback_speed() {
+        let relay = env("BUZZ_ACP_E2E_RELAY_URL");
+        let key = env("BUZZ_ACP_E2E_PRIVATE_KEY");
+        let channel = env("BUZZ_ACP_E2E_CHANNEL_ID");
+        let clip = env("BUZZ_ACP_E2E_CLIP");
+        assert!(
+            !relay.is_empty() && !key.is_empty() && !channel.is_empty() && !clip.is_empty(),
+            "e2e env not set"
+        );
+        let rest = RestClient {
+            http: reqwest::Client::new(),
+            base_url: relay.trim_end_matches('/').to_string(),
+            keys: nostr::Keys::parse(&key).expect("member key"),
+            auth_tag_json: None,
+        };
+        let origin = crate::blossom::RelayOrigin::from_base_url(&rest.base_url).expect("origin");
+        let bytes = std::fs::read(&clip).expect("clip bytes");
+        let descriptor = crate::blossom::upload_blob(&rest, &origin, bytes, "audio/mpeg")
+            .await
+            .expect("the relay stores the clip");
+        let item = PublishedMedia {
+            descriptor,
+            filename: "voice-note-e2e.mp3".into(),
+            kind: MediaKind::Audio,
+            delivery: None,
+        };
+        let hints = AudioNoteHints {
+            transcript: Some("Hello Chief, this is the playback speed round trip."),
+            playback_speed: Some(1.1),
+        };
+        let (content, media_tags) = compose_message(std::slice::from_ref(&item), hints);
+        assert!(media_tags[0].contains(&"playback_speed 1.1".to_string()));
+        let event = buzz_sdk::build_message(
+            uuid::Uuid::parse_str(&channel).expect("channel id"),
+            &content,
+            None,
+            &[],
+            false,
+            &media_tags,
+            &[],
+        )
+        .expect("builder")
+        .sign_with_keys(&rest.keys)
+        .expect("sign");
+        rest.submit_event(&event)
+            .await
+            .expect("the relay must accept a voice note carrying playback_speed");
+    }
+}
