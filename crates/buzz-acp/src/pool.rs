@@ -2231,6 +2231,7 @@ fn publish_reply_media(
     batch: Option<&FlushBatch>,
     turn_id: &str,
     guard: crate::attachments::LiveTurnGuard,
+    reply_text: String,
 ) -> Option<tokio::task::JoinHandle<()>> {
     let capture = agent.acp.take_turn_media();
     let Some(batch) = batch else {
@@ -2317,6 +2318,13 @@ fn publish_reply_media(
                 &crate::media_publish::failure_notice(&report),
             )
             .await;
+        }
+        // The media message carries the reply text as its transcript, so it
+        // is the one place the words land. Only when no message reached the
+        // relay at all do the words go out on their own, and then through the
+        // same settle-and-check as a plain text turn.
+        if reply_text_needs_own_message(report.event_id.is_some(), &reply_text) {
+            publish_text_reply_after_settle(&ctx, channel_id, &trigger, reply_text).await;
         }
         observer.emit(
             "turn_media_published",
@@ -3481,6 +3489,7 @@ pub async fn run_prompt_task(
                             batch.as_ref(),
                             &turn_id,
                             turn_dir_guard,
+                            String::new(),
                         );
                         let usage = agent.acp.take_turn_usage();
                         publish_agent_turn_metric(
@@ -3563,12 +3572,23 @@ pub async fn run_prompt_task(
             } else {
                 // Read before `publish_reply_media` takes the capture.
                 let reply_text = agent.acp.peek_turn_text().trim().to_string();
-                publish_reply_media(&ctx, &mut agent, batch.as_ref(), &turn_id, turn_dir_guard);
                 // `MEDIA:` lines are directives to the harness, not words for
                 // a reader. Publishing one verbatim put a file path in the
                 // channel where the reply should have been.
                 let reply_text = crate::media_publish::text_without_media_directives(&reply_text);
-                if !reply_text.is_empty() {
+                // A turn that named media publishes its words on the media
+                // message (as the transcript); posting them again here raced
+                // the upload and doubled every voice reply that took longer
+                // than the settle window to land.
+                let media_task = publish_reply_media(
+                    &ctx,
+                    &mut agent,
+                    batch.as_ref(),
+                    &turn_id,
+                    turn_dir_guard,
+                    reply_text.clone(),
+                );
+                if reply_text_needs_own_message(media_task.is_some(), &reply_text) {
                     publish_text_reply_fallback(&ctx, batch.as_ref(), reply_text);
                 }
             }
@@ -5682,10 +5702,21 @@ async fn publish_inbound_transcripts(
                 note = %event_id,
                 "published a transcript for an inbound voice note"
             ),
-            Ok(Err(e)) => {
-                tracing::debug!(channel = %channel_id, "inbound transcript publish failed: {e}")
-            }
-            Err(_) => tracing::debug!(channel = %channel_id, "inbound transcript publish timed out"),
+            // Warn, not debug: a relay that refuses the kind is the one failure
+            // a person notices (their note has no transcript) and it has to be
+            // findable in the log.
+            Ok(Err(e)) => tracing::warn!(
+                target: "acp::media",
+                channel = %channel_id,
+                note = %event_id,
+                "inbound transcript publish failed: {e}"
+            ),
+            Err(_) => tracing::warn!(
+                target: "acp::media",
+                channel = %channel_id,
+                note = %event_id,
+                "inbound transcript publish timed out"
+            ),
         }
     }
 }
@@ -5759,33 +5790,53 @@ fn publish_text_reply_fallback(
     let channel_id = batch.channel_id;
     let ctx = Arc::clone(ctx);
     Some(tokio::spawn(async move {
-        tokio::time::sleep(TEXT_REPLY_SETTLE).await;
-        if agent_published_message_since(&ctx.rest_client, channel_id, trigger.created_at).await {
-            return;
-        }
-        // Anchor exactly like a media reply: the harness owns the reply
-        // destination and a threaded reply is the intended shape.
-        let target = crate::media_publish::ReplyTarget::for_trigger(channel_id, &trigger);
-        let thread_tags = crate::queue::ThreadTags {
-            root_event_id: Some(target.root_event_id.to_hex()),
-            parent_event_id: Some(trigger.id.to_hex()),
-            mentioned_pubkeys: Vec::new(),
-        };
-        tracing::info!(
-            target: "buzz_acp::pool::prompt",
-            channel = %channel_id,
-            bytes = text.len(),
-            "engine published no message this turn; publishing its reply text"
-        );
-        post_text_message(
-            &ctx.rest_client,
-            channel_id,
-            &thread_tags,
-            &text,
-            "text reply fallback",
-        )
-        .await;
+        publish_text_reply_after_settle(&ctx, channel_id, &trigger, text).await;
     }))
+}
+
+/// Whether the turn's words still need a message of their own.
+///
+/// A media reply carries them as its transcript, so while one is on its way
+/// (or has landed) a second message would only duplicate it. Words are posted
+/// alone when the turn had no media, or when the media never reached the relay.
+fn reply_text_needs_own_message(media_message_carries_text: bool, reply_text: &str) -> bool {
+    !media_message_carries_text && !reply_text.is_empty()
+}
+
+/// Wait out [`TEXT_REPLY_SETTLE`], then post `text` unless the engine already
+/// published a message for this turn itself.
+async fn publish_text_reply_after_settle(
+    ctx: &PromptContext,
+    channel_id: Uuid,
+    trigger: &nostr::Event,
+    text: String,
+) {
+    tokio::time::sleep(TEXT_REPLY_SETTLE).await;
+    if agent_published_message_since(&ctx.rest_client, channel_id, trigger.created_at).await {
+        return;
+    }
+    // Anchor exactly like a media reply: the harness owns the reply
+    // destination and a threaded reply is the intended shape.
+    let target = crate::media_publish::ReplyTarget::for_trigger(channel_id, trigger);
+    let thread_tags = crate::queue::ThreadTags {
+        root_event_id: Some(target.root_event_id.to_hex()),
+        parent_event_id: Some(trigger.id.to_hex()),
+        mentioned_pubkeys: Vec::new(),
+    };
+    tracing::info!(
+        target: "buzz_acp::pool::prompt",
+        channel = %channel_id,
+        bytes = text.len(),
+        "engine published no message this turn; publishing its reply text"
+    );
+    post_text_message(
+        &ctx.rest_client,
+        channel_id,
+        &thread_tags,
+        &text,
+        "text reply fallback",
+    )
+    .await;
 }
 
 /// Best-effort: remove a reaction via a signed kind:5 (NIP-09) deletion event.
@@ -13292,6 +13343,24 @@ done"#
 #[cfg(test)]
 mod text_reply_fallback_tests {
     use super::*;
+
+    #[test]
+    fn words_ride_on_the_media_message() {
+        // A voice reply already carries the words as its transcript; a second
+        // message would double it (seen live: text at +0.0s, clip at +0.6s).
+        assert!(!reply_text_needs_own_message(true, "hello"));
+    }
+
+    #[test]
+    fn words_go_alone_when_there_is_no_media() {
+        assert!(reply_text_needs_own_message(false, "hello"));
+    }
+
+    #[test]
+    fn nothing_to_say_needs_no_message() {
+        assert!(!reply_text_needs_own_message(false, ""));
+        assert!(!reply_text_needs_own_message(true, ""));
+    }
 
     #[test]
     fn empty_result_releases_the_fallback() {
