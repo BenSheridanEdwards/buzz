@@ -2842,6 +2842,7 @@ async fn tokio_main() -> Result<()> {
         transcribe_endpoint: config.transcribe_endpoint.clone(),
         transcribe_profile: config.transcribe_profile.clone(),
         transcribe_token: config.transcribe_token.clone(),
+        voice_playback_speed: config.voice_playback_speed,
         attachment_dir,
         live_turn_dirs: crate::attachments::LiveTurnDirs::default(),
         // Two in-flight reply-media publishes per agent slot: the tasks are
@@ -9128,6 +9129,7 @@ mod build_mcp_servers_tests {
             transcribe_endpoint: String::new(),
             transcribe_profile: String::new(),
             transcribe_token: String::new(),
+            voice_playback_speed: None,
             dedup_mode: config::DedupMode::Queue,
             session_policy: scope::SessionPolicy::Channel,
             multiple_event_handling: config::MultipleEventHandling::Queue,
@@ -9357,6 +9359,7 @@ mod error_outcome_emission_tests {
             transcribe_endpoint: String::new(),
             transcribe_profile: String::new(),
             transcribe_token: String::new(),
+            voice_playback_speed: None,
             dedup_mode: config::DedupMode::Queue,
             session_policy: scope::SessionPolicy::Channel,
             multiple_event_handling: config::MultipleEventHandling::Queue,

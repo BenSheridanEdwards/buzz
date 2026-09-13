@@ -362,6 +362,13 @@ pub struct CliArgs {
     )]
     pub transcribe_token: String,
 
+    /// Rate this agent's voice is meant to be heard at, published on every
+    /// voice note as the imeta `playback_speed` hint so clients start there.
+    /// Empty publishes no hint. Accepted range 0.5 to 2.0, matching what the
+    /// clients will honour; anything else is refused at startup.
+    #[arg(long, env = "BUZZ_ACP_VOICE_PLAYBACK_SPEED", default_value = "")]
+    pub voice_playback_speed: String,
+
     #[arg(long, env = "BUZZ_ACP_KINDS", value_delimiter = ',')]
     pub kinds: Option<Vec<u32>>,
 
@@ -590,6 +597,9 @@ pub struct Config {
     pub transcribe_profile: String,
     /// Session token for the Hermes transcribe endpoint.
     pub transcribe_token: String,
+    /// Playback rate hint published on this agent's voice notes; `None`
+    /// publishes no hint.
+    pub voice_playback_speed: Option<f64>,
     pub dedup_mode: DedupMode,
     /// How ACP provider sessions are scoped in channels (channel vs thread).
     pub session_policy: crate::scope::SessionPolicy,
@@ -756,6 +766,32 @@ fn compose_session_title_with_limit(
 }
 
 /// Validate and deduplicate allowlist entries: each must be exactly 64 hex chars.
+/// Slowest and fastest `playback_speed` hint the clients honour; a hint
+/// outside it would be published and then ignored on every device.
+pub const VOICE_PLAYBACK_SPEED_RANGE: std::ops::RangeInclusive<f64> = 0.5..=2.0;
+
+/// Parse `BUZZ_ACP_VOICE_PLAYBACK_SPEED`: empty is no hint, anything else
+/// must be a finite rate inside [`VOICE_PLAYBACK_SPEED_RANGE`].
+fn parse_voice_playback_speed(raw: &str) -> Result<Option<f64>, ConfigError> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return Ok(None);
+    }
+    let speed: f64 = raw.parse().map_err(|_| {
+        ConfigError::ConfigFile(format!(
+            "BUZZ_ACP_VOICE_PLAYBACK_SPEED must be a number, got {raw:?}"
+        ))
+    })?;
+    if !speed.is_finite() || !VOICE_PLAYBACK_SPEED_RANGE.contains(&speed) {
+        return Err(ConfigError::ConfigFile(format!(
+            "BUZZ_ACP_VOICE_PLAYBACK_SPEED must be between {} and {}, got {raw}",
+            VOICE_PLAYBACK_SPEED_RANGE.start(),
+            VOICE_PLAYBACK_SPEED_RANGE.end()
+        )));
+    }
+    Ok(Some(speed))
+}
+
 fn validate_allowlist(entries: &[String]) -> Result<HashSet<String>, ConfigError> {
     let mut validated = HashSet::new();
     for entry in entries {
@@ -1277,6 +1313,7 @@ impl Config {
             transcribe_endpoint: args.transcribe_endpoint.clone(),
             transcribe_profile: args.transcribe_profile.clone(),
             transcribe_token: args.transcribe_token.clone(),
+            voice_playback_speed: parse_voice_playback_speed(&args.voice_playback_speed)?,
             dedup_mode: args.dedup,
             session_policy: args.session_policy,
             multiple_event_handling: args.multiple_event_handling,
@@ -1633,6 +1670,34 @@ fn rule_applies_to_channel(rule: &SubscriptionRule, channel_id: Uuid) -> bool {
 }
 
 #[cfg(test)]
+mod voice_playback_speed_tests {
+    use super::parse_voice_playback_speed;
+
+    #[test]
+    fn empty_means_no_hint() {
+        assert_eq!(parse_voice_playback_speed("").unwrap(), None);
+        assert_eq!(parse_voice_playback_speed("  ").unwrap(), None);
+    }
+
+    #[test]
+    fn a_rate_in_range_is_kept_as_given() {
+        assert_eq!(parse_voice_playback_speed("1.1").unwrap(), Some(1.1));
+        assert_eq!(parse_voice_playback_speed(" 0.5 ").unwrap(), Some(0.5));
+        assert_eq!(parse_voice_playback_speed("2").unwrap(), Some(2.0));
+    }
+
+    #[test]
+    fn a_rate_the_clients_would_ignore_is_refused_at_startup() {
+        for raw in ["0.4", "2.01", "-1", "0", "NaN", "inf", "fast"] {
+            assert!(
+                parse_voice_playback_speed(raw).is_err(),
+                "{raw:?} must be refused"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::filter::{ChannelScope, SubscriptionRule};
@@ -1659,6 +1724,7 @@ mod tests {
             transcribe_endpoint: String::new(),
             transcribe_profile: String::new(),
             transcribe_token: String::new(),
+            voice_playback_speed: None,
             dedup_mode: DedupMode::Queue,
             session_policy: crate::scope::SessionPolicy::Channel,
             multiple_event_handling: MultipleEventHandling::Queue,
