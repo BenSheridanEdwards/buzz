@@ -31,26 +31,59 @@ const voiceNoteHoldToRecordHint =
 const voiceNoteMaxDownloadBytes = 32 * 1024 * 1024;
 
 /// Playback rates offered by the voice-note player, in selection order.
-const voiceNotePlaybackRates = <double>[1, 1.5, 2, 0.5];
+/// Fastest a voice note plays; past it the pill wraps to the default.
+const voiceNoteMaxPlaybackRate = 2.0;
 
-/// Playback rates cycled by the mobile voice-note card (desktop keeps 0.5x).
-const voiceNoteMobilePlaybackRates = <double>[1, 1.5, 2];
+/// Slowest a sender's hint can ask for.
+const voiceNoteMinPlaybackRate = 0.5;
+
+/// Your own notes step by a quarter: 1, 1.25, 1.5, 1.75, 2, then 1 again.
+const ownVoiceNoteRateStep = 0.25;
+
+/// Received notes step by a tenth so a voice can be tuned finely.
+const receivedVoiceNoteRateStep = 0.1;
+
+double _roundRate(double rate) => (rate * 100).roundToDouble() / 100;
 
 /// Route observer used to cancel recording when its composer is covered.
 final voiceNoteRouteObserver = RouteObserver<ModalRoute<void>>();
 
-/// Returns the playback rate following [current] in the [rates] cycle.
-double nextVoiceNotePlaybackRate(
-  double current, {
-  List<double> rates = voiceNotePlaybackRates,
-}) {
-  final index = rates.indexOf(current);
-  return rates[(index + 1) % rates.length];
+/// The rate a voice note starts at. Your own notes always start at 1x; a
+/// received note starts at the sender's `playback_speed` [hint] when it
+/// carries a sane one, else 1x.
+double voiceNoteDefaultPlaybackRate(double? hint, {required bool ownNote}) {
+  if (ownNote || hint == null || !hint.isFinite) return 1;
+  if (hint < voiceNoteMinPlaybackRate || hint > voiceNoteMaxPlaybackRate) {
+    return 1;
+  }
+  return _roundRate(hint);
 }
 
-/// Formats a supported voice-note playback rate for display.
-String formatVoiceNotePlaybackRate(double rate) =>
-    '${rate == 0.5 ? '.5' : rate.toStringAsFixed(rate % 1 == 0 ? 0 : 1)}×';
+/// The rate after one tap on the speed pill: one step faster, wrapping to
+/// [defaultRate] past 2x. A rate the pill could not have produced (not
+/// finite, or below the slowest hint) also resets to the default.
+double nextVoiceNotePlaybackRate(
+  double current, {
+  required bool ownNote,
+  required double defaultRate,
+}) {
+  if (!current.isFinite || current < voiceNoteMinPlaybackRate) {
+    return defaultRate;
+  }
+  final step = ownNote ? ownVoiceNoteRateStep : receivedVoiceNoteRateStep;
+  final next = _roundRate(current + step);
+  return next > voiceNoteMaxPlaybackRate ? defaultRate : next;
+}
+
+/// Formats a playback rate for the pill: `1×`, `1.25×`, `1.1×`, never a
+/// float tail.
+String formatVoiceNotePlaybackRate(double rate) {
+  final rounded = _roundRate(rate);
+  final text = rounded == rounded.roundToDouble()
+      ? rounded.toStringAsFixed(0)
+      : rounded.toStringAsFixed(2).replaceFirst(RegExp(r'0$'), '');
+  return '$text×';
+}
 
 /// A finalized local voice-note recording and its presentation metadata.
 @immutable

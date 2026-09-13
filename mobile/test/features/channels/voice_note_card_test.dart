@@ -42,7 +42,8 @@ void main() {
     String url = _url,
     String? sender = 'Neo',
     String? transcript = _transcript,
-    bool transcriptOpenByDefault = false,
+    bool ownNote = false,
+    String? playbackSpeed,
     String messageId = 'message-1',
   }) => MessageContent(
     content: '![audio]($url)',
@@ -54,10 +55,11 @@ void main() {
         'duration 24.0',
         'filename voice-note.m4a',
         if (transcript != null) 'alt $transcript',
+        if (playbackSpeed != null) 'playback_speed $playbackSpeed',
       ],
     ],
     voiceNoteSenderName: sender,
-    voiceNoteTranscriptOpenByDefault: transcriptOpenByDefault,
+    voiceNoteIsOwn: ownNote,
     voiceNoteMessageId: messageId,
   );
 
@@ -65,14 +67,16 @@ void main() {
     required FakeVoiceNotePlayer player,
     String? sender = 'Neo',
     String? transcript = _transcript,
-    bool transcriptOpenByDefault = false,
+    bool ownNote = false,
+    String? playbackSpeed,
     String messageId = 'message-1',
   }) => scope(
     overrides: [voiceNotePlayerFactoryProvider.overrideWithValue(() => player)],
     child: message(
       sender: sender,
       transcript: transcript,
-      transcriptOpenByDefault: transcriptOpenByDefault,
+      ownNote: ownNote,
+      playbackSpeed: playbackSpeed,
       messageId: messageId,
     ),
   );
@@ -147,7 +151,9 @@ void main() {
     await tester.pump(const Duration(seconds: 12));
   });
 
-  testWidgets('speed pill cycles 1x, 1.5x, 2x and back to 1x', (tester) async {
+  testWidgets('a received note steps by a tenth and wraps to 1x', (
+    tester,
+  ) async {
     final player = FakeVoiceNotePlayer();
     await tester.pumpWidget(card(player: player));
     await tester.pump();
@@ -156,13 +162,109 @@ void main() {
     final value = find.byKey(const ValueKey('voice-note-playback-rate-value'));
     expect(tester.widget<Text>(value).data, '1×');
 
-    for (final expected in ['1.5×', '2×', '1×']) {
+    final expected = [
+      for (var tenths = 11; tenths <= 20; tenths++) tenths / 10,
+      1.0,
+    ];
+    for (final next in expected) {
+      await tester.tap(rate);
+      await tester.pump();
+      expect(
+        tester.widget<Text>(value).data,
+        formatVoiceNotePlaybackRate(next),
+      );
+    }
+    expect(player.speeds, expected);
+    expect(find.text('1.2000000000000002×'), findsNothing);
+  });
+
+  testWidgets('your own note steps by a quarter to 2x and back to 1x', (
+    tester,
+  ) async {
+    final player = FakeVoiceNotePlayer();
+    await tester.pumpWidget(card(player: player, ownNote: true));
+    await tester.pump();
+
+    final rate = find.byKey(const ValueKey('voice-note-playback-rate'));
+    final value = find.byKey(const ValueKey('voice-note-playback-rate-value'));
+    expect(tester.widget<Text>(value).data, '1×');
+
+    for (final expected in ['1.25×', '1.5×', '1.75×', '2×', '1×']) {
       await tester.tap(rate);
       await tester.pump();
       expect(tester.widget<Text>(value).data, expected);
     }
-    expect(player.speeds, [1.5, 2, 1]);
-    expect(find.text('.5×'), findsNothing);
+    expect(player.speeds, [1.25, 1.5, 1.75, 2, 1]);
+  });
+
+  testWidgets("a voice's hinted speed is where its note starts and wraps", (
+    tester,
+  ) async {
+    final player = FakeVoiceNotePlayer();
+    await tester.pumpWidget(card(player: player, playbackSpeed: '1.1'));
+    await tester.pump();
+
+    final value = find.byKey(const ValueKey('voice-note-playback-rate-value'));
+    expect(tester.widget<Text>(value).data, '1.1×');
+    // The player itself was told the hinted rate before any tap.
+    expect(player.speeds, [1.1]);
+
+    final rate = find.byKey(const ValueKey('voice-note-playback-rate'));
+    for (var taps = 0; taps < 9; taps++) {
+      await tester.tap(rate);
+      await tester.pump();
+    }
+    expect(tester.widget<Text>(value).data, '2×');
+    await tester.tap(rate);
+    await tester.pump();
+    expect(tester.widget<Text>(value).data, '1.1×');
+  });
+
+  testWidgets('a hint outside the playable range is ignored', (tester) async {
+    for (final hint in ['4', '0.1', 'fast', 'NaN']) {
+      final player = FakeVoiceNotePlayer();
+      await tester.pumpWidget(card(player: player, playbackSpeed: hint));
+      await tester.pump();
+      expect(
+        tester
+            .widget<Text>(
+              find.byKey(const ValueKey('voice-note-playback-rate-value')),
+            )
+            .data,
+        '1×',
+        reason: 'hint $hint',
+      );
+      expect(player.speeds, isEmpty, reason: 'hint $hint');
+    }
+    // Your own note ignores even a sane hint: it always starts at 1x.
+    final own = FakeVoiceNotePlayer();
+    await tester.pumpWidget(
+      card(player: own, ownNote: true, playbackSpeed: '1.5'),
+    );
+    await tester.pump();
+    expect(own.speeds, isEmpty);
+  });
+
+  test('the rate table is the same on both clients', () {
+    expect(voiceNoteMaxPlaybackRate, 2);
+    expect(voiceNoteMinPlaybackRate, 0.5);
+    expect(ownVoiceNoteRateStep, 0.25);
+    expect(receivedVoiceNoteRateStep, 0.1);
+    expect(nextVoiceNotePlaybackRate(1.9, ownNote: false, defaultRate: 1), 2);
+    expect(nextVoiceNotePlaybackRate(2, ownNote: false, defaultRate: 1.1), 1.1);
+    expect(
+      nextVoiceNotePlaybackRate(0.8, ownNote: false, defaultRate: 0.8),
+      0.9,
+    );
+    expect(
+      nextVoiceNotePlaybackRate(double.nan, ownNote: true, defaultRate: 1),
+      1,
+    );
+    expect(nextVoiceNotePlaybackRate(0.25, ownNote: true, defaultRate: 1), 1);
+    expect(voiceNoteDefaultPlaybackRate(1.1000000001, ownNote: false), 1.1);
+    expect(formatVoiceNotePlaybackRate(1.1 + 0.1), '1.2×');
+    expect(formatVoiceNotePlaybackRate(1.25), '1.25×');
+    expect(formatVoiceNotePlaybackRate(2), '2×');
   });
 
   testWidgets('the speed choice survives the card remounting', (tester) async {
@@ -196,43 +298,69 @@ void main() {
             find.byKey(const ValueKey('voice-note-playback-rate-value')),
           )
           .data,
-      '1.5×',
+      '1.1×',
     );
     expect(players, isEmpty);
-    expect(first.speeds, [1.5]);
+    expect(first.speeds, [1.1]);
     // The fresh player was told the remembered rate.
-    expect(second.speeds, [1.5]);
+    expect(second.speeds, [1.1]);
   });
 
-  testWidgets('transcript starts folded and unfolds on playback only in DMs', (
+  testWidgets('transcript starts folded everywhere, even in a DM', (
     tester,
   ) async {
-    final dmPlayer = FakeVoiceNotePlayer();
-    await tester.pumpWidget(
-      card(player: dmPlayer, transcriptOpenByDefault: true),
-    );
+    final player = FakeVoiceNotePlayer();
+    await tester.pumpWidget(card(player: player));
     await tester.pump();
     expect(find.text('Show transcript'), findsOneWidget);
     expect(bodyFinder, findsNothing);
 
-    await tester.tap(playFinder);
-    await tester.pumpAndSettle();
-    expect(find.text('Transcript'), findsOneWidget);
-    expect(bodyFinder, findsOneWidget);
-    expect(find.text(_transcript), findsOneWidget);
-
-    final channelPlayer = FakeVoiceNotePlayer();
-    await tester.pumpWidget(
-      card(player: channelPlayer, transcriptOpenByDefault: false),
-    );
-    await tester.pump();
+    // Playing does not unfold it; the words wait to be asked for.
     await tester.tap(playFinder);
     await tester.pumpAndSettle();
     expect(find.text('Transcript'), findsOneWidget);
     expect(bodyFinder, findsNothing);
+
+    await tester.tap(toggleFinder);
+    await tester.pumpAndSettle();
+    expect(bodyFinder, findsOneWidget);
+    expect(find.text(_transcript), findsOneWidget);
   });
 
-  testWidgets('the fold choice is remembered per message, not globally', (
+  testWidgets('opening one transcript keeps the next ones open', (
+    tester,
+  ) async {
+    await tester.pumpWidget(
+      card(player: FakeVoiceNotePlayer(), messageId: 'message-1'),
+    );
+    await tester.pump();
+    expect(bodyFinder, findsNothing);
+    await tester.tap(toggleFinder);
+    await tester.pumpAndSettle();
+    expect(bodyFinder, findsOneWidget);
+    expect(prefs.getBool(voiceNoteTranscriptLastChoicePrefsKey), isTrue);
+
+    // A fresh container (a newly opened channel, or the next launch) starts
+    // the next card open.
+    await tester.pumpWidget(
+      card(player: FakeVoiceNotePlayer(), messageId: 'message-2'),
+    );
+    await tester.pump();
+    expect(bodyFinder, findsOneWidget);
+
+    // Folding it folds the ones after it too.
+    await tester.tap(toggleFinder);
+    await tester.pumpAndSettle();
+    expect(bodyFinder, findsNothing);
+    expect(prefs.getBool(voiceNoteTranscriptLastChoicePrefsKey), isFalse);
+    await tester.pumpWidget(
+      card(player: FakeVoiceNotePlayer(), messageId: 'message-3'),
+    );
+    await tester.pump();
+    expect(bodyFinder, findsNothing);
+  });
+
+  testWidgets("a message's own fold choice wins over the sticky default", (
     tester,
   ) async {
     const scopeKey = ValueKey('pinned-scope');
@@ -245,20 +373,42 @@ void main() {
         message(url: _otherUrl, messageId: 'message-2'),
       ],
     );
+    final firstBody = find.descendant(
+      of: find.byKey(const ValueKey('voice-note-attachment:$_url')),
+      matching: bodyFinder,
+    );
+    final secondBody = find.descendant(
+      of: find.byKey(const ValueKey('voice-note-attachment:$_otherUrl')),
+      matching: bodyFinder,
+    );
     await tester.pumpWidget(
       scope(key: scopeKey, overrides: overrides, child: both()),
     );
     await tester.pump();
     expect(bodyFinder, findsNothing);
 
+    // Opening the first opens the second too: that is the sticky default.
     await tester.tap(toggleFinder.first);
     await tester.pumpAndSettle();
-    expect(bodyFinder, findsOneWidget);
+    expect(firstBody, findsOneWidget);
+    expect(secondBody, findsOneWidget);
     expect(prefs.getStringList(voiceNoteTranscriptChoicesPrefsKey), [
       'message-1=1',
     ]);
 
-    // A remount keeps the first open and the second folded.
+    // Folding the second is remembered for it alone; the first keeps its
+    // own choice, and the sticky default is now folded.
+    await tester.tap(toggleFinder.last);
+    await tester.pumpAndSettle();
+    expect(firstBody, findsOneWidget);
+    expect(secondBody, findsNothing);
+    expect(prefs.getStringList(voiceNoteTranscriptChoicesPrefsKey), [
+      'message-1=1',
+      'message-2=0',
+    ]);
+    expect(prefs.getBool(voiceNoteTranscriptLastChoicePrefsKey), isFalse);
+
+    // A remount reads the same choices back: first open, second folded.
     await tester.pumpWidget(
       scope(key: scopeKey, overrides: overrides, child: const SizedBox()),
     );
@@ -266,47 +416,15 @@ void main() {
       scope(key: scopeKey, overrides: overrides, child: both()),
     );
     await tester.pump();
-    expect(bodyFinder, findsOneWidget);
-    expect(
-      find.descendant(
-        of: find.byKey(const ValueKey('voice-note-attachment:$_url')),
-        matching: bodyFinder,
-      ),
-      findsOneWidget,
-    );
+    expect(firstBody, findsOneWidget);
+    expect(secondBody, findsNothing);
 
-    // Folding a DM card that auto-opened is remembered for that message
-    // only; a fresh container (new install) reads the same list back.
+    // A third card with no choice of its own follows the sticky default.
     await tester.pumpWidget(
-      card(
-        player: FakeVoiceNotePlayer(),
-        messageId: 'dm-1',
-        transcriptOpenByDefault: true,
-      ),
+      card(player: FakeVoiceNotePlayer(), messageId: 'message-3'),
     );
     await tester.pump();
-    await tester.tap(playFinder);
-    await tester.pumpAndSettle();
-    expect(bodyFinder, findsOneWidget);
-    await tester.tap(toggleFinder);
-    await tester.pumpAndSettle();
     expect(bodyFinder, findsNothing);
-    expect(prefs.getStringList(voiceNoteTranscriptChoicesPrefsKey), [
-      'message-1=1',
-      'dm-1=0',
-    ]);
-
-    await tester.pumpWidget(
-      card(
-        player: FakeVoiceNotePlayer(),
-        messageId: 'dm-2',
-        transcriptOpenByDefault: true,
-      ),
-    );
-    await tester.pump();
-    await tester.tap(playFinder);
-    await tester.pumpAndSettle();
-    expect(bodyFinder, findsOneWidget);
   });
 
   test('remembered transcript choices stay bounded', () async {

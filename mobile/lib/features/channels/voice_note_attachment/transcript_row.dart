@@ -3,21 +3,22 @@ part of '../voice_note_attachment.dart';
 /// "Transcript" header that folds and unfolds the transcript body.
 ///
 /// The header is the single semantics owner for the toggle. Every card
-/// starts folded (ReceivedIdle); in a DM the transcript unfolds when
-/// playback starts (Main) unless this message remembers a choice, and a
-/// fold made while playing stays folded (ReceivedCollapsed). Choices are
-/// remembered per message, so one toggle never moves another card.
+/// starts folded on a fresh install; a message that remembers a choice
+/// keeps it, and any other card starts from the last choice made anywhere,
+/// so opening one transcript keeps the next ones open. Folding is remembered
+/// the same way, so one card you folded never pops back open.
 class _VoiceNoteTranscriptRow extends ConsumerWidget {
   const _VoiceNoteTranscriptRow({
     required this.messageId,
     required this.transcript,
-    required this.opensOnPlayback,
     required this.hasPlayed,
   });
 
   final String messageId;
   final String transcript;
-  final bool opensOnPlayback;
+
+  /// Playback has started at least once; the header reads "Transcript"
+  /// rather than the "Show transcript" invitation from then on.
   final bool hasPlayed;
 
   @override
@@ -27,14 +28,17 @@ class _VoiceNoteTranscriptRow extends ConsumerWidget {
         (choices) => choices[messageId],
       ),
     );
-    final isOpen = remembered ?? (opensOnPlayback && hasPlayed);
+    final lastChoice = ref.watch(voiceNoteTranscriptLastChoiceProvider);
+    final isOpen = remembered ?? lastChoice;
     final color = context.colors.onSurfaceVariant;
     final reducedMotion = MediaQuery.disableAnimationsOf(context);
     void toggle() {
       unawaited(HapticFeedback.selectionClick());
+      final open = !isOpen;
       ref
           .read(voiceNoteTranscriptChoicesProvider.notifier)
-          .set(messageId, open: !isOpen);
+          .set(messageId, open: open);
+      ref.read(voiceNoteTranscriptLastChoiceProvider.notifier).set(open: open);
     }
 
     return Column(

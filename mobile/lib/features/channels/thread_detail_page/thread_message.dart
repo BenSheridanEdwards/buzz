@@ -40,7 +40,6 @@ class _ThreadMessage extends HookConsumerWidget {
         ref.watch(userCacheProvider.select((cache) => cache[pk])) ??
         ref.read(userCacheProvider.notifier).get(pk);
     final displayName = profile?.label ?? shortPubkey(message.pubkey);
-    final isDmChannel = ref.watch(isDmChannelProvider(channelId));
     final isAgent =
         ref.watch(agentMentionPubkeysProvider(channelId)).contains(pk) ||
         profile?.ownerPubkey != null;
@@ -234,7 +233,8 @@ class _ThreadMessage extends HookConsumerWidget {
                                   channelNames: channelNames,
                                   tags: message.tags,
                                   voiceNoteSenderName: displayName,
-                                  voiceNoteTranscriptOpenByDefault: isDmChannel,
+                                  voiceNoteIsOwn:
+                                      currentPubkey?.toLowerCase() == pk,
                                   voiceNoteMessageId: message.id,
                                   baseStyle: messageBodyTextStyle.copyWith(
                                     color: context.colors.onSurface,

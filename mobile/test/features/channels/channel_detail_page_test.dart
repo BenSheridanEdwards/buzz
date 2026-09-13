@@ -1957,65 +1957,101 @@ void main() {
       );
     });
 
-    for (final (channelType, unfolds) in [('dm', true), ('stream', false)]) {
-      testWidgets('a voice-note transcript in a $channelType channel '
-          '${unfolds ? 'unfolds' : 'stays folded'} when playback starts', (
-        tester,
-      ) async {
-        const audioUrl = 'https://example.com/media/note.mp4';
-        final channel = Channel(
-          id: _channelId,
-          name: channelType == 'dm' ? '' : 'general',
-          channelType: channelType,
-          visibility: 'open',
-          description: '',
-          createdBy: 'abc123',
-          createdAt: DateTime(2025),
-          memberCount: 2,
-          isMember: true,
-        );
-        await tester.pumpWidget(
-          _buildTestable(
-            channel: channel,
-            messages: [
-              _textMsg(
-                id: 'voice-1',
-                pubkey: 'alice',
-                content: '![audio]($audioUrl)',
-                extraTags: const [
-                  [
-                    'imeta',
-                    'url $audioUrl',
-                    'm audio/mp4',
-                    'duration 24.0',
-                    'alt Status is green on the Studio.',
+    for (final channelType in ['dm', 'stream']) {
+      testWidgets(
+        'a voice-note transcript in a $channelType channel stays folded '
+        'when playback starts',
+        (tester) async {
+          const audioUrl = 'https://example.com/media/note.mp4';
+          final channel = Channel(
+            id: _channelId,
+            name: channelType == 'dm' ? '' : 'general',
+            channelType: channelType,
+            visibility: 'open',
+            description: '',
+            createdBy: 'abc123',
+            createdAt: DateTime(2025),
+            memberCount: 2,
+            isMember: true,
+          );
+          await tester.pumpWidget(
+            _buildTestable(
+              channel: channel,
+              messages: [
+                _textMsg(
+                  id: 'voice-1',
+                  pubkey: 'alice',
+                  content: '![audio]($audioUrl)',
+                  extraTags: const [
+                    [
+                      'imeta',
+                      'url $audioUrl',
+                      'm audio/mp4',
+                      'duration 24.0',
+                      'alt Status is green on the Studio.',
+                    ],
                   ],
-                ],
-              ),
-            ],
-            users: const {
-              'alice': UserProfile(pubkey: 'alice', displayName: 'Alice'),
-            },
-            extraOverrides: [
-              voiceNotePlayerFactoryProvider.overrideWithValue(
-                FakeVoiceNotePlayer.new,
-              ),
-            ],
-          ),
-        );
-        await tester.pumpAndSettle();
+                ),
+              ],
+              users: const {
+                'alice': UserProfile(pubkey: 'alice', displayName: 'Alice'),
+              },
+              extraOverrides: [
+                voiceNotePlayerFactoryProvider.overrideWithValue(
+                  FakeVoiceNotePlayer.new,
+                ),
+              ],
+            ),
+          );
+          await tester.pumpAndSettle();
 
-        final body = find.byKey(const ValueKey('voice-note-transcript-body'));
-        expect(find.text('Show transcript'), findsOneWidget);
-        expect(body, findsNothing);
+          final body = find.byKey(const ValueKey('voice-note-transcript-body'));
+          expect(find.text('Show transcript'), findsOneWidget);
+          expect(body, findsNothing);
 
-        await tester.tap(find.byKey(const ValueKey('voice-note-play-pause')));
-        await tester.pumpAndSettle();
+          await tester.tap(find.byKey(const ValueKey('voice-note-play-pause')));
+          await tester.pumpAndSettle();
 
-        expect(find.text('0:00 · Alice · 0:24'), findsOneWidget);
-        expect(body, unfolds ? findsOneWidget : findsNothing);
-      });
+          expect(find.text('0:00 · Alice · 0:24'), findsOneWidget);
+          // The words wait to be asked for, in a DM as much as a channel.
+          expect(body, findsNothing);
+        },
+      );
     }
+
+    testWidgets('your own voice note steps its speed by a quarter', (
+      tester,
+    ) async {
+      const audioUrl = 'https://example.com/media/mine.mp4';
+      await tester.pumpWidget(
+        _buildTestable(
+          messages: [
+            _textMsg(
+              id: 'voice-mine',
+              pubkey: 'self',
+              content: '![audio]($audioUrl)',
+              extraTags: const [
+                ['imeta', 'url $audioUrl', 'm audio/mp4', 'duration 24.0'],
+              ],
+            ),
+          ],
+          huddleCurrentPubkey: 'self',
+          extraOverrides: [
+            voiceNotePlayerFactoryProvider.overrideWithValue(
+              FakeVoiceNotePlayer.new,
+            ),
+          ],
+        ),
+      );
+      await tester.pumpAndSettle();
+
+      final value = find.byKey(
+        const ValueKey('voice-note-playback-rate-value'),
+      );
+      await tester.tap(find.byKey(const ValueKey('voice-note-playback-rate')));
+      await tester.pumpAndSettle();
+      expect(tester.widget<Text>(value).data, '1.25×');
+    });
 
     testWidgets(
       'channel details combines people and agents in one member list',

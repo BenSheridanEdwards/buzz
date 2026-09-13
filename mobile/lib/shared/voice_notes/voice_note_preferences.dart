@@ -37,8 +37,9 @@ final voiceNoteReviewSettingProvider =
     );
 
 /// Transcript fold choices remembered per message id on this device, in
-/// the order they were made. A message without an entry falls back to its
-/// channel default, so one toggle never folds or unfolds every other card.
+/// the order they were made. A message without an entry falls back to the
+/// last choice made anywhere ([voiceNoteTranscriptLastChoiceProvider]), so
+/// a card you folded stays folded even after you open a newer one.
 class VoiceNoteTranscriptChoicesNotifier extends Notifier<Map<String, bool>> {
   @override
   Map<String, bool> build() {
@@ -76,6 +77,36 @@ class VoiceNoteTranscriptChoicesNotifier extends Notifier<Map<String, bool>> {
     );
   }
 }
+
+/// Shared-preferences key for the last transcript fold choice made on this
+/// device, which every card without its own remembered choice starts from.
+const voiceNoteTranscriptLastChoicePrefsKey = 'voice_note_transcript_open';
+
+/// The fold a card starts at when its message remembers nothing: folded on
+/// a fresh install, then whatever was chosen last. Opening one transcript
+/// keeps the next ones open; folding one folds the next ones.
+class VoiceNoteTranscriptLastChoiceNotifier extends Notifier<bool> {
+  @override
+  bool build() =>
+      ref
+          .read(savedPrefsProvider)
+          .getBool(voiceNoteTranscriptLastChoicePrefsKey) ??
+      false;
+
+  /// Persists [open] as one atomic write under a single key.
+  void set({required bool open}) {
+    state = open;
+    ref
+        .read(savedPrefsProvider)
+        .setBool(voiceNoteTranscriptLastChoicePrefsKey, open);
+  }
+}
+
+/// Provides the last transcript fold choice made on this device.
+final voiceNoteTranscriptLastChoiceProvider =
+    NotifierProvider<VoiceNoteTranscriptLastChoiceNotifier, bool>(
+      VoiceNoteTranscriptLastChoiceNotifier.new,
+    );
 
 /// Provides the remembered transcript fold choices keyed by message id.
 final voiceNoteTranscriptChoicesProvider =
