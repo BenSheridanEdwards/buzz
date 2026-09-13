@@ -4,12 +4,12 @@ import type { ParsedMessageLink } from "@/features/messages/lib/messageLink";
 import type { ParsedEntityLink } from "@/shared/lib/entityLink";
 import type { Channel } from "@/shared/api/types";
 import type { CustomEmoji } from "@/shared/lib/remarkCustomEmoji";
-import type { VoiceNoteConversationContext } from "@/features/messages/lib/audioAttachment";
 import type { VideoReviewContext } from "../VideoPlayer";
 
-/** Card context for a received voice note: who sent it and where. */
+/** Card context for a voice note: who sent it, and whether that was you. */
 export type VoiceNoteCardContext = {
-  conversation: VoiceNoteConversationContext;
+  /** The viewer recorded this note; its speed pill steps by a quarter. */
+  ownNote: boolean;
   /**
    * Renders the attachment's transcript (its imeta `alt`) through the message
    * Markdown pipeline so emoji, mentions and emphasis match the body. Must be
@@ -28,6 +28,8 @@ export type ImetaEntry = {
   size?: number;
   filename?: string;
   duration?: number;
+  /** Rate a voice note is meant to play at (imeta `playback_speed`). */
+  playbackSpeed?: number;
   /** SHA-256 hex of the attachment bytes (from imeta `x` field). */
   x?: string;
 };

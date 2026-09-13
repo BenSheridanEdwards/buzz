@@ -49,6 +49,9 @@ export function parseImetaTags(
         case "duration":
           entry.duration = parseFloat(val);
           break;
+        case "playback_speed":
+          entry.playbackSpeed = parseFloat(val);
+          break;
         case "image":
           entry.image = val;
           break;
