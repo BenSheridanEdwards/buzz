@@ -19,6 +19,11 @@ type MembershipDeniedProps = {
   onImportKey: (nsec: string) => Promise<void>;
   onRetry: () => void;
   pubkey: string;
+  /**
+   * What the last "Try again" ran into when it could not reach a verdict
+   * (relay unreachable, relay error). Null when there is nothing to add.
+   */
+  retryNotice?: string | null;
 };
 
 export function MembershipDenied({
@@ -28,6 +33,7 @@ export function MembershipDenied({
   onImportKey,
   onRetry,
   pubkey,
+  retryNotice = null,
 }: MembershipDeniedProps) {
   const npub = React.useMemo(() => {
     if (!pubkey) {
@@ -247,7 +253,21 @@ export function MembershipDenied({
             </form>
           ) : (
             <>
-              <Button className="w-full" onClick={onRetry} type="button">
+              {retryNotice ? (
+                <p
+                  className="text-sm text-destructive"
+                  data-testid="membership-denied-retry-notice"
+                  role="status"
+                >
+                  {retryNotice}
+                </p>
+              ) : null}
+              <Button
+                className="w-full"
+                data-testid="membership-denied-retry"
+                onClick={onRetry}
+                type="button"
+              >
                 Try again
               </Button>
               <div className="flex gap-2">

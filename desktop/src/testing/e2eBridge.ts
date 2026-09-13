@@ -498,6 +498,7 @@ type E2eConfig = {
     relayRequiresMembership?: boolean;
     /** Delay EOSE for membership snapshots after delivering the event. */
     relayMembershipEoseDelayMs?: number;
+
     relayRole?: "owner" | "admin" | "member" | null;
     // Descriptors returned by the mocked `pick_and_upload_media` /
     // `upload_media_bytes` commands. Lets a spec drive the attachment flow
@@ -1424,6 +1425,10 @@ declare global {
     /** Queue deterministic mock AUTH outcomes, consumed in order. */
     __BUZZ_E2E_QUEUE_AUTH_RESPONSES__?: (
       responses: Array<{ success: boolean; message: string }>,
+    ) => void;
+    /** Add the active identity to the mock relay roster, as an admin would. */
+    __BUZZ_E2E_ADD_ACTIVE_IDENTITY_AS_RELAY_MEMBER__?: (
+      role?: "admin" | "member",
     ) => void;
     /** Inject CLOSED into every active mock live subscription. */
     __BUZZ_E2E_CLOSE_LIVE_SUBSCRIPTIONS__?: (reason: string) => number;
@@ -11817,6 +11822,18 @@ export function maybeInstallE2eTauriMocks() {
     relayClient.getConnectionState();
   window.__BUZZ_E2E_QUEUE_AUTH_RESPONSES__ = (responses) => {
     mockAuthResponses.push(...responses);
+  };
+  window.__BUZZ_E2E_ADD_ACTIVE_IDENTITY_AS_RELAY_MEMBER__ = (
+    role = "member",
+  ) => {
+    const pubkey = getMockMemberPubkey(getConfig());
+    if (mockRelayMembers.some((member) => member.pubkey === pubkey)) return;
+    mockRelayMembers.push({
+      pubkey,
+      role,
+      added_by: ALICE_PUBKEY,
+      created_at: new Date().toISOString(),
+    });
   };
   window.__BUZZ_E2E_QUEUE_CHANNEL_HISTORY_CLOSES__ = (reasons) => {
     mockChannelHistoryCloses.push(...reasons);

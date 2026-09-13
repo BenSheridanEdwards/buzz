@@ -32,6 +32,7 @@ import { Button } from "@/shared/ui/button";
 import { Dialog, DialogContent, DialogTitle } from "@/shared/ui/dialog";
 import { Input } from "@/shared/ui/input";
 import { MembershipDenied } from "./MembershipDenied";
+import { reengageRelayForMembershipRetry } from "../lib/membershipRetry";
 import { StartupWindowDragRegion } from "@/shared/ui/StartupWindowDragRegion";
 import {
   ONBOARDING_PRIMARY_CTA_CLASS,
@@ -394,8 +395,15 @@ export function CommunityOnboardingFlow({
             update({ stage: "connecting", error: undefined });
           }}
           onRetry={() => {
-            setIsMembershipDenied(false);
-            update({ stage: "connecting", error: undefined });
+            void (async () => {
+              // The denial latched the relay session terminal; "Try again"
+              // is the re-engagement that lets it reconnect (#37).
+              await reengageRelayForMembershipRetry(() =>
+                relayClient.preconnect(),
+              );
+              setIsMembershipDenied(false);
+              update({ stage: "connecting", error: undefined });
+            })();
           }}
           pubkey={deniedPubkey}
         />

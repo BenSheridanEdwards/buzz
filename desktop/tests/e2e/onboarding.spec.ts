@@ -3607,6 +3607,95 @@ test("open relay skips membership gating during onboarding", async ({
   await expect(page.getByTestId("membership-denied")).toHaveCount(0);
 });
 
+test("membership retry after the admin adds the key advances onboarding", async ({
+  page,
+}) => {
+  // #37: the roster says "not a member" and, while the screen is up, the
+  // relay also rejects a reconnect AUTH as `restricted: not a relay member`,
+  // which latches the relay session terminal. The admin then adds the key.
+  // "Try again" must re-open the session and move on, not stay on the
+  // denied screen until the app is relaunched.
+  await seedActiveIdentity(page, BLANK_TYLER_IDENTITY);
+  await installMockBridge(
+    page,
+    {
+      relayRequiresMembership: true,
+      relayRole: null,
+    },
+    { skipOnboardingSeed: true },
+  );
+  await page.goto("/");
+
+  await page.getByTestId("onboarding-display-name").fill("Morty QA");
+  await page.getByTestId("onboarding-next").click();
+  await expect(page.getByTestId("membership-denied")).toBeVisible();
+
+  // The socket drops and the relay refuses the next AUTH: a closed relay's
+  // answer to a non-member, and the session latches terminal on it.
+  await page.evaluate(() => {
+    const queue = window.__BUZZ_E2E_QUEUE_AUTH_RESPONSES__;
+    if (!queue) throw new Error("E2E AUTH response seam is not installed.");
+    queue([{ success: false, message: "restricted: not a relay member" }]);
+    window.__BUZZ_E2E_DISCONNECT_MOCK_WEBSOCKETS__?.();
+  });
+  await expect
+    .poll(
+      () =>
+        page.evaluate(() => window.__BUZZ_E2E_GET_RELAY_CONNECTION_STATE__?.()),
+      { timeout: 10_000 },
+    )
+    .toBe("disconnected");
+
+  // The admin adds the key while the screen is up.
+  await page.evaluate(() => {
+    const add = window.__BUZZ_E2E_ADD_ACTIVE_IDENTITY_AS_RELAY_MEMBER__;
+    if (!add) throw new Error("E2E relay member seam is not installed.");
+    add("member");
+  });
+
+  await page.getByTestId("membership-denied-retry").click();
+
+  await expect(page.getByTestId("membership-denied")).toHaveCount(0);
+  await expect(page.getByTestId("onboarding-page-avatar")).toBeVisible();
+});
+
+test("membership retry says so when the relay cannot be reached", async ({
+  page,
+}) => {
+  await seedActiveIdentity(page, BLANK_TYLER_IDENTITY);
+  await installMockBridge(
+    page,
+    {
+      relayRequiresMembership: true,
+      relayRole: null,
+    },
+    { skipOnboardingSeed: true },
+  );
+  await page.goto("/");
+
+  await page.getByTestId("onboarding-display-name").fill("Morty QA");
+  await page.getByTestId("onboarding-next").click();
+  await expect(page.getByTestId("membership-denied")).toBeVisible();
+  await expect(page.getByTestId("membership-denied-retry-notice")).toHaveCount(
+    0,
+  );
+
+  // Still not a member, and now the relay is down: the screen has to say
+  // the check could not run rather than sit there unchanged.
+  await page.evaluate(() => {
+    const setUnavailable = window.__BUZZ_E2E_SET_MOCK_WEBSOCKET_UNAVAILABLE__;
+    if (!setUnavailable)
+      throw new Error("E2E websocket seam is not installed.");
+    setUnavailable(true);
+  });
+  await page.evaluate(() => window.__BUZZ_E2E_DISCONNECT_MOCK_WEBSOCKETS__?.());
+  await page.getByTestId("membership-denied-retry").click();
+  await expect(page.getByTestId("membership-denied")).toBeVisible();
+  await expect(page.getByTestId("membership-denied-retry-notice")).toBeVisible({
+    timeout: 20_000,
+  });
+});
+
 test("membership denial can import a different invited key", async ({
   page,
 }) => {
