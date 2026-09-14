@@ -2283,6 +2283,26 @@ mod inactivity_tests {
     }
 
     #[test]
+    fn delivery_turn_duplicate_guard_uses_turn_start_not_trigger_time() {
+        // A delivery turn reuses the thread's last real message as its trigger —
+        // a message the agent typically already replied to. Judging "already
+        // published?" from that message's timestamp would see the earlier reply
+        // and swallow the report; the turn must be judged from its own start.
+        let trigger_at = nostr::Timestamp::from(1_000_u64);
+        let turn_started = nostr::Timestamp::from(2_000_u64);
+        assert_eq!(
+            pool::fallback_since(true, trigger_at, turn_started),
+            turn_started
+        );
+        // A normal turn keeps the trigger's timestamp (the engine can only have
+        // answered after the message arrived).
+        assert_eq!(
+            pool::fallback_since(false, trigger_at, turn_started),
+            trigger_at
+        );
+    }
+
+    #[test]
     fn zero_disables_expiry_and_in_flight_turns_defer_it() {
         let started = tokio::time::Instant::now();
         let after_bound = started + Duration::from_secs(61);
@@ -5513,7 +5533,7 @@ fn dispatch_delivery_turns(
             scope: scope.clone(),
             events: vec![BatchEvent {
                 event: trigger,
-                prompt_tag: "background-result".to_string(),
+                prompt_tag: pool::DELIVERY_PROMPT_TAG.to_string(),
                 received_at: std::time::Instant::now(),
             }],
             cancelled_events: Vec::new(),
