@@ -2281,6 +2281,7 @@ fn publish_reply_media(
     turn_id: &str,
     guard: crate::attachments::LiveTurnGuard,
     reply_text: String,
+    turn_started: nostr::Timestamp,
 ) -> Option<tokio::task::JoinHandle<()>> {
     let capture = agent.acp.take_turn_media();
     let Some(batch) = batch else {
@@ -2306,6 +2307,9 @@ fn publish_reply_media(
         return None;
     }
     let trigger = batch.events.last()?;
+    // A delivery turn is anchored on an older, already-answered message; the
+    // duplicate-reply guard must judge it from the turn's own start.
+    let is_delivery_turn = trigger.prompt_tag == DELIVERY_PROMPT_TAG;
     let observer = TurnObserver::for_agent(agent);
     let ctx = Arc::clone(ctx);
     let channel_id = batch.channel_id;
@@ -2373,7 +2377,8 @@ fn publish_reply_media(
         // relay at all do the words go out on their own, and then through the
         // same settle-and-check as a plain text turn.
         if reply_text_needs_own_message(report.event_id.is_some(), &reply_text) {
-            publish_text_reply_after_settle(&ctx, channel_id, &trigger, reply_text).await;
+            let since = fallback_since(is_delivery_turn, trigger.created_at, turn_started);
+            publish_text_reply_after_settle(&ctx, channel_id, &trigger, reply_text, since).await;
         }
         observer.emit(
             "turn_media_published",
@@ -2546,6 +2551,9 @@ pub async fn run_prompt_task(
     };
     let observer_channel_id = source.channel_id();
     let turn_started_at = chrono::Utc::now().to_rfc3339();
+    // Wall-clock start of this turn, for the duplicate-reply guard on a
+    // delivery turn (see `fallback_since`).
+    let turn_started_ts = nostr::Timestamp::now();
     // This turn's attachment directory stays out of the prune while the
     // engine may read it and, after the turn, while its reply media is
     // published (the guard moves into that task).
@@ -3541,6 +3549,7 @@ pub async fn run_prompt_task(
                             &turn_id,
                             turn_dir_guard,
                             String::new(),
+                            turn_started_ts,
                         );
                         let usage = agent.acp.take_turn_usage();
                         publish_agent_turn_metric(
@@ -3638,9 +3647,10 @@ pub async fn run_prompt_task(
                     &turn_id,
                     turn_dir_guard,
                     reply_text.clone(),
+                    turn_started_ts,
                 );
                 if reply_text_needs_own_message(media_task.is_some(), &reply_text) {
-                    publish_text_reply_fallback(&ctx, batch.as_ref(), reply_text);
+                    publish_text_reply_fallback(&ctx, batch.as_ref(), reply_text, turn_started_ts);
                 }
             }
 
@@ -5831,17 +5841,51 @@ fn query_says_published(value: &serde_json::Value) -> bool {
 /// alone. An ACP engine that simply answers (the Hermes runtime does) would
 /// otherwise complete a turn, log `end_turn`, and leave the human with
 /// silence; its answer is published here, anchored exactly like a media reply.
+/// `prompt_tag` of the synthetic trigger a delivery turn is anchored on: a
+/// finished background result being reported back into its own thread. The
+/// harness dispatches such turns on the thread's *last real* message, so
+/// anything keyed on that message's age must treat the turn specially.
+pub(crate) const DELIVERY_PROMPT_TAG: &str = "background-result";
+
+/// The `since` the duplicate-reply guard should use for a turn.
+///
+/// The guard asks "did the engine already publish since `since`?". For a
+/// normal turn the trigger's timestamp is right: the engine can only have
+/// answered after the message arrived. A delivery turn reuses the thread's
+/// last real message as its trigger — a message the agent has typically
+/// already replied to — so from that timestamp the guard sees the earlier
+/// reply and swallows the report as a duplicate. Such a turn must be judged
+/// from its own start instead.
+pub(crate) fn fallback_since(
+    is_delivery_turn: bool,
+    trigger_created_at: nostr::Timestamp,
+    turn_started: nostr::Timestamp,
+) -> nostr::Timestamp {
+    if is_delivery_turn {
+        turn_started
+    } else {
+        trigger_created_at
+    }
+}
+
 fn publish_text_reply_fallback(
     ctx: &Arc<PromptContext>,
     batch: Option<&FlushBatch>,
     text: String,
+    turn_started: nostr::Timestamp,
 ) -> Option<tokio::task::JoinHandle<()>> {
     let batch = batch?;
-    let trigger = batch.events.last()?.event.clone();
+    let last = batch.events.last()?;
+    let trigger = last.event.clone();
+    let since = fallback_since(
+        last.prompt_tag == DELIVERY_PROMPT_TAG,
+        trigger.created_at,
+        turn_started,
+    );
     let channel_id = batch.channel_id;
     let ctx = Arc::clone(ctx);
     Some(tokio::spawn(async move {
-        publish_text_reply_after_settle(&ctx, channel_id, &trigger, text).await;
+        publish_text_reply_after_settle(&ctx, channel_id, &trigger, text, since).await;
     }))
 }
 
@@ -5874,9 +5918,12 @@ async fn publish_text_reply_after_settle(
     channel_id: Uuid,
     trigger: &nostr::Event,
     text: String,
+    since: nostr::Timestamp,
 ) {
     tokio::time::sleep(TEXT_REPLY_SETTLE).await;
-    if agent_published_message_since(&ctx.rest_client, channel_id, trigger.created_at).await {
+    // `since` is the trigger's timestamp for a normal turn and the turn's own
+    // start for a delivery turn (see `fallback_since`).
+    if agent_published_message_since(&ctx.rest_client, channel_id, since).await {
         return;
     }
     // Anchor exactly like a media reply, and like the rule the prompt gives
