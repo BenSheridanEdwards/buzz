@@ -3307,6 +3307,13 @@ async fn ingest_event_inner(
         }
     }
 
+    // Auto-onboard an owner's agent when they @-mention it in a channel it is
+    // not a member of yet. Owner-only and best-effort: mirrors a manual kind:9000
+    // add, and its failure never fails the (already-stored) message.
+    if matches!(kind_u32, KIND_STREAM_MESSAGE | KIND_STREAM_MESSAGE_V2) {
+        crate::handlers::side_effects::maybe_autojoin_owned_agents(tenant, &event, state).await;
+    }
+
     // A freshly inserted reply changed its thread's counters (updated in the
     // same transaction as the insert) — push a fresh relay-signed 39005 so
     // subscribed clients can update badge counts without refetching the head

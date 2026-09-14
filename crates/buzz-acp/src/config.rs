@@ -30,6 +30,16 @@ pub(crate) const DEFAULT_IDLE_TIMEOUT_SECS: u64 = 1_500;
 /// Override via `--max-turn-duration` / `BUZZ_ACP_MAX_TURN_DURATION`.
 pub(crate) const DEFAULT_MAX_TURN_DURATION_SECS: u64 = 7200;
 
+/// Default backfill window (seconds) applied when the agent subscribes to a
+/// channel it was *just* added to via a live member-added notification. The
+/// triggering mention is typically posted a moment before the add lands, so the
+/// live subscription's `since` must reach slightly into the past to replay it —
+/// otherwise the agent joins silently and never sees what pulled it in. Only
+/// applied to mention-filtered subscriptions, so it can only surface mentions of
+/// the agent within the window, never unrelated channel chatter.
+/// Override via `--join-backfill-secs` / `BUZZ_ACP_JOIN_BACKFILL_SECS` (0 = off).
+pub(crate) const DEFAULT_JOIN_BACKFILL_SECS: u64 = 120;
+
 /// Upper bound for `max_turn_duration` (7 days). Any higher is operationally
 /// meaningless and risks arithmetic overflow when deriving the in-flight
 /// deadline (`max_turn_duration + IN_FLIGHT_DEADLINE_BUFFER_SECS`).
@@ -320,6 +330,13 @@ pub struct CliArgs {
     #[arg(long, env = "BUZZ_ACP_HEARTBEAT_INTERVAL", default_value_t = 0)]
     pub heartbeat_interval: u64,
 
+    /// Backfill window (seconds) when subscribing to a channel the agent was just
+    /// added to live, so a mention posted just before the add is still replayed
+    /// and answered. Mention-filtered subscriptions only. 0 = subscribe from the
+    /// add timestamp with no backfill.
+    #[arg(long, env = "BUZZ_ACP_JOIN_BACKFILL_SECS", default_value_t = DEFAULT_JOIN_BACKFILL_SECS)]
+    pub join_backfill_secs: u64,
+
     /// Seconds between per-turn liveness pings (the crash backstop signal —
     /// distinct from heartbeat self-prompting). 0 = disabled.
     #[arg(long, env = "BUZZ_ACP_TURN_LIVENESS_SECS", default_value_t = 10)]
@@ -604,6 +621,10 @@ pub struct Config {
     pub max_turn_duration_secs: u64,
     pub agents: u32,
     pub heartbeat_interval_secs: u64,
+    /// Backfill window (seconds) for a channel joined live via a member-added
+    /// notification, so a mention posted just before the join is replayed.
+    /// Mention-filtered subscriptions only. 0 = no backfill.
+    pub join_backfill_secs: u64,
     /// Seconds between per-turn liveness pings. 0 = disabled. Distinct from
     /// `heartbeat_interval_secs` (agent self-prompting) — this is the desktop
     /// crash-backstop signal.
@@ -1324,6 +1345,7 @@ impl Config {
             max_turn_duration_secs,
             agents: args.agents,
             heartbeat_interval_secs: heartbeat_interval,
+            join_backfill_secs: args.join_backfill_secs,
             turn_liveness_secs,
             heartbeat_prompt,
             system_prompt,
@@ -1741,6 +1763,7 @@ mod tests {
             max_turn_duration_secs: DEFAULT_MAX_TURN_DURATION_SECS,
             agents: 1,
             heartbeat_interval_secs: 0,
+            join_backfill_secs: DEFAULT_JOIN_BACKFILL_SECS,
             turn_liveness_secs: 10,
             heartbeat_prompt: None,
             system_prompt: None,

@@ -225,6 +225,227 @@ pub async fn handle_side_effects(
     }
 }
 
+/// Distinct 32-byte pubkeys mentioned by an event's `p` tags, excluding the
+/// message author's own pubkey.
+///
+/// The author is excluded because a relay-signed REST message carries the real
+/// sender in an attribution `p` tag (see `effective_message_author`), which is
+/// not a mention. Malformed and non-32-byte `p` values are ignored, and each
+/// distinct pubkey is returned once regardless of how many times it is tagged.
+fn collect_mention_targets(event: &Event, author: &[u8]) -> Vec<Vec<u8>> {
+    let mut mentioned: Vec<Vec<u8>> = Vec::new();
+    for tag in event.tags.iter() {
+        if tag.kind().to_string() != "p" {
+            continue;
+        }
+        let Some(val) = tag.content() else { continue };
+        let Ok(bytes) = hex::decode(val) else {
+            continue;
+        };
+        if bytes.len() != 32 || bytes == author {
+            continue;
+        }
+        if !mentioned.contains(&bytes) {
+            mentioned.push(bytes);
+        }
+    }
+    mentioned
+}
+
+/// Auto-onboard an owner's agent when they @-mention it in a channel it is not
+/// yet a member of.
+///
+/// When a channel message `p`-tags an agent whose registered owner is the
+/// message author, and that agent is not already a member, the relay adds it to
+/// the roster — exactly the grant the owner could perform by hand via kind:9000
+/// PUT_USER. The agent's global member-added subscription then wires up a live
+/// channel subscription, so the owner can pull their own agent into a channel
+/// simply by mentioning it and the agent can reply.
+///
+/// Scope is deliberately **owner-only**: the mention must come from the agent's
+/// own owner, and the same NIP-29 add authority (`decide_put_user` +
+/// `decide_channel_add_policy`) that gates a manual add is enforced here, so
+/// auto-join grants nothing a manual PUT_USER would not. Mentions of non-agents,
+/// mentions by anyone other than the owner, and agents already in the channel
+/// are all no-ops.
+///
+/// Best-effort: every failure is logged, never propagated — the triggering
+/// message is already stored and delivered.
+pub async fn maybe_autojoin_owned_agents(
+    tenant: &TenantContext,
+    event: &Event,
+    state: &Arc<AppState>,
+) {
+    let Some(channel_id) = extract_h_tag_channel(event) else {
+        return;
+    };
+
+    // The message author. For relay-signed REST messages this is carried in an
+    // attribution tag; `effective_message_author` resolves it. That pubkey is
+    // NOT a mention and must be excluded below.
+    let author = effective_message_author(event, &state.relay_keypair.public_key());
+
+    // Distinct mentioned pubkeys: every valid `p` tag except the author's own.
+    let mentioned = collect_mention_targets(event, &author);
+    if mentioned.is_empty() {
+        return;
+    }
+
+    // Hot-path shortcut: on almost every mention the mentioned party is already
+    // a member, so drop those via the cached membership check before touching
+    // the DB. Only genuine non-members warrant the channel + roster reads below.
+    let mut candidates: Vec<Vec<u8>> = Vec::new();
+    for target in mentioned {
+        match state
+            .is_member_cached(tenant.community(), channel_id, &target)
+            .await
+        {
+            Ok(true) => {}
+            Ok(false) => candidates.push(target),
+            // On a lookup error, keep the candidate: the authoritative
+            // member read below still gates the add.
+            Err(_) => candidates.push(target),
+        }
+    }
+    if candidates.is_empty() {
+        return;
+    }
+
+    // Load channel + roster once. A missing or archived channel is a no-op.
+    let channel = match state
+        .db
+        .get_channel_for_event_write(tenant.community(), channel_id)
+        .await
+    {
+        Ok(ch) => ch,
+        Err(_) => return,
+    };
+    if channel.archived_at.is_some() {
+        return;
+    }
+    let members = match state.db.get_members(tenant.community(), channel_id).await {
+        Ok(m) => m,
+        Err(e) => {
+            warn!(channel = %channel_id, error = %e, "auto-join: member read failed");
+            return;
+        }
+    };
+    let actor_role: Option<MemberRole> = members
+        .iter()
+        .find(|m| m.pubkey == author)
+        .and_then(|m| m.role.parse().ok());
+
+    for target in candidates {
+        // Re-check against the authoritative roster read: the cached check above
+        // can lag a very recent add, and this closes that gap.
+        if members.iter().any(|m| m.pubkey == target) {
+            continue;
+        }
+
+        // The mentioned pubkey must be an agent whose owner is the author. A
+        // single read yields both the owner and the channel-add policy; a
+        // non-agent (or an agent with no recorded owner) returns None.
+        let (policy, owner) = match state
+            .db
+            .get_agent_channel_policy(tenant.community(), &target)
+            .await
+        {
+            Ok(Some(pair)) => pair,
+            Ok(None) => continue,
+            Err(e) => {
+                warn!(channel = %channel_id, error = %e, "auto-join: policy read failed");
+                continue;
+            }
+        };
+        // Owner-only: the mention must come from the agent's own owner.
+        if owner.as_deref() != Some(author.as_slice()) {
+            continue;
+        }
+
+        // Enforce the same add authority a manual kind:9000 PUT_USER would, so
+        // auto-join can only do what the owner could already do by hand.
+        match channel_authz::decide_put_user(
+            &channel.visibility,
+            actor_role,
+            None,
+            &members,
+            &target,
+            &author,
+        ) {
+            Ok(PutUserDecision::Allow) => {}
+            Ok(PutUserDecision::CheckAddPolicy) => {
+                if let Err(e) =
+                    channel_authz::decide_channel_add_policy(&policy, owner.as_deref(), &author)
+                {
+                    tracing::debug!(channel = %channel_id, "auto-join denied by channel add policy: {e}");
+                    continue;
+                }
+            }
+            Err(e) => {
+                tracing::debug!(channel = %channel_id, "auto-join denied by put-user authority: {e}");
+                continue;
+            }
+        }
+
+        // Grant membership — mirrors handle_put_user's grant path.
+        if let Err(e) = state
+            .db
+            .add_member(
+                tenant.community(),
+                channel_id,
+                &target,
+                MemberRole::Member,
+                Some(&author),
+            )
+            .await
+        {
+            warn!(channel = %channel_id, error = %e, "auto-join: add_member failed");
+            continue;
+        }
+        state.invalidate_membership(tenant, channel_id, &target);
+
+        let actor_hex = hex::encode(&author);
+        let target_hex = hex::encode(&target);
+        if let Err(e) = emit_system_message(
+            tenant,
+            state,
+            channel_id,
+            serde_json::json!({
+                "type": "member_joined",
+                "actor": actor_hex,
+                "target": target_hex,
+                "reason": "mention",
+            }),
+            chrono::Utc::now(),
+        )
+        .await
+        {
+            warn!(channel = %channel_id, error = %e, "auto-join: system message failed");
+        }
+        if let Err(e) = emit_group_discovery_events(tenant, state, channel_id).await {
+            warn!(channel = %channel_id, error = %e, "auto-join: group discovery emission failed");
+        }
+        if let Err(e) = emit_membership_notification(
+            tenant,
+            state,
+            channel_id,
+            &target,
+            &author,
+            KIND_MEMBER_ADDED_NOTIFICATION,
+        )
+        .await
+        {
+            warn!(channel = %channel_id, error = %e, "auto-join: membership notification failed");
+        }
+        info!(
+            channel = %channel_id,
+            target = %target_hex,
+            actor = %actor_hex,
+            "auto-onboarded owner's agent via mention"
+        );
+    }
+}
+
 /// Validate a standard NIP-09 deletion event before it is stored.
 ///
 /// Buzz accepts standard deletions for self-authored events, plus the owning
@@ -3768,5 +3989,58 @@ mod tests {
         }];
 
         assert!(actor_is_channel_owner_or_admin(&members, &actor));
+    }
+
+    use buzz_core::kind::KIND_STREAM_MESSAGE;
+
+    fn stream_message_with_p_tags(p_hex: &[&str]) -> Event {
+        let mut tags = vec![Tag::parse(["h", &Uuid::new_v4().to_string()]).expect("h tag")];
+        for p in p_hex {
+            tags.push(Tag::parse(["p", p]).expect("p tag"));
+        }
+        EventBuilder::new(Kind::Custom(KIND_STREAM_MESSAGE as u16), "@agent")
+            .tags(tags)
+            .sign_with_keys(&nostr::Keys::generate())
+            .expect("sign stream message")
+    }
+
+    #[test]
+    fn collect_mentions_excludes_the_author_and_dedups() {
+        let author = nostr::Keys::generate().public_key();
+        let author_hex = author.to_hex();
+        let agent = nostr::Keys::generate().public_key().to_hex();
+        // Author p-tag (REST attribution), agent mentioned twice.
+        let event = stream_message_with_p_tags(&[&author_hex, &agent, &agent]);
+
+        let targets = collect_mention_targets(&event, &author.to_bytes());
+
+        assert_eq!(targets.len(), 1, "author excluded, duplicate agent deduped");
+        assert_eq!(hex::encode(&targets[0]), agent);
+    }
+
+    #[test]
+    fn collect_mentions_ignores_malformed_p_values() {
+        let author = nostr::Keys::generate().public_key();
+        let agent = nostr::Keys::generate().public_key().to_hex();
+        // A non-hex value and a too-short hex value must both be skipped.
+        let event = stream_message_with_p_tags(&["not-hex", "deadbeef", &agent]);
+
+        let targets = collect_mention_targets(&event, &author.to_bytes());
+
+        assert_eq!(
+            targets.len(),
+            1,
+            "only the one valid 32-byte pubkey survives"
+        );
+        assert_eq!(hex::encode(&targets[0]), agent);
+    }
+
+    #[test]
+    fn collect_mentions_is_empty_without_mentions() {
+        let author = nostr::Keys::generate().public_key();
+        // Only the author's own p-tag present → no mentions to onboard.
+        let event = stream_message_with_p_tags(&[&author.to_hex()]);
+
+        assert!(collect_mention_targets(&event, &author.to_bytes()).is_empty());
     }
 }
