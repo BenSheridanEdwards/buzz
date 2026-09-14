@@ -5033,6 +5033,58 @@ void main() {
     });
 
     testWidgets(
+      'a note recorded after the keyboard hides is not falsely rejected',
+      (tester) async {
+        // Regression: with the keyboard up at mic-press the start is deferred
+        // until the keyboard hides, so the recorder mounts late. A real note
+        // recorded this way was wrongly reported "needs at least one second"
+        // and discarded, because the compose bar's guard fired on the phase
+        // reaching finishing while its isRecording flag was momentarily clear.
+        final recorder = _FakeVoiceNoteRecorder();
+        addTearDown(tester.view.resetViewInsets);
+        tester.view.viewInsets = const FakeViewPadding(bottom: 300);
+        await tester.pumpWidget(
+          _buildComposeBar(
+            uploadService: _FakeVoiceNoteUploadService(),
+            voiceNoteRecorderFactory: () => recorder,
+            voiceNotePlayerFactory: _FakeVoiceNotePlayer.new,
+            onSend: (_, _, {mediaTags = const <List<String>>[]}) async {},
+          ),
+        );
+
+        await _tapMic(tester);
+        // Start is deferred behind the keyboard: the recorder is not up yet.
+        expect(
+          find.byKey(const ValueKey('voice-note-recorder')),
+          findsNothing,
+        );
+
+        // Keyboard finishes hiding: the recorder mounts and capture begins.
+        tester.view.viewInsets = FakeViewPadding.zero;
+        await tester.pumpAndSettle();
+        expect(recorder.started, isTrue);
+        expect(
+          find.byKey(const ValueKey('voice-note-recorder')),
+          findsOneWidget,
+        );
+
+        await tester.tap(
+          find.byKey(const ValueKey('voice-note-recorder-send')),
+        );
+        await tester.pumpAndSettle();
+
+        expect(recorder.stopped, isTrue);
+        expect(find.text(voiceNoteHoldToRecordHint), findsNothing);
+        expect(
+          find.byKey(
+            const ValueKey('voice-note-attachment:/tmp/voice-note-test.m4a'),
+          ),
+          findsOneWidget,
+        );
+      },
+    );
+
+    testWidgets(
       'permission startup survives transient inactive and resumed states',
       (tester) async {
         final recorder = _DelayedVoiceNoteRecorder();
