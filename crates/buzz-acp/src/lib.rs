@@ -3360,8 +3360,19 @@ async fn tokio_main() -> Result<()> {
                                     if subscribed_channel_ids.contains(&ch) {
                                         tracing::debug!(channel_id = %ch, "membership notification: channel already subscribed");
                                     } else if let Some(filter) = config::resolve_dynamic_channel_filter(&config, ch, &rules) {
-                                        tracing::info!(channel_id = %ch, "membership notification: subscribing to new channel");
-                                        if let Err(e) = relay.subscribe_channel_from(ch, filter, Some(ts)).await {
+                                        // Backfill slightly into the past on a live join so a
+                                        // mention posted just before the add (e.g. the @-mention
+                                        // that auto-onboarded this agent) is replayed and answered
+                                        // instead of sitting behind the subscription. Only for
+                                        // mention-filtered subscriptions, so it can surface only
+                                        // mentions of this agent within the window.
+                                        let since = if filter.require_mention {
+                                            ts.saturating_sub(config.join_backfill_secs)
+                                        } else {
+                                            ts
+                                        };
+                                        tracing::info!(channel_id = %ch, subscribe_since = since, "membership notification: subscribing to new channel");
+                                        if let Err(e) = relay.subscribe_channel_from(ch, filter, Some(since)).await {
                                             tracing::warn!("failed to subscribe to new channel {ch}: {e}");
                                         } else {
                                             subscribed_channel_ids.insert(ch);
@@ -9121,6 +9132,7 @@ mod build_mcp_servers_tests {
             max_turn_duration_secs: config::DEFAULT_MAX_TURN_DURATION_SECS,
             agents: 1,
             heartbeat_interval_secs: 0,
+            join_backfill_secs: 0,
             turn_liveness_secs: 10,
             heartbeat_prompt: None,
             system_prompt: None,
@@ -9352,6 +9364,7 @@ mod error_outcome_emission_tests {
             max_turn_duration_secs: config::DEFAULT_MAX_TURN_DURATION_SECS,
             agents: 1,
             heartbeat_interval_secs: 0,
+            join_backfill_secs: 0,
             turn_liveness_secs: 10,
             heartbeat_prompt: None,
             system_prompt: None,
