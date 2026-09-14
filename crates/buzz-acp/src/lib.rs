@@ -2161,6 +2161,57 @@ fn inactivity_expired(
 /// queued batch is never stranded — the caller's next loop iteration will
 /// dispatch or wake it instead.
 #[allow(clippy::too_many_arguments)]
+/// Marker the agent engine maintains (see hermes `refresh_background_work_marker`)
+/// while it has background work outstanding — delegated workers running, or
+/// finished results awaiting delivery. Lives beside the engine's durable ledger
+/// under the agent's `HERMES_HOME`.
+const BACKGROUND_WORK_MARKER: &str = ".buzz-background-work";
+
+/// A marker older than this is treated as a leftover from a crashed engine
+/// rather than live work, so a stale file can never pin an idle pool resident
+/// forever. Long enough to outlast any realistic delegation.
+const BACKGROUND_WORK_MARKER_MAX_AGE: Duration = Duration::from_secs(12 * 60 * 60);
+
+/// The agent's `HERMES_HOME` as its engine sees it: an explicit persona env
+/// entry wins, else the harness's own environment (which the child inherits).
+fn agent_hermes_home(config: &config::Config) -> Option<std::path::PathBuf> {
+    config
+        .persona_env_vars
+        .iter()
+        .find(|(key, _)| key == config::HERMES_HOME_ENV)
+        .map(|(_, value)| std::path::PathBuf::from(value))
+        .or_else(|| std::env::var_os(config::HERMES_HOME_ENV).map(std::path::PathBuf::from))
+}
+
+/// Whether the engine has advertised outstanding background work.
+///
+/// While true the harness must not tear the pool down (teardown kills the
+/// engine and every worker it owns) and should wake a torn-down pool so the
+/// pending results are drained on the next heartbeat. This is what lets an
+/// agent run a long delegated task on Buzz instead of dying at the first idle
+/// window — and lets it resume on its own after a restart.
+fn background_work_pending(config: &config::Config) -> bool {
+    let Some(home) = agent_hermes_home(config) else {
+        return false;
+    };
+    marker_is_live(
+        &home.join(BACKGROUND_WORK_MARKER),
+        std::time::SystemTime::now(),
+    )
+}
+
+/// Pure check behind [`background_work_pending`]: the marker exists and is not
+/// stale. A future mtime (clock skew) still counts as live, not stale.
+fn marker_is_live(path: &std::path::Path, now: std::time::SystemTime) -> bool {
+    let Ok(modified) = std::fs::metadata(path).and_then(|meta| meta.modified()) else {
+        return false;
+    };
+    match now.duration_since(modified) {
+        Ok(age) => age < BACKGROUND_WORK_MARKER_MAX_AGE,
+        Err(_) => true,
+    }
+}
+
 fn idle_pool_sleep_due(
     pool_ready: bool,
     last_activity: tokio::time::Instant,
@@ -2181,6 +2232,37 @@ fn idle_pool_sleep_due(
 #[cfg(test)]
 mod inactivity_tests {
     use super::*;
+
+    fn scratch_marker(name: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!("buzz-acp-marker-{}-{}", std::process::id(), name))
+    }
+
+    #[test]
+    fn background_marker_present_and_fresh_is_live() {
+        let path = scratch_marker("fresh");
+        std::fs::write(&path, "1 2\n").expect("write marker");
+        assert!(marker_is_live(&path, std::time::SystemTime::now()));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn background_marker_absent_is_not_live() {
+        let path = scratch_marker("absent");
+        let _ = std::fs::remove_file(&path);
+        assert!(!marker_is_live(&path, std::time::SystemTime::now()));
+    }
+
+    #[test]
+    fn background_marker_stale_is_not_live() {
+        // A crashed engine leaves its marker behind; past the max age it must
+        // stop pinning the pool resident.
+        let path = scratch_marker("stale");
+        std::fs::write(&path, "1 2\n").expect("write marker");
+        let far_future =
+            std::time::SystemTime::now() + BACKGROUND_WORK_MARKER_MAX_AGE + Duration::from_secs(60);
+        assert!(!marker_is_live(&path, far_future));
+        let _ = std::fs::remove_file(&path);
+    }
 
     #[test]
     fn zero_disables_expiry_and_in_flight_turns_defer_it() {
@@ -3082,7 +3164,11 @@ async fn tokio_main() -> Result<()> {
         // busy spin — whenever the queued work drained after a failed wake.
         let mut lazy_wake_work_pending = false;
         if config.lazy_pool && !pool_ready {
-            lazy_wake_work_pending = queue.has_flushable_work();
+            // Queued events wake the pool as before. Outstanding background
+            // work (the engine's marker) wakes it too: after a restart, an
+            // agent with pending delegation results resumes on its own instead
+            // of sitting deaf until a human happens to message it.
+            lazy_wake_work_pending = queue.has_flushable_work() || background_work_pending(&config);
             if let Some(attempt) = pool_lifecycle
                 .start_wake_if_due(lazy_wake_work_pending, tokio::time::Instant::now())
             {
@@ -3774,7 +3860,12 @@ async fn tokio_main() -> Result<()> {
                         queue.has_undispatched_work(),
                         !wake_tasks.is_empty()
                             || any_respawn_in_flight(&crash_history),
-                    ) {
+                    ) && !background_work_pending(&config)
+                    {
+                        // Gated on the engine's background-work marker: tearing
+                        // down would kill its running delegated workers, and
+                        // strand any finished results. An idle-looking pool
+                        // with work outstanding stays warm instead.
                         tracing::info!(
                             idle_pool_sleep_seconds = config.idle_pool_sleep_secs,
                             "idle pool sleep bound reached — tearing pool back to lazy state"
