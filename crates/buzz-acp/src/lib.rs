@@ -50,7 +50,7 @@ use pool::{
     PromptResult, PromptSource, SessionState, TimeoutKind,
 };
 use pool_lifecycle::PoolLifecycle;
-use queue::{CancelReason, EventQueue, FlushBatch, QueuedEvent, ThreadTags};
+use queue::{BatchEvent, CancelReason, EventQueue, FlushBatch, QueuedEvent, ThreadTags};
 use relay::{HarnessRelay, RelayEventPublisher};
 use tokio::sync::{mpsc, watch};
 use tracing_subscriber::EnvFilter;
@@ -2265,6 +2265,24 @@ mod inactivity_tests {
     }
 
     #[test]
+    fn pending_delivery_origins_parse_the_json_marker() {
+        let text = r#"{"pid":1,"ts":2,"pending":[{"delegation_id":"d1","origin_session":"sess-a"},{"delegation_id":"d2","origin_session":""}]}"#;
+        assert_eq!(
+            parse_pending_delivery_origins(text),
+            vec!["sess-a".to_string()],
+            "only results with a known originating session are deliverable by thread"
+        );
+    }
+
+    #[test]
+    fn pending_delivery_origins_legacy_marker_is_empty() {
+        // The plain-text marker (pid + timestamp) advertises work but no
+        // per-thread results; it must not be mistaken for a delivery list.
+        assert!(parse_pending_delivery_origins("1 2\n").is_empty());
+        assert!(parse_pending_delivery_origins("").is_empty());
+    }
+
+    #[test]
     fn zero_disables_expiry_and_in_flight_turns_defer_it() {
         let started = tokio::time::Instant::now();
         let after_bound = started + Duration::from_secs(61);
@@ -3908,7 +3926,14 @@ async fn tokio_main() -> Result<()> {
                             typing_channels.insert(scope, thread_tags);
                         }
                     } else if pool.any_idle() {
-                        dispatch_heartbeat(&mut pool, &ctx, &mut heartbeat_in_flight);
+                        // Finished background results go back to their own
+                        // threads first; the generic (channel-less) heartbeat
+                        // only runs if a worker is still idle afterwards, and
+                        // drains whatever has no thread to return to.
+                        dispatch_delivery_turns(&mut pool, &ctx, &config);
+                        if pool.any_idle() {
+                            dispatch_heartbeat(&mut pool, &ctx, &mut heartbeat_in_flight);
+                        }
                     } else {
                         tracing::debug!("heartbeat_skipped_busy");
                     }
@@ -3932,6 +3957,12 @@ async fn tokio_main() -> Result<()> {
                             tracing::warn!("presence heartbeat failed: {e}");
                         }
                     }));
+                    // Every 60s: if a finished background result is waiting and
+                    // its thread's worker is idle, deliver it now instead of at
+                    // the next 15-minute heartbeat.
+                    if pool_ready && !heartbeat_in_flight && pool.any_idle() {
+                        dispatch_delivery_turns(&mut pool, &ctx, &config);
+                    }
                     None
                 }
                 _ = async {
@@ -4728,6 +4759,14 @@ fn dispatch_pending(
             }
         };
         tracing::debug!(agent = agent.index, channel = %channel_id, scope = %scope.telemetry_label(), affinity_hit, "agent_claimed");
+        // Remember the thread's latest real trigger so a later delivery turn (a
+        // finished background result) can reply into this exact thread.
+        if let Some(last) = batch.events.last() {
+            agent
+                .state
+                .last_trigger
+                .insert(scope.clone(), last.event.clone());
+        }
 
         let recoverable_batch = match ctx.dedup_mode {
             DedupMode::Queue => Some(batch.clone()),
@@ -5406,6 +5445,117 @@ fn drain_ready_join_results(
         }
     }
     LoopAction::Continue
+}
+
+/// The instruction for a delivery turn. It runs in the originating thread's own
+/// session, so the agent's reply publishes there. The engine's drain prepends
+/// the finished result itself (it routes by session id), so this only has to
+/// say what to do with it — and to override a heartbeat's silence.
+const DELIVERY_PROMPT: &str = "A background task you dispatched from this thread has finished — \
+its result is included above. Report the outcome here now: what finished, the result, and \
+what happens next. Keep it short.";
+
+/// Finished-but-undelivered background results the engine has advertised in
+/// its marker, as the ACP session id each was dispatched from. Empty for the
+/// legacy plain-text marker or when nothing is awaiting delivery.
+fn pending_delivery_origins(config: &config::Config) -> Vec<String> {
+    let Some(home) = agent_hermes_home(config) else {
+        return Vec::new();
+    };
+    let Ok(text) = std::fs::read_to_string(home.join(BACKGROUND_WORK_MARKER)) else {
+        return Vec::new();
+    };
+    parse_pending_delivery_origins(&text)
+}
+
+/// Pure parser behind [`pending_delivery_origins`].
+fn parse_pending_delivery_origins(marker_text: &str) -> Vec<String> {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(marker_text) else {
+        return Vec::new();
+    };
+    value
+        .get("pending")
+        .and_then(|pending| pending.as_array())
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| item.get("origin_session")?.as_str())
+                .filter(|origin| !origin.is_empty())
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Run a delivery turn in each originating thread that has a finished
+/// background result waiting, so the report lands where the asker is instead
+/// of being swallowed by a channel-less heartbeat.
+///
+/// Only the thread's own, idle session is used — never a forked worker — and
+/// a thread whose session or trigger is gone is left for the generic heartbeat
+/// drain. The turn is anchored on the thread's last real trigger, so the reply
+/// publishes exactly like a normal in-thread reply.
+fn dispatch_delivery_turns(
+    pool: &mut AgentPool,
+    ctx: &Arc<PromptContext>,
+    config: &config::Config,
+) {
+    for origin in pending_delivery_origins(config) {
+        let Some((scope, trigger)) = pool.find_scope_for_session(&origin) else {
+            continue;
+        };
+        let Some(agent) = pool.try_claim_owner_only(&scope) else {
+            continue;
+        };
+        let channel_id = scope.channel_id();
+        let batch = FlushBatch {
+            channel_id,
+            scope: scope.clone(),
+            events: vec![BatchEvent {
+                event: trigger,
+                prompt_tag: "background-result".to_string(),
+                received_at: std::time::Instant::now(),
+            }],
+            cancelled_events: Vec::new(),
+            cancel_reason: None,
+        };
+        tracing::info!(
+            channel_id = %channel_id,
+            scope = %scope.telemetry_label(),
+            origin_session = %origin,
+            "delivering finished background result in its thread"
+        );
+        let result_tx = pool.result_tx();
+        let ctx_clone = Arc::clone(ctx);
+        let agent_index = agent.index;
+        let turn_id = Uuid::new_v4().to_string();
+        let task_turn_id = turn_id.clone();
+        let abort_handle = pool.join_set.spawn(async move {
+            pool::run_prompt_task(
+                agent,
+                Some(batch),
+                Some(DELIVERY_PROMPT.to_string()),
+                ctx_clone,
+                result_tx,
+                None,
+                task_turn_id,
+            )
+            .await;
+        });
+        pool.task_map_mut().insert(
+            abort_handle.id(),
+            pool::TaskMeta {
+                agent_index,
+                channel_id: Some(channel_id),
+                scope: Some(scope),
+                turn_id,
+                recoverable_batch: None,
+                control_tx: None,
+                steer_tx: None,
+                successful_steer_deliveries: HashSet::new(),
+            },
+        );
+    }
 }
 
 fn dispatch_heartbeat(

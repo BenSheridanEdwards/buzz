@@ -141,6 +141,13 @@ pub struct SessionState {
     /// Per-scope successful-delivery state. Created with the ACP session and
     /// cleared atomically with every invalidation path.
     pub deliveries: HashMap<SessionScope, ChannelDeliveryState>,
+    /// session scope → the latest real message that triggered a turn there.
+    ///
+    /// A delivery turn (a finished background result being reported back into
+    /// the thread it came from) is anchored on this event, so it publishes
+    /// exactly like a normal in-thread reply. Cleared with every invalidation
+    /// path alongside `sessions`.
+    pub last_trigger: HashMap<SessionScope, nostr::Event>,
 }
 
 impl SessionState {
@@ -165,6 +172,7 @@ impl SessionState {
         self.core_sections.remove(scope);
         self.canvas_sections.remove(scope);
         self.deliveries.remove(scope);
+        self.last_trigger.remove(scope);
         self.sessions.remove(scope).is_some()
     }
 
@@ -179,6 +187,7 @@ impl SessionState {
             .chain(self.core_sections.keys())
             .chain(self.canvas_sections.keys())
             .chain(self.deliveries.keys())
+            .chain(self.last_trigger.keys())
             .filter(|s| s.channel_id() == *channel_id)
             .cloned()
             .collect::<HashSet<_>>()
@@ -203,6 +212,7 @@ impl SessionState {
         self.core_sections.clear();
         self.canvas_sections.clear();
         self.deliveries.clear();
+        self.last_trigger.clear();
     }
 
     pub(crate) fn mark_scope_delivery_success(
@@ -940,6 +950,41 @@ impl AgentPool {
     /// Pass 2: any idle agent.
     ///
     /// Returns `None` if all agents are checked out.
+    /// Claim the worker that already owns `scope`'s session, and only if it is
+    /// idle. Unlike [`try_claim`](Self::try_claim) this never forks the scope
+    /// onto another worker: a delivery turn must run in the thread's own
+    /// session, because the engine routes the finished result by that session
+    /// id. `None` when the owner is busy or the scope has no session here.
+    pub fn try_claim_owner_only(&mut self, scope: &SessionScope) -> Option<OwnedAgent> {
+        let owner_idle = self.agents.iter().any(|slot| {
+            slot.as_ref()
+                .is_some_and(|agent| agent.state.sessions.contains_key(scope))
+        });
+        if !owner_idle {
+            return None;
+        }
+        // Pass 1 of try_claim returns exactly that idle owner.
+        self.try_claim(Some(scope))
+    }
+
+    /// The scope (and the thread's latest real trigger) whose ACP session id is
+    /// `session_id`, on whichever *idle* worker owns it. Lets a finished
+    /// background result — advertised by the engine under the session it was
+    /// dispatched from — be delivered back into its own thread. A busy owner's
+    /// slot is empty, so its scope is simply not found until it is idle again.
+    pub fn find_scope_for_session(&self, session_id: &str) -> Option<(SessionScope, nostr::Event)> {
+        self.agents.iter().find_map(|slot| {
+            let agent = slot.as_ref()?;
+            let (scope, _) = agent
+                .state
+                .sessions
+                .iter()
+                .find(|(_, sid)| sid.as_str() == session_id)?;
+            let trigger = agent.state.last_trigger.get(scope)?.clone();
+            Some((scope.clone(), trigger))
+        })
+    }
+
     pub fn try_claim(&mut self, scope: Option<&SessionScope>) -> Option<OwnedAgent> {
         // Pass 1: prefer agent with existing session for this scope.
         if let Some(scope) = scope {
