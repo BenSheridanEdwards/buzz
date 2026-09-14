@@ -371,6 +371,23 @@ pub async fn match_event(
     rules: &[SubscriptionRule],
     agent_pubkey_hex: &str,
 ) -> Option<MatchedRule> {
+    match_event_engaged(event, channel_id, rules, agent_pubkey_hex, false).await
+}
+
+/// Like [`match_event`], but `engaged` bypasses the `require_mention` gate.
+///
+/// Set `engaged` when the event belongs to a thread the agent is already an
+/// active participant in (see the harness's engaged-thread tracking): such a
+/// reply should reach the agent even without a fresh `p`-tag mention, so it can
+/// continue the conversation. Every other rule condition (channel scope, kinds,
+/// evalexpr filter) still applies unchanged.
+pub async fn match_event_engaged(
+    event: &nostr::Event,
+    channel_id: uuid::Uuid,
+    rules: &[SubscriptionRule],
+    agent_pubkey_hex: &str,
+    engaged: bool,
+) -> Option<MatchedRule> {
     let filter_ctx = FilterContext::from_event(event, channel_id);
 
     for (index, rule) in rules.iter().enumerate() {
@@ -387,7 +404,9 @@ pub async fn match_event(
         // 3. Mention check — look for a `p` tag whose first element equals
         //    agent_pubkey_hex. Uses tag.as_slice() for stable, library-independent
         //    access — avoids relying on the Display impl of tag kind.
-        if rule.require_mention {
+        // `engaged` bypasses the mention requirement: a reply in a thread the
+        // agent already participates in reaches it without a fresh mention.
+        if rule.require_mention && !engaged {
             let mentioned = event.tags.iter().any(|tag| {
                 let s = tag.as_slice();
                 s.first().map(|k| k.as_str()) == Some("p")
@@ -661,6 +680,63 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(matched.prompt_tag, "mentioned");
+    }
+
+    #[tokio::test]
+    async fn engaged_bypasses_require_mention() {
+        let agent_pubkey = "deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef";
+        let event_no_mention = make_event(9, "a thread reply with no mention");
+        let channel_id = any_channel();
+
+        let rules = vec![make_rule(
+            "mention-only",
+            ChannelScope::All("all".into()),
+            vec![9],
+            true,
+            None,
+            Some("mentioned"),
+        )];
+
+        // Not engaged → the un-mentioned reply is dropped (the guard holds).
+        assert!(
+            match_event_engaged(&event_no_mention, channel_id, &rules, agent_pubkey, false)
+                .await
+                .is_none(),
+            "un-mentioned reply must be dropped when not engaged"
+        );
+
+        // Engaged → the same un-mentioned reply matches, so a thread the agent
+        // is already in keeps reaching it.
+        let matched =
+            match_event_engaged(&event_no_mention, channel_id, &rules, agent_pubkey, true)
+                .await
+                .expect("engaged reply must match despite no mention");
+        assert_eq!(matched.prompt_tag, "mentioned");
+    }
+
+    #[tokio::test]
+    async fn engaged_still_honors_kind_filter() {
+        // Engagement bypasses ONLY the mention gate, never the kind scope: a
+        // wrong-kind event in an engaged thread must still be dropped.
+        let agent_pubkey = "deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef";
+        let event_wrong_kind = make_event(1, "not a stream message");
+        let channel_id = any_channel();
+
+        let rules = vec![make_rule(
+            "kind-9-mention",
+            ChannelScope::All("all".into()),
+            vec![9],
+            true,
+            None,
+            Some("mentioned"),
+        )];
+
+        assert!(
+            match_event_engaged(&event_wrong_kind, channel_id, &rules, agent_pubkey, true)
+                .await
+                .is_none(),
+            "engagement must not widen the kind filter"
+        );
     }
 
     #[tokio::test]
