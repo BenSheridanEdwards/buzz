@@ -31,7 +31,7 @@ use acp::{AcpClient, EnvVar, McpServer};
 use anyhow::{ensure, Context, Result};
 use buzz_core::kind::{
     KIND_MEMBER_ADDED_NOTIFICATION, KIND_MEMBER_REMOVED_NOTIFICATION, KIND_STREAM_MESSAGE,
-    KIND_STREAM_REMINDER, KIND_WORKFLOW_APPROVAL_REQUESTED,
+    KIND_STREAM_MESSAGE_V2, KIND_STREAM_REMINDER, KIND_WORKFLOW_APPROVAL_REQUESTED,
 };
 use buzz_core::observer::{
     decrypt_observer_payload, encrypt_observer_payload, OBSERVER_FRAME_TELEMETRY,
@@ -601,13 +601,15 @@ impl AuthorizedNormalListenerEvent {
         self,
         rules: &[SubscriptionRule],
         agent_pubkey_hex: &str,
+        engaged: bool,
     ) -> Option<NormalListenerIngress> {
         let (buzz_event, effective_author) = self.0.into_parts();
-        let matched = filter::match_event(
+        let matched = filter::match_event_engaged(
             &buzz_event.event,
             buzz_event.channel_id,
             rules,
             agent_pubkey_hex,
+            engaged,
         )
         .await?;
         Some(NormalListenerIngress {
@@ -3039,6 +3041,15 @@ async fn tokio_main() -> Result<()> {
     // and capture it in TaskMeta at dispatch time.
     let mut removed_channels: HashSet<Uuid> = HashSet::new();
 
+    // Threads the agent is actively engaged in, per channel (most-recent last,
+    // bounded to MAX_ENGAGED_THREADS_PER_CHANNEL). A thread is engaged when the
+    // agent is admitted to act on any message in it; while engaged, the relay
+    // ORs a `#e` filter for these roots into the channel subscription, so
+    // subsequent replies reach the agent without a fresh mention and the
+    // conversation continues. Bounded per channel; oldest roots fall off.
+    const MAX_ENGAGED_THREADS_PER_CHANNEL: usize = 16;
+    let mut engaged_threads: HashMap<Uuid, std::collections::VecDeque<String>> = HashMap::new();
+
     //
     // One SlotCircuit per agent slot. crash_times entries are pruned to the last
     // CIRCUIT_BREAKER_WINDOW on each respawn attempt. The Vec is indexed by
@@ -3300,6 +3311,32 @@ async fn tokio_main() -> Result<()> {
                         Some(buzz_event) => {
                             let kind_u32 = buzz_event.event.kind.as_u16() as u32;
 
+                            // Thread engagement: for conversation messages,
+                            // resolve the canonical thread root and note whether
+                            // the agent is already engaged in it. Computed here,
+                            // before `buzz_event` is moved into the gate, so an
+                            // engaged-thread reply can bypass the mention gate
+                            // and so a newly-admitted thread can be engaged.
+                            let engagement_channel = buzz_event.channel_id;
+                            let engagement_root: Option<String> = if matches!(
+                                kind_u32,
+                                KIND_STREAM_MESSAGE | KIND_STREAM_MESSAGE_V2
+                            ) {
+                                Some(
+                                    queue::parse_thread_tags(&buzz_event.event)
+                                        .root_event_id
+                                        .unwrap_or_else(|| buzz_event.event.id.to_hex())
+                                        .to_ascii_lowercase(),
+                                )
+                            } else {
+                                None
+                            };
+                            let is_engaged = engagement_root.as_ref().is_some_and(|root| {
+                                engaged_threads
+                                    .get(&engagement_channel)
+                                    .is_some_and(|set| set.iter().any(|r| r == root))
+                            });
+
                             if kind_u32 == KIND_MEMBER_ADDED_NOTIFICATION
                                 || kind_u32 == KIND_MEMBER_REMOVED_NOTIFICATION
                             {
@@ -3382,6 +3419,7 @@ async fn tokio_main() -> Result<()> {
                                     }
                                 } else {
                                     subscribed_channel_ids.remove(&ch);
+                                    engaged_threads.remove(&ch);
                                     tracing::info!(channel_id = %ch, "membership notification: unsubscribing from channel");
                                     if let Err(e) = relay.unsubscribe_channel(ch).await {
                                         tracing::warn!("failed to unsubscribe from channel {ch}: {e}");
@@ -3594,12 +3632,41 @@ async fn tokio_main() -> Result<()> {
                             };
                             let Some(ingress) =
                                 AuthorizedNormalListenerEvent(authorized_event)
-                                    .match_subscription(&rules, &pubkey_hex)
+                                    .match_subscription(&rules, &pubkey_hex, is_engaged)
                                     .await
                             else {
                                 tracing::debug!("authorized event matched no rule — dropping");
                                 continue;
                             };
+
+                            // The agent is acting on this thread — engage it so
+                            // subsequent replies are delivered without a fresh
+                            // mention. Only a newly-engaged root needs a REQ
+                            // update; the set is bounded per channel.
+                            if let Some(root) = engagement_root {
+                                let set = engaged_threads.entry(engagement_channel).or_default();
+                                if !set.iter().any(|r| *r == root) {
+                                    set.push_back(root.clone());
+                                    while set.len() > MAX_ENGAGED_THREADS_PER_CHANNEL {
+                                        set.pop_front();
+                                    }
+                                    let roots: Vec<String> = set.iter().cloned().collect();
+                                    if let Err(e) =
+                                        relay.set_engaged_threads(engagement_channel, roots).await
+                                    {
+                                        tracing::warn!(
+                                            channel_id = %engagement_channel,
+                                            "failed to update engaged threads: {e}"
+                                        );
+                                    } else {
+                                        tracing::debug!(
+                                            channel_id = %engagement_channel,
+                                            thread_root = %root,
+                                            "engaged thread — following its replies without re-mention"
+                                        );
+                                    }
+                                }
+                            }
                             // Derive the session scope once, at admission, from
                             // the operator policy, DM status, and NIP-10 thread
                             // tags. Under the default `channel` policy this is
