@@ -120,11 +120,15 @@ pub(crate) const PUBLISH_TIMEOUT: Duration = Duration::from_secs(20);
 /// Wall-clock cap for one reply's uploads, end to end; the kind-9 for
 /// whatever finished in time is still posted.
 pub(crate) const OUTBOUND_DEADLINE: Duration = Duration::from_secs(180);
-/// Extensions the `MEDIA:` matcher accepts; mirrors the Hermes gateway list.
+/// Extensions that anchor a single-token `MEDIA:` reference (the Hermes
+/// gateway list plus the document types agents hand over most). A reference
+/// whose token carries none of these is still a reference when it is an
+/// absolute path: it then runs to the end of the line, so paths with spaces
+/// and files without an extension are named, not silently skipped.
 const MEDIA_EXTENSIONS: &[&str] = &[
-    "png", "jpg", "jpeg", "gif", "webp", "mp4", "mov", "avi", "mkv", "webm", "ogg", "opus", "mp3",
-    "wav", "m4a", "flac", "epub", "pdf", "zip", "rar", "7z", "doc", "docx", "xls", "xlsx", "ppt",
-    "pptx", "txt", "csv", "apk", "ipa",
+    "png", "jpg", "jpeg", "gif", "webp", "svg", "mp4", "mov", "avi", "mkv", "webm", "ogg", "opus",
+    "mp3", "wav", "m4a", "flac", "epub", "pdf", "zip", "rar", "7z", "doc", "docx", "xls", "xlsx",
+    "ppt", "pptx", "txt", "md", "csv", "json", "html", "htm", "apk", "ipa",
 ];
 
 /// Bounded capture of one turn's `agent_message_chunk` stream.
@@ -228,8 +232,7 @@ impl TurnMediaCapture {
         if self.dropped_blocks > 0 || self.blocks.iter().any(is_publishable_block) {
             return true;
         }
-        let refs = extract_media_refs(&self.text);
-        !refs.paths.is_empty() || !refs.notes.is_empty()
+        !extract_media_refs(&self.text).paths.is_empty()
     }
 }
 
@@ -242,30 +245,33 @@ fn is_publishable_block(block: &serde_json::Value) -> bool {
     )
 }
 
-/// `MEDIA:` references found in reply text, plus the ones that looked like a
-/// reference but could not be used.
+/// `MEDIA:` references found in reply text.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct MediaRefs {
-    /// Absolute (or `~/`) paths with a supported extension, deduplicated.
+    /// Absolute (or `~/`) paths as written, deduplicated. A path may carry
+    /// spaces or no extension; whether it names a real file is decided in
+    /// `resolve_outbound_files`, where the filesystem is.
     pub paths: Vec<String>,
-    /// One reason per `MEDIA:` token that started like a path but was unusable.
-    pub notes: Vec<String>,
 }
 
 /// Find `MEDIA:<path>` references in reply text.
 ///
-/// Extension-anchored like the Hermes matcher: the token after `MEDIA:` must
-/// be an absolute (or `~/`) path ending in a known media extension, so a
-/// bare `MEDIA:` in prose never triggers an upload. Trailing punctuation
-/// after the extension is dropped.
+/// A bare `MEDIA:` in prose never triggers an upload: the reference must be
+/// an absolute (or `~/`) path. Three spellings are read, in this order:
+///
+/// 1. a quoted path (`MEDIA:"/out/My File.png"`, single quotes or backticks
+///    too) — the quotes delimit it exactly;
+/// 2. a single token ending in a known media extension, trailing punctuation
+///    dropped (`MEDIA:/out/a.mp3.`) — the Hermes matcher;
+/// 3. otherwise the rest of the line (up to the next marker), trailing
+///    punctuation and markdown dropped — a path with spaces, cut at its
+///    extension when it has one, or an extensionless name taken whole.
 #[cfg(test)]
 pub fn extract_media_paths(text: &str) -> Vec<String> {
     extract_media_refs(text).paths
 }
 
-/// Like [`extract_media_paths`], also naming the tokens that started like an
-/// absolute path but carried no supported extension (a path with a space, or
-/// an extension outside the list), so the miss is not silent.
+/// See [`extract_media_paths`].
 pub fn extract_media_refs(text: &str) -> MediaRefs {
     let mut refs = MediaRefs::default();
     let mut rest = text;
@@ -276,28 +282,69 @@ pub fn extract_media_refs(text: &str) -> MediaRefs {
             });
         let after = &rest[idx + "MEDIA:".len()..];
         let after = after.strip_prefix(' ').unwrap_or(after);
-        let token: &str = after.split(char::is_whitespace).next().unwrap_or("");
         if preceded_ok {
-            match trim_to_media_extension(token) {
-                // The same token twice is one reference, deduplicated here
-                // with no note: nothing was skipped, the reply named one
-                // file. Two *different* names for one file (a path and a
-                // symlink to it) are two references, and the second earns a
-                // note in `resolve_outbound_files`.
-                Some(path) if is_absolute_or_home(path) && !refs.paths.iter().any(|p| p == path) => {
-                    refs.paths.push(path.to_string());
+            // The same path twice is one reference: nothing was skipped, the
+            // reply named one file. Two *different* names for one file (a
+            // path and a symlink to it) are two references, and the second
+            // earns a note in `resolve_outbound_files`.
+            if let Some(path) = media_path_from_segment(after) {
+                if is_absolute_or_home(&path) && !refs.paths.iter().any(|p| *p == path) {
+                    refs.paths.push(path);
                 }
-                Some(_) => {}
-                None if is_absolute_or_home(token) => refs.notes.push(format!(
-                    "MEDIA:{} skipped: no supported media extension (paths with spaces are not supported)",
-                    token.chars().take(80).collect::<String>()
-                )),
-                None => {}
             }
         }
         rest = &rest[idx + "MEDIA:".len()..];
     }
     refs
+}
+
+/// The path one `MEDIA:` marker names; `after` starts right after the marker
+/// (one leading space already dropped). `None` when the marker is prose.
+fn media_path_from_segment(after: &str) -> Option<String> {
+    // A reference ends at the line, or at the next marker on the same line.
+    let line_end = after.find(['\n', '\r']).unwrap_or(after.len());
+    let mut segment = &after[..line_end];
+    if let Some(next) = segment.find(" MEDIA:") {
+        segment = &segment[..next];
+    }
+    if let Some(quote) = segment
+        .chars()
+        .next()
+        .filter(|c| matches!(c, '"' | '\'' | '`'))
+    {
+        let inner = &segment[quote.len_utf8()..];
+        if let Some(end) = inner.find(quote) {
+            let path = inner[..end].trim();
+            return (!path.is_empty()).then(|| path.to_string());
+        }
+    }
+    let token = segment.split(char::is_whitespace).next().unwrap_or("");
+    if let Some(path) = trim_to_media_extension(token) {
+        return Some(path.to_string());
+    }
+    if !is_absolute_or_home(token) {
+        return None;
+    }
+    let trimmed = trim_trailing_decoration(segment);
+    if let Some(path) = trim_to_media_extension(trimmed) {
+        return Some(path.to_string());
+    }
+    // Extensionless: the rest of the line names the file. Prose after the
+    // path, if any, is narrowed away at resolution against the filesystem.
+    (!trimmed.is_empty()).then(|| trimmed.to_string())
+}
+
+/// Drop trailing punctuation and markdown emphasis that prose wraps a path in.
+fn trim_trailing_decoration(segment: &str) -> &str {
+    segment
+        .trim_end()
+        .trim_end_matches(|c: char| {
+            matches!(
+                c,
+                '.' | ',' | ';' | ':' | '!' | '?' | ')' | ']' | '}' | '*' | '_' | '`' | '"' | '\''
+            )
+        })
+        .trim_end()
 }
 
 fn is_absolute_or_home(path: &str) -> bool {
@@ -385,10 +432,153 @@ pub fn mime_for_path(path: &Path) -> &'static str {
         Some("webm") => "video/webm",
         Some("pdf") => "application/pdf",
         Some("txt" | "md") => "text/plain",
+        Some("html" | "htm") => "text/html",
+        Some("svg") => "image/svg+xml",
         Some("csv") => "text/csv",
         Some("json") => "application/json",
         Some("zip") => "application/zip",
         _ => "application/octet-stream",
+    }
+}
+
+/// MIME type from a file's leading bytes, for files whose name carries no
+/// usable extension. Only well-known signatures are recognised; anything else
+/// that is plain UTF-8 text is `text/plain`, and binary is left to the
+/// caller's default.
+pub fn sniff_mime(path: &Path) -> Option<&'static str> {
+    use std::io::Read;
+    let mut head = [0u8; 512];
+    let mut file = std::fs::File::open(path).ok()?;
+    let mut read = 0;
+    while read < head.len() {
+        match file.read(&mut head[read..]) {
+            Ok(0) => break,
+            Ok(n) => read += n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => return None,
+        }
+    }
+    let head = &head[..read];
+    let starts = |sig: &[u8]| head.starts_with(sig);
+    let mime = if starts(b"\x89PNG\r\n\x1a\n") {
+        "image/png"
+    } else if starts(b"\xff\xd8\xff") {
+        "image/jpeg"
+    } else if starts(b"GIF87a") || starts(b"GIF89a") {
+        "image/gif"
+    } else if starts(b"RIFF") && head.get(8..12) == Some(b"WEBP") {
+        "image/webp"
+    } else if starts(b"RIFF") && head.get(8..12) == Some(b"WAVE") {
+        "audio/wav"
+    } else if starts(b"%PDF") {
+        "application/pdf"
+    } else if starts(b"PK\x03\x04") {
+        "application/zip"
+    } else if head.get(4..8) == Some(b"ftyp") {
+        "video/mp4"
+    } else if starts(b"OggS") {
+        "audio/ogg"
+    } else if starts(b"fLaC") {
+        "audio/flac"
+    } else if starts(b"ID3") || (head.len() >= 2 && head[0] == 0xff && (head[1] & 0xe0) == 0xe0) {
+        "audio/mpeg"
+    } else if std::str::from_utf8(head).is_ok_and(|text| {
+        let lower = text.trim_start().to_ascii_lowercase();
+        lower.starts_with("<!doctype html") || lower.starts_with("<html")
+    }) {
+        "text/html"
+    } else if !head.is_empty()
+        && !head.contains(&0)
+        && std::str::from_utf8(head).is_ok_and(|text| !text.is_empty())
+    {
+        "text/plain"
+    } else {
+        return None;
+    };
+    Some(mime)
+}
+
+/// Turn the path a reply named into the file it meant, or say why it cannot.
+///
+/// Exact names win. A name that does not exist is then read two more ways:
+/// the reply may have run on after the path (`MEDIA:/out/report is attached`),
+/// so the text is shortened at whitespace until something exists; and an
+/// extensionless name may be the file's stem (`MEDIA:/out/report` for
+/// `report.pdf`), so a single sibling with that stem is taken, while several
+/// are reported for the agent to choose between. A directory is refused with
+/// the reason, not a generic "not a regular file".
+///
+/// Only directories under the roots are ever listed: a name outside them is
+/// refused as outside, exactly as `confine` would refuse the file, so the
+/// notes never describe what sits next to an arbitrary path on the host.
+/// The `Err` text is the whole note suffix (`refused: …` / `skipped: …`).
+pub fn locate_named_file(path: &Path, roots: &OutboundRoots) -> Result<PathBuf, String> {
+    let text = path.to_string_lossy().into_owned();
+    let mut candidates: Vec<&str> = vec![text.as_str()];
+    let mut cut = text.len();
+    while let Some(ws) = text[..cut].trim_end().rfind(char::is_whitespace) {
+        let shorter = text[..ws].trim_end();
+        cut = ws;
+        if shorter.is_empty() {
+            break;
+        }
+        candidates.push(shorter);
+    }
+    let mut any_parent_inside = false;
+    for candidate in candidates {
+        let candidate = Path::new(candidate);
+        if let Ok(meta) = std::fs::symlink_metadata(candidate) {
+            if meta.is_dir() {
+                return Err("skipped: is a directory; name a file inside it or zip it first".into());
+            }
+            return Ok(candidate.to_path_buf());
+        }
+        let (Some(parent), Some(stem)) = (candidate.parent(), candidate.file_name()) else {
+            continue;
+        };
+        if !roots.contains_dir(parent) {
+            continue;
+        }
+        any_parent_inside = true;
+        if candidate.extension().is_some() {
+            continue;
+        }
+        let stem = stem.to_string_lossy();
+        let mut siblings: Vec<PathBuf> = std::fs::read_dir(parent)
+            .ok()
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter(|entry| {
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                name.len() > stem.len() + 1
+                    && name.starts_with(stem.as_ref())
+                    && name[stem.len()..].starts_with('.')
+            })
+            .map(|entry| entry.path())
+            .filter(|p| std::fs::metadata(p).map(|m| m.is_file()).unwrap_or(false))
+            .collect();
+        siblings.sort();
+        match siblings.len() {
+            0 => {}
+            1 => return Ok(siblings.remove(0)),
+            n => {
+                let names: Vec<String> = siblings
+                    .iter()
+                    .filter_map(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
+                    .collect();
+                return Err(format!(
+                    "skipped: {n} files share that name ({}); name one with its extension",
+                    names.join(", ")
+                ));
+            }
+        }
+    }
+    if any_parent_inside {
+        Err("skipped: no such file".into())
+    } else {
+        Err(format!("refused: {}", roots.outside_reason()))
     }
 }
 
@@ -481,6 +671,20 @@ impl OutboundRoots {
             (Some(_), None) => "outside the turn directory and the workspace".into(),
             (None, None) => "outside the turn directory".into(),
         }
+    }
+
+    /// Whether an existing directory sits under one of the roots (symlinks
+    /// followed), so a listing of it reveals nothing the engine could not
+    /// publish anyway.
+    pub fn contains_dir(&self, dir: &Path) -> bool {
+        let Ok(canonical) = std::fs::canonicalize(dir) else {
+            return false;
+        };
+        [Some(&self.turn_dir), self.workspace.as_ref()]
+            .into_iter()
+            .flatten()
+            .filter_map(|root| std::fs::canonicalize(root).ok())
+            .any(|root| canonical.starts_with(&root))
     }
 
     /// Resolve `path` to the canonical regular file it names, provided that
@@ -767,6 +971,12 @@ pub fn resolve_outbound_files(
                 return;
             }
         };
+        if meta.is_dir() {
+            out.notes.push(format!(
+                "{shown} skipped: is a directory; name a file inside it or zip it first"
+            ));
+            return;
+        }
         if !meta.is_file() {
             out.notes
                 .push(format!("{shown} skipped: not a regular file"));
@@ -826,7 +1036,6 @@ pub fn resolve_outbound_files(
     };
 
     let refs = extract_media_refs(capture.text());
-    out.notes.extend(refs.notes);
     for raw in refs.paths {
         let expanded = if let Some(rest) = raw.strip_prefix("~/") {
             match roots.home.as_ref() {
@@ -839,7 +1048,20 @@ pub fn resolve_outbound_files(
         } else {
             PathBuf::from(&raw)
         };
-        add(&mut out, expanded, None, None, "MEDIA: line");
+        let located = match locate_named_file(&expanded, roots) {
+            Ok(located) => located,
+            Err(reason) => {
+                out.notes.push(format!("{raw} {reason}"));
+                continue;
+            }
+        };
+        // A name without a usable extension is typed from its bytes, so an
+        // extensionless PNG still lands as an image, not a generic file.
+        let mime = (mime_for_path(&located) == "application/octet-stream")
+            .then(|| sniff_mime(&located))
+            .flatten()
+            .map(str::to_string);
+        add(&mut out, located, None, mime, "MEDIA: line");
     }
 
     for block in capture.blocks() {
@@ -1819,7 +2041,7 @@ mod tests {
 
     #[test]
     fn media_paths_are_extension_anchored_like_hermes() {
-        let text = "Here you go.\nMEDIA:/tmp/out/voice.mp3\nAlso (MEDIA:/tmp/pic.PNG).\nnotMEDIA:/tmp/x.mp3 MEDIA:relative.mp3 MEDIA:/tmp/noext MEDIA: /tmp/spaced.wav MEDIA:~/home.ogg MEDIA:/tmp/out/voice.mp3";
+        let text = "Here you go.\nMEDIA:/tmp/out/voice.mp3\nAlso (MEDIA:/tmp/pic.PNG).\nnotMEDIA:/tmp/x.mp3 MEDIA:relative.mp3 MEDIA: /tmp/spaced.wav MEDIA:~/home.ogg MEDIA:/tmp/out/voice.mp3";
         assert_eq!(
             extract_media_paths(text),
             vec![
@@ -1830,7 +2052,7 @@ mod tests {
             ]
         );
         assert!(extract_media_paths("MEDIA: is a tag used by tools").is_empty());
-        assert!(extract_media_paths("MEDIA:/tmp/archive.tar.gz").is_empty());
+        assert!(extract_media_paths("MEDIA:relative/x.mp3").is_empty());
         assert_eq!(
             extract_media_paths("MEDIA:/tmp/a.mp3."),
             vec!["/tmp/a.mp3".to_string()]
@@ -1843,30 +2065,91 @@ mod tests {
     }
 
     #[test]
-    fn unusable_media_refs_are_named_not_dropped() {
-        let refs = extract_media_refs(
-            "MEDIA:/tmp/my note.mp3 and MEDIA:/tmp/archive.tar.gz then MEDIA:/tmp/ok.ogg",
+    fn media_paths_with_spaces_or_no_extension_are_references() {
+        assert_eq!(
+            extract_media_paths(
+                "MEDIA:/tmp/my note.mp3 and MEDIA:/tmp/archive.tar.gz then MEDIA:/tmp/ok.ogg"
+            ),
+            vec![
+                "/tmp/my note.mp3".to_string(),
+                "/tmp/archive.tar.gz then".to_string(),
+                "/tmp/ok.ogg".to_string(),
+            ],
+            "a spaced path is cut at its extension; an extensionless one runs to the next marker and is narrowed at resolution"
         );
-        assert_eq!(refs.paths, vec!["/tmp/ok.ogg".to_string()]);
-        assert_eq!(refs.notes.len(), 2, "{:?}", refs.notes);
-        assert!(refs.notes[0].contains("MEDIA:/tmp/my"), "{:?}", refs.notes);
-        assert!(refs.notes[1].contains("archive.tar.gz"), "{:?}", refs.notes);
+        assert_eq!(
+            extract_media_paths("Screenshot: MEDIA:/out/FLEET_MONITORING_PROTOTYPE\nnext line"),
+            vec!["/out/FLEET_MONITORING_PROTOTYPE".to_string()],
+            "an extensionless name ends at the line"
+        );
+        assert_eq!(
+            extract_media_paths("MEDIA:\"/out/My Deck.pptx\" and MEDIA:`/out/notes final`."),
+            vec!["/out/My Deck.pptx".to_string(), "/out/notes final".to_string()],
+            "quotes and backticks delimit the path exactly"
+        );
+        assert_eq!(
+            extract_media_paths("(MEDIA:/out/Fleet Report.pdf)."),
+            vec!["/out/Fleet Report.pdf".to_string()]
+        );
+        assert_eq!(
+            extract_media_paths("MEDIA:/out/bundle.tar.gz"),
+            vec!["/out/bundle.tar.gz".to_string()],
+            "an absolute path with an unlisted extension is still the file the reply named"
+        );
+    }
+
+    #[test]
+    fn named_files_are_located_by_exact_name_stem_or_narrowed_prose() {
+        let root = temp_root();
+        std::fs::write(root.join("report.pdf"), b"%PDF-1.4").unwrap();
+        std::fs::write(root.join("shot.png"), b"\x89PNG\r\n\x1a\n").unwrap();
+        std::fs::write(root.join("shot.html"), b"<html>").unwrap();
+        std::fs::write(root.join("plain"), b"hello there").unwrap();
+        std::fs::create_dir_all(root.join("folder")).unwrap();
+        let roots = OutboundRoots {
+            turn_dir: root.clone(),
+            workspace: None,
+            workspace_refused: None,
+            home: None,
+        };
+
+        assert_eq!(locate_named_file(&root.join("report.pdf"), &roots).unwrap(), root.join("report.pdf"));
+        assert_eq!(
+            locate_named_file(&root.join("report"), &roots).unwrap(),
+            root.join("report.pdf"),
+            "an extensionless name resolves to its single sibling"
+        );
+        assert_eq!(
+            locate_named_file(&PathBuf::from(format!("{} is attached above", root.join("report").display())), &roots).unwrap(),
+            root.join("report.pdf"),
+            "prose after the path is narrowed away"
+        );
+        assert_eq!(locate_named_file(&root.join("plain"), &roots).unwrap(), root.join("plain"));
+        let ambiguous = locate_named_file(&root.join("shot"), &roots).unwrap_err();
+        assert!(ambiguous.contains("shot.html, shot.png"), "{ambiguous}");
+        assert!(locate_named_file(&root.join("folder"), &roots).unwrap_err().contains("directory"));
+        assert_eq!(locate_named_file(&root.join("missing"), &roots).unwrap_err(), "skipped: no such file");
+        let elsewhere = temp_root();
+        std::fs::write(elsewhere.join("secret.pdf"), b"%PDF").unwrap();
+        let outside = locate_named_file(&elsewhere.join("secret"), &roots).unwrap_err();
         assert!(
-            extract_media_refs("MEDIA: is a tag used by tools")
-                .notes
-                .is_empty(),
-            "prose after the marker is not a path and earns no note"
+            outside.starts_with("refused: outside") && !outside.contains("secret.pdf"),
+            "a directory outside the roots is never listed: {outside}"
         );
-        assert!(
-            extract_media_refs("MEDIA:relative/x.mp3").notes.is_empty(),
-            "a relative token is not a candidate, as before"
-        );
+
+        assert_eq!(sniff_mime(&root.join("shot.png")), Some("image/png"));
+        assert_eq!(sniff_mime(&root.join("report.pdf")), Some("application/pdf"));
+        assert_eq!(sniff_mime(&root.join("shot.html")), Some("text/html"));
+        assert_eq!(sniff_mime(&root.join("plain")), Some("text/plain"));
+        std::fs::write(root.join("bin"), [0u8, 1, 2, 3]).unwrap();
+        assert_eq!(sniff_mime(&root.join("bin")), None);
     }
 
     #[test]
     fn mime_and_kind_tables() {
         assert_eq!(mime_for_path(Path::new("/x/a.MP3")), "audio/mpeg");
         assert_eq!(mime_for_path(Path::new("/x/a.png")), "image/png");
+        assert_eq!(mime_for_path(Path::new("/x/a.html")), "text/html");
         assert_eq!(
             mime_for_path(Path::new("/x/a.weird")),
             "application/octet-stream"

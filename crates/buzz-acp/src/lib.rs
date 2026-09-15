@@ -4,6 +4,7 @@ mod acp;
 mod attachments;
 mod blossom;
 mod config;
+mod engagement;
 mod engram_fetch;
 mod ffmpeg;
 mod filter;
@@ -2960,7 +2961,12 @@ async fn tokio_main() -> Result<()> {
         "attachment handling ready"
     );
 
+    // Attachment failures come back here from the detached publish tasks and
+    // are turned into follow-up turns for the agent (`dispatch_media_feedback`).
+    let (media_feedback_tx, mut media_feedback_rx) =
+        mpsc::unbounded_channel::<pool::MediaFeedback>();
     let ctx = Arc::new(PromptContext {
+        media_feedback_tx: Some(media_feedback_tx),
         transcribe_endpoint: config.transcribe_endpoint.clone(),
         transcribe_profile: config.transcribe_profile.clone(),
         transcribe_token: config.transcribe_token.clone(),
@@ -3170,6 +3176,44 @@ async fn tokio_main() -> Result<()> {
     const MAX_ENGAGED_THREADS_PER_CHANNEL: usize = 16;
     let mut engaged_threads: HashMap<Uuid, std::collections::VecDeque<String>> = HashMap::new();
 
+    // The set is in memory, so a restart would forget every conversation in
+    // progress and the next unmentioned reply in it would never arrive. Seed
+    // it from the agent's own recent posts on the relay before the first
+    // event is read; a relay error only means the seed is skipped.
+    if matches!(config.subscribe_mode, SubscribeMode::Mentions) && !subscribed_channel_ids.is_empty() {
+        let agent_pubkey_hex = config.keys.public_key().to_hex();
+        match engagement::seed_engaged_threads(
+            &ctx.rest_client,
+            &agent_pubkey_hex,
+            &subscribed_channel_ids,
+            MAX_ENGAGED_THREADS_PER_CHANNEL,
+        )
+        .await
+        {
+            Ok(seeded) => {
+                let threads: usize = seeded.values().map(VecDeque::len).sum();
+                for (channel, roots) in seeded {
+                    let list: Vec<String> = roots.iter().cloned().collect();
+                    if let Err(e) = relay.set_engaged_threads(channel, list).await {
+                        tracing::warn!(channel_id = %channel, "failed to re-engage threads: {e}");
+                        continue;
+                    }
+                    engaged_threads.insert(channel, roots);
+                }
+                tracing::info!(
+                    channels = engaged_threads.len(),
+                    threads,
+                    lookback_days = engagement::LOOKBACK.as_secs() / 86_400,
+                    "re-engaged recent threads from relay history"
+                );
+            }
+            Err(e) => tracing::warn!("could not seed engaged threads from relay history: {e}"),
+        }
+    }
+
+    // Attachment failures waiting for their thread's worker to be free.
+    let mut pending_media_feedback: Vec<pool::MediaFeedback> = Vec::new();
+
     //
     // One SlotCircuit per agent slot. crash_times entries are pruned to the last
     // CIRCUIT_BREAKER_WINDOW on each respawn attempt. The Vec is indexed by
@@ -3350,6 +3394,15 @@ async fn tokio_main() -> Result<()> {
                         break;
                     }
                 },
+                // A reply's attachments failed: tell the agent in its thread.
+                Some(feedback) = media_feedback_rx.recv() => {
+                    let _ = result_rx;
+                    pending_media_feedback.push(feedback);
+                    if pool_ready {
+                        dispatch_media_feedback(&mut pool, &ctx, &mut pending_media_feedback);
+                    }
+                    None
+                }
                 // Guard: join_next() returns None immediately when JoinSet is
                 // empty, which would cause a tight spin. Only poll when there
                 // are in-flight tasks.
@@ -3977,11 +4030,15 @@ async fn tokio_main() -> Result<()> {
                             tracing::warn!("presence heartbeat failed: {e}");
                         }
                     }));
-                    // Every 60s: if a finished background result is waiting and
-                    // its thread's worker is idle, deliver it now instead of at
-                    // the next 15-minute heartbeat.
-                    if pool_ready && !heartbeat_in_flight && pool.any_idle() {
-                        dispatch_delivery_turns(&mut pool, &ctx, &config);
+                    // Every 60s: if a finished background result or an
+                    // attachment failure is waiting and its thread's worker is
+                    // idle, deliver it now instead of at the next 15-minute
+                    // heartbeat.
+                    if pool_ready && !heartbeat_in_flight {
+                        dispatch_media_feedback(&mut pool, &ctx, &mut pending_media_feedback);
+                        if pool.any_idle() {
+                            dispatch_delivery_turns(&mut pool, &ctx, &config);
+                        }
                     }
                     None
                 }
@@ -5576,6 +5633,115 @@ fn dispatch_delivery_turns(
             },
         );
     }
+}
+
+/// How long an attachment failure waits for its thread's worker before the
+/// channel is told by the harness instead.
+const MEDIA_FEEDBACK_EXPIRY: Duration = Duration::from_secs(10 * 60);
+
+/// Run a follow-up turn for each reply whose attachments failed, in the thread
+/// the reply came from, so the agent that wrote it fixes the reference and
+/// posts the file. A thread whose worker is mid-turn waits (never a forked
+/// worker); a thread whose session is gone gets a fresh one on any idle
+/// worker; a failure nobody could take within [`MEDIA_FEEDBACK_EXPIRY`] falls
+/// back to the short channel notice so it is not lost silently.
+fn dispatch_media_feedback(
+    pool: &mut AgentPool,
+    ctx: &Arc<PromptContext>,
+    pending: &mut Vec<pool::MediaFeedback>,
+) {
+    let mut waiting = Vec::new();
+    for feedback in pending.drain(..) {
+        if feedback.created_at.elapsed() > MEDIA_FEEDBACK_EXPIRY {
+            tracing::warn!(
+                target: "buzz_acp::media",
+                channel_id = %feedback.channel_id,
+                scope = %feedback.scope.telemetry_label(),
+                "attachment feedback not taken by the agent in time; posting the channel notice"
+            );
+            let rest = ctx.rest_client.clone();
+            let root = feedback.trigger.id.to_hex();
+            let thread_tags = queue::ThreadTags {
+                root_event_id: Some(
+                    queue::parse_thread_tags(&feedback.trigger)
+                        .root_event_id
+                        .unwrap_or_else(|| root.clone()),
+                ),
+                parent_event_id: Some(root),
+                mentioned_pubkeys: Vec::new(),
+            };
+            let channel_id = feedback.channel_id;
+            let notice = feedback.notice;
+            tokio::spawn(async move {
+                pool::post_failure_notice(&rest, channel_id, &thread_tags, &notice).await;
+            });
+            continue;
+        }
+        let scope_busy = pool
+            .task_map()
+            .values()
+            .any(|meta| meta.scope.as_ref() == Some(&feedback.scope));
+        if scope_busy {
+            waiting.push(feedback);
+            continue;
+        }
+        let Some(agent) = pool.try_claim(Some(&feedback.scope)) else {
+            waiting.push(feedback);
+            continue;
+        };
+        let channel_id = feedback.channel_id;
+        let scope = feedback.scope.clone();
+        let prompt = pool::media_feedback_prompt(&feedback);
+        let batch = FlushBatch {
+            channel_id,
+            scope: scope.clone(),
+            events: vec![BatchEvent {
+                event: feedback.trigger,
+                prompt_tag: pool::MEDIA_FEEDBACK_PROMPT_TAG.to_string(),
+                received_at: std::time::Instant::now(),
+            }],
+            cancelled_events: Vec::new(),
+            cancel_reason: None,
+        };
+        tracing::info!(
+            target: "buzz_acp::media",
+            channel_id = %channel_id,
+            scope = %scope.telemetry_label(),
+            failed = feedback.failed.len(),
+            "telling the agent its attachments failed, in its thread"
+        );
+        let result_tx = pool.result_tx();
+        let ctx_clone = Arc::clone(ctx);
+        let agent_index = agent.index;
+        let turn_id = Uuid::new_v4().to_string();
+        let task_turn_id = turn_id.clone();
+        let abort_handle = pool.join_set.spawn(async move {
+            pool::run_prompt_task(
+                agent,
+                Some(batch),
+                Some(prompt),
+                ctx_clone,
+                result_tx,
+                None,
+                task_turn_id,
+            )
+            .await;
+        });
+        pool.task_map_mut().insert(
+            abort_handle.id(),
+            pool::TaskMeta {
+                agent_index,
+                channel_id: Some(channel_id),
+                scope: Some(scope),
+                turn_id,
+                recoverable_batch: None,
+                control_tx: None,
+                steer_tx: None,
+                successful_steer_deliveries: HashSet::new(),
+            },
+        );
+    }
+    *pending = waiting;
 }
 
 fn dispatch_heartbeat(

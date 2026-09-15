@@ -856,6 +856,65 @@ pub struct PromptContext {
     /// envelopes are passed through unextracted and outbound audio that the
     /// relay refuses falls back to a generic file.
     pub ffmpeg: Option<std::path::PathBuf>,
+    /// Where a reply's attachment failures go: back to the agent, as a
+    /// follow-up turn in the same thread (see [`MediaFeedback`]), so it can
+    /// fix the reference and post the file — instead of a harness-authored
+    /// error line in the channel. `None` (tests, or a closed receiver) falls
+    /// back to the channel notice.
+    pub media_feedback_tx: Option<mpsc::UnboundedSender<MediaFeedback>>,
+}
+
+/// One reply whose media did not all reach the relay, handed back to the main
+/// loop so the agent that wrote it is told in its own thread.
+#[derive(Debug)]
+pub struct MediaFeedback {
+    pub channel_id: Uuid,
+    /// The session the reply came from; the follow-up turn runs in it.
+    pub scope: SessionScope,
+    /// The message the reply answered; the follow-up is anchored on it so it
+    /// publishes as an ordinary in-thread reply.
+    pub trigger: nostr::Event,
+    /// Short human-readable summary, also the channel fallback text.
+    pub notice: String,
+    /// Every failure reason, one per reference, for the prompt.
+    pub failed: Vec<String>,
+    /// How many files did arrive.
+    pub published: usize,
+    pub created_at: std::time::Instant,
+}
+
+/// `prompt_tag` of the synthetic trigger an attachment-failure turn is
+/// anchored on.
+pub(crate) const MEDIA_FEEDBACK_PROMPT_TAG: &str = "attachment-failed";
+
+/// The follow-up prompt for one [`MediaFeedback`]: what failed, why, and what
+/// a usable reference looks like. Short on purpose — the agent already has
+/// the thread.
+pub fn media_feedback_prompt(feedback: &MediaFeedback) -> String {
+    let reasons = feedback
+        .failed
+        .iter()
+        .map(|reason| format!("- {reason}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let arrived = match feedback.published {
+        0 => "Nothing was attached.".to_string(),
+        1 => "One other file did attach.".to_string(),
+        n => format!("{n} other files did attach."),
+    };
+    format!(
+        "Your last reply in this thread was posted, but {} of its attachments could not be published:\n{reasons}\n{arrived}\n\
+Reply here with the file again: a short message and one `MEDIA:` line per file, giving the absolute path of a regular file \
+(a name without its extension is matched to the one file with that stem; paths with spaces are fine; a directory is not a file). \
+If the file does not exist or cannot be produced, say so in one line instead. Do not repeat your previous reply.",
+        feedback.failed.len()
+    )
+}
+
+/// Turns anchored on an older, already-answered trigger judge the
+/// duplicate-reply guard from their own start, not from the trigger.
+pub(crate) fn anchored_on_old_trigger(prompt_tag: &str) -> bool {
+    prompt_tag == DELIVERY_PROMPT_TAG || prompt_tag == MEDIA_FEEDBACK_PROMPT_TAG
 }
 
 impl AgentPool {
@@ -2307,12 +2366,14 @@ fn publish_reply_media(
         return None;
     }
     let trigger = batch.events.last()?;
-    // A delivery turn is anchored on an older, already-answered message; the
-    // duplicate-reply guard must judge it from the turn's own start.
-    let is_delivery_turn = trigger.prompt_tag == DELIVERY_PROMPT_TAG;
+    // A delivery or attachment-retry turn is anchored on an older,
+    // already-answered message; the duplicate-reply guard must judge it from
+    // the turn's own start.
+    let is_delivery_turn = anchored_on_old_trigger(&trigger.prompt_tag);
     let observer = TurnObserver::for_agent(agent);
     let ctx = Arc::clone(ctx);
     let channel_id = batch.channel_id;
+    let scope = batch.scope.clone();
     let trigger = trigger.event.clone();
     let turn_id = turn_id.to_string();
     Some(tokio::spawn(async move {
@@ -2359,18 +2420,31 @@ fn publish_reply_media(
                 "reply media partially failed: {}",
                 report.failed.join("; ")
             );
-            let thread_tags = crate::queue::ThreadTags {
-                root_event_id: Some(target.root_event_id.to_hex()),
-                parent_event_id: Some(target.root_event_id.to_hex()),
-                mentioned_pubkeys: Vec::new(),
-            };
-            post_failure_notice(
-                &ctx.rest_client,
+            // The agent that wrote the reply is told, in its own thread, and
+            // posts the file itself; the channel only hears from the harness
+            // when no main loop is there to carry the feedback.
+            let notice = crate::media_publish::failure_notice(&report);
+            let feedback = MediaFeedback {
                 channel_id,
-                &thread_tags,
-                &crate::media_publish::failure_notice(&report),
-            )
-            .await;
+                scope: scope.clone(),
+                trigger: trigger.clone(),
+                notice: notice.clone(),
+                failed: report.failed.clone(),
+                published: report.published.len(),
+                created_at: std::time::Instant::now(),
+            };
+            let handed_to_agent = ctx
+                .media_feedback_tx
+                .as_ref()
+                .is_some_and(|tx| tx.send(feedback).is_ok());
+            if !handed_to_agent {
+                let thread_tags = crate::queue::ThreadTags {
+                    root_event_id: Some(target.root_event_id.to_hex()),
+                    parent_event_id: Some(target.root_event_id.to_hex()),
+                    mentioned_pubkeys: Vec::new(),
+                };
+                post_failure_notice(&ctx.rest_client, channel_id, &thread_tags, &notice).await;
+            }
         }
         // The media message carries the reply text as its transcript, so it
         // is the one place the words land. Only when no message reached the
@@ -5878,7 +5952,7 @@ fn publish_text_reply_fallback(
     let last = batch.events.last()?;
     let trigger = last.event.clone();
     let since = fallback_since(
-        last.prompt_tag == DELIVERY_PROMPT_TAG,
+        anchored_on_old_trigger(&last.prompt_tag),
         trigger.created_at,
         turn_started,
     );
@@ -11493,6 +11567,7 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
             live_turn_dirs: crate::attachments::LiveTurnDirs::default(),
             audio_support: crate::blossom::AudioSupportCache::default(),
             ffmpeg: None,
+            media_feedback_tx: None,
         }
     }
 
