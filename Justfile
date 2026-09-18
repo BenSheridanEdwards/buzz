@@ -289,15 +289,22 @@ desktop-release-build target="aarch64-apple-darwin":
     cd {{desktop_dir}} && pnpm tauri build --features mesh-llm --target {{target}}
 
 # Build an unsigned named macOS demo DMG with isolated app and runtime identities.
-desktop-demo-build demo_name target="aarch64-apple-darwin":
+# Named demo build. Pass build_id to rebuild an installed demo in place (same
+# identifier, config home and keyring); product_name renames the app without
+# touching that identity; icon_dir (relative to desktop/src-tauri, default $BUZZ_DEMO_ICON_DIR) swaps the icon set.
+# sign_identity is a codesign identity ("-" = ad hoc). A stable self-signed identity keeps
+# the keychain grant across rebuilds; ad hoc re-prompts for keychain access on every launch.
+# Example: just desktop-demo-build Fleet aarch64-apple-darwin 51094c33a0d51d7c "Fleet Buzz" icons-fleet "Buzz Fleet Dev"
+desktop-demo-build demo_name target="aarch64-apple-darwin" build_id="" product_name="" icon_dir="" sign_identity="-":
     #!/usr/bin/env bash
     set -euo pipefail
     TARGET={{target}}
     [[ "$(uname -s)" == "Darwin" && "$TARGET" == *-apple-darwin ]] || { echo "Demo DMGs require a macOS Apple target" >&2; exit 2; }
     CONFIG_PATH="$(mktemp "${TMPDIR:-/tmp}/buzz-demo-config.XXXXXX")"
     trap 'rm -f "$CONFIG_PATH"' EXIT
-    DEMO_BUILD_ID="$(node -e 'console.log(require("node:crypto").randomBytes(8).toString("hex"))')"
-    DEMO_CONFIG="$(node desktop/scripts/demo-build-config.mjs {{quote(demo_name)}} "$CONFIG_PATH" "$DEMO_BUILD_ID")"
+    DEMO_BUILD_ID={{quote(build_id)}}
+    [[ -n "$DEMO_BUILD_ID" ]] || DEMO_BUILD_ID="$(node -e 'console.log(require("node:crypto").randomBytes(8).toString("hex"))')"
+    DEMO_CONFIG="$(node desktop/scripts/demo-build-config.mjs {{quote(demo_name)}} "$CONFIG_PATH" "$DEMO_BUILD_ID" {{quote(product_name)}} {{quote(icon_dir)}})"
     read_config() { node -e 'console.log(JSON.parse(process.argv[1])[process.argv[2]])' "$DEMO_CONFIG" "$1"; }
     PRODUCT_NAME="$(read_config productName)"
     DMG_VOLUME_NAME="$(read_config dmgVolumeName)"
@@ -317,7 +324,7 @@ desktop-demo-build demo_name target="aarch64-apple-darwin":
     PLIST="$APP_PATH/Contents/Info.plist"
     /usr/libexec/PlistBuddy -c "Set :CFBundleDisplayName $PRODUCT_NAME" "$PLIST"
     /usr/libexec/PlistBuddy -c "Set :CFBundleName $PRODUCT_NAME" "$PLIST"
-    codesign --force --deep --sign - "$APP_PATH"
+    codesign --force --deep --sign {{quote(sign_identity)}} "$APP_PATH"
     VOL_NAME="$DMG_VOLUME_NAME" ./desktop/scripts/package-macos-dmg.sh "$APP_PATH" "desktop/src-tauri/target/$TARGET/release/bundle/dmg/${DMG_FILE_STEM}_${VERSION}_${DMG_ARCH}.dmg"
 
 # Run desktop checks suitable for CI / pre-push
