@@ -3,9 +3,9 @@
 #
 # The same steps `just desktop-demo-build` runs, with the Fleet specifics
 # pinned: a fixed demo build id (so the installed app keeps its bundle id,
-# agents, membership and channels across rebuilds), the blue Fleet icon, the
-# display name, and a stable code-signing identity so macOS does not ask for
-# keychain access again on every rebuild.
+# agents, membership and channels across rebuilds), the Fleet icon set, the
+# display name "Fleet Buzz", and a stable code-signing identity so macOS does
+# not ask for keychain access again on every rebuild.
 #
 #   scripts/fleet-desktop-build.sh            # build, sign, bundle
 #   scripts/fleet-desktop-build.sh --install  # ... and install to /Applications, keeping the previous build
@@ -20,7 +20,7 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 TARGET="${BUZZ_FLEET_TARGET:-aarch64-apple-darwin}"
 BUILD_ID="${BUZZ_FLEET_BUILD_ID:-51094c33a0d51d7c}"
-NAME="Buzz Fleet"
+NAME="Fleet Buzz"
 if [[ -z "${BUZZ_FLEET_SIGN_IDENTITY:-}" ]]; then
   if security find-identity -v -p codesigning 2>/dev/null | grep -q '"Buzz Fleet Dev"'; then
     BUZZ_FLEET_SIGN_IDENTITY="Buzz Fleet Dev"
@@ -43,8 +43,8 @@ cargo build --release --target "$TARGET" \
   -p git-credential-nostr -p buzz-cli
 ./scripts/bundle-sidecars.sh "$TARGET"
 
-echo "== demo config (build id $BUILD_ID, Fleet icon)"
-DEMO_CONFIG="$(BUZZ_DEMO_ICON_DIR=icons-fleet node desktop/scripts/demo-build-config.mjs Fleet "$CONFIG" "$BUILD_ID")"
+echo "== demo config (build id $BUILD_ID, name $NAME, Fleet icon)"
+DEMO_CONFIG="$(node desktop/scripts/demo-build-config.mjs Fleet "$CONFIG" "$BUILD_ID" "$NAME" icons-fleet)"
 SLUG="$(node -e 'console.log(JSON.parse(process.argv[1]).slug)' "$DEMO_CONFIG")"
 
 echo "== tauri build"
@@ -73,5 +73,6 @@ if [[ "${1:-}" == "--install" ]]; then
   fi
   cp -R "$APP" "$DEST"
   codesign --verify --deep --strict "$DEST"
+  /System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister -f "$DEST" >/dev/null 2>&1 || true
   echo "installed: $DEST"
 fi
