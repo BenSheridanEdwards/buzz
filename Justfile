@@ -292,8 +292,10 @@ desktop-release-build target="aarch64-apple-darwin":
 # Named demo build. Pass build_id to rebuild an installed demo in place (same
 # identifier, config home and keyring); product_name renames the app without
 # touching that identity; icon_dir (relative to desktop/src-tauri, default $BUZZ_DEMO_ICON_DIR) swaps the icon set.
-# Example: just desktop-demo-build Fleet aarch64-apple-darwin 51094c33a0d51d7c "Fleet Buzz" icons-fleet
-desktop-demo-build demo_name target="aarch64-apple-darwin" build_id="" product_name="" icon_dir="":
+# sign_identity is a codesign identity ("-" = ad hoc). A stable self-signed identity keeps
+# the keychain grant across rebuilds; ad hoc re-prompts for keychain access on every launch.
+# Example: just desktop-demo-build Fleet aarch64-apple-darwin 51094c33a0d51d7c "Fleet Buzz" icons-fleet "Buzz Fleet Dev"
+desktop-demo-build demo_name target="aarch64-apple-darwin" build_id="" product_name="" icon_dir="" sign_identity="-":
     #!/usr/bin/env bash
     set -euo pipefail
     TARGET={{target}}
@@ -322,7 +324,7 @@ desktop-demo-build demo_name target="aarch64-apple-darwin" build_id="" product_n
     PLIST="$APP_PATH/Contents/Info.plist"
     /usr/libexec/PlistBuddy -c "Set :CFBundleDisplayName $PRODUCT_NAME" "$PLIST"
     /usr/libexec/PlistBuddy -c "Set :CFBundleName $PRODUCT_NAME" "$PLIST"
-    codesign --force --deep --sign - "$APP_PATH"
+    codesign --force --deep --sign {{quote(sign_identity)}} "$APP_PATH"
     VOL_NAME="$DMG_VOLUME_NAME" ./desktop/scripts/package-macos-dmg.sh "$APP_PATH" "desktop/src-tauri/target/$TARGET/release/bundle/dmg/${DMG_FILE_STEM}_${VERSION}_${DMG_ARCH}.dmg"
 
 # Run desktop checks suitable for CI / pre-push
