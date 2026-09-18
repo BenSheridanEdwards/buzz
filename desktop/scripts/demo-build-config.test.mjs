@@ -132,3 +132,65 @@ for (const name of [
   test(`rejects unusable name ${JSON.stringify(name)}`, () =>
     assert.throws(() => demoBuildConfig(name, "1234567812345678")));
 }
+
+test("a product name override renames the app but keeps every runtime identity", () => {
+  const plain = demoBuildConfig("Fleet", "51094c33a0d51d7c");
+  const renamed = demoBuildConfig("Fleet", "51094c33a0d51d7c", {
+    productName: "Fleet Buzz",
+  });
+  assert.equal(plain.productName, "Buzz Fleet");
+  assert.equal(renamed.productName, "Fleet Buzz");
+  assert.equal(renamed.dmgVolumeName, "Fleet Buzz");
+  assert.equal(renamed.dmgFileStem, "Fleet_Buzz");
+  assert.equal(renamed.tauriConfig.productName, "Fleet Buzz");
+  for (const key of [
+    "slug",
+    "identifier",
+    "appDataIdentity",
+    "deepLinkScheme",
+    "keyringService",
+    "nestName",
+    "cliName",
+  ]) {
+    assert.equal(renamed[key], plain[key], key);
+  }
+  assert.equal(renamed.tauriConfig.identifier, plain.tauriConfig.identifier);
+});
+
+test("an empty product name override means no override", () => {
+  const config = demoBuildConfig("Fleet", "51094c33a0d51d7c", {
+    productName: "",
+  });
+  assert.equal(config.productName, "Buzz Fleet");
+});
+
+test("an icon directory swaps the bundle icon set and nothing else", () => {
+  const plain = demoBuildConfig("Fleet", "51094c33a0d51d7c");
+  const iconed = demoBuildConfig("Fleet", "51094c33a0d51d7c", {
+    iconDir: "icons/fleet-buzz/",
+  });
+  assert.equal(plain.tauriConfig.bundle.icon, undefined);
+  assert.deepEqual(iconed.tauriConfig.bundle.icon, [
+    "icons/fleet-buzz/32x32.png",
+    "icons/fleet-buzz/128x128.png",
+    "icons/fleet-buzz/128x128@2x.png",
+    "icons/fleet-buzz/icon.icns",
+    "icons/fleet-buzz/icon.ico",
+  ]);
+  assert.deepEqual(iconed.tauriConfig.bundle.targets, ["app"]);
+  assert.equal(iconed.identifier, plain.identifier);
+});
+
+for (const bad of ["   ", "Fleet/Buzz", "Fleet_Buzz", "équipe", "-Fleet"]) {
+  test(`rejects unusable product name ${JSON.stringify(bad)}`, () =>
+    assert.throws(() =>
+      demoBuildConfig("Fleet", "51094c33a0d51d7c", { productName: bad }),
+    ));
+}
+
+for (const bad of ["../icons", "/abs/icons", "icons/../../x"]) {
+  test(`rejects unusable icon directory ${JSON.stringify(bad)}`, () =>
+    assert.throws(() =>
+      demoBuildConfig("Fleet", "51094c33a0d51d7c", { iconDir: bad }),
+    ));
+}

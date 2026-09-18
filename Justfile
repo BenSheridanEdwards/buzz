@@ -289,15 +289,20 @@ desktop-release-build target="aarch64-apple-darwin":
     cd {{desktop_dir}} && pnpm tauri build --features mesh-llm --target {{target}}
 
 # Build an unsigned named macOS demo DMG with isolated app and runtime identities.
-desktop-demo-build demo_name target="aarch64-apple-darwin":
+# Named demo build. Pass build_id to rebuild an installed demo in place (same
+# identifier, config home and keyring); product_name renames the app without
+# touching that identity; icon_dir (relative to desktop/src-tauri) swaps the icon set.
+# Example: just desktop-demo-build Fleet aarch64-apple-darwin 51094c33a0d51d7c "Fleet Buzz" icons/fleet-buzz
+desktop-demo-build demo_name target="aarch64-apple-darwin" build_id="" product_name="" icon_dir="":
     #!/usr/bin/env bash
     set -euo pipefail
     TARGET={{target}}
     [[ "$(uname -s)" == "Darwin" && "$TARGET" == *-apple-darwin ]] || { echo "Demo DMGs require a macOS Apple target" >&2; exit 2; }
     CONFIG_PATH="$(mktemp "${TMPDIR:-/tmp}/buzz-demo-config.XXXXXX")"
     trap 'rm -f "$CONFIG_PATH"' EXIT
-    DEMO_BUILD_ID="$(node -e 'console.log(require("node:crypto").randomBytes(8).toString("hex"))')"
-    DEMO_CONFIG="$(node desktop/scripts/demo-build-config.mjs {{quote(demo_name)}} "$CONFIG_PATH" "$DEMO_BUILD_ID")"
+    DEMO_BUILD_ID={{quote(build_id)}}
+    [[ -n "$DEMO_BUILD_ID" ]] || DEMO_BUILD_ID="$(node -e 'console.log(require("node:crypto").randomBytes(8).toString("hex"))')"
+    DEMO_CONFIG="$(node desktop/scripts/demo-build-config.mjs {{quote(demo_name)}} "$CONFIG_PATH" "$DEMO_BUILD_ID" {{quote(product_name)}} {{quote(icon_dir)}})"
     read_config() { node -e 'console.log(JSON.parse(process.argv[1])[process.argv[2]])' "$DEMO_CONFIG" "$1"; }
     PRODUCT_NAME="$(read_config productName)"
     DMG_VOLUME_NAME="$(read_config dmgVolumeName)"
