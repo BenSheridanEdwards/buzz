@@ -78,7 +78,7 @@ const NAME_ABBREVIATIONS: &[&str] = &[
 ];
 
 /// One Hermes profile as presented to the Desktop picker.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct HermesProfile {
     /// Directory name under the profiles root.
     pub slug: String,
@@ -90,6 +90,10 @@ pub struct HermesProfile {
     pub path: String,
     /// Inline `data:image/...;base64,` avatar when the profile ships one.
     pub avatar_data_url: Option<String>,
+    /// `voice.playback_speed` from the profile's `config.yaml`: the rate this
+    /// voice is meant to be heard at, published on its voice notes so every
+    /// client starts there. Absent when the profile sets none.
+    pub voice_playback_speed: Option<f64>,
 }
 
 /// Default Hermes home: `$HOME/.hermes`.
@@ -217,6 +221,7 @@ struct ProfileMeta {
     name: String,
     description: Option<String>,
     path: String,
+    voice_playback_speed: Option<f64>,
 }
 
 impl ProfileMeta {
@@ -231,6 +236,7 @@ impl ProfileMeta {
             description: self.description,
             path: self.path,
             avatar_data_url,
+            voice_playback_speed: self.voice_playback_speed,
         }
     }
 }
@@ -275,6 +281,9 @@ fn read_profile_meta(dir: &Path, kind: ProfileKind) -> Option<ProfileMeta> {
             ProfileKind::Child => slug_display_name(&slug),
         });
     let description = soul.as_deref().and_then(soul_description);
+    let voice_playback_speed = read_bounded(&dir.join("config.yaml"), MAX_CONFIG_READ_BYTES)
+        .ok()
+        .and_then(|bytes| config_voice_playback_speed(&String::from_utf8_lossy(&bytes)));
 
     Some(ProfileMeta {
         dir: dir.to_path_buf(),
@@ -282,7 +291,28 @@ fn read_profile_meta(dir: &Path, kind: ProfileKind) -> Option<ProfileMeta> {
         name,
         description,
         path,
+        voice_playback_speed,
     })
+}
+
+/// A profile `config.yaml` is a few KB; anything past this is not one.
+const MAX_CONFIG_READ_BYTES: u64 = 256 * 1024;
+
+/// Slowest and fastest rate the clients honour; a value outside it would be
+/// published and then ignored on every device, so it is not offered.
+const VOICE_PLAYBACK_SPEED_RANGE: std::ops::RangeInclusive<f64> = 0.5..=2.0;
+
+/// `voice.playback_speed` from a Hermes `config.yaml`, when it is a rate the
+/// clients can honour. A file that does not parse as YAML, or sets no voice
+/// block, yields `None` rather than an error: the pick still works, the
+/// notes just start at 1x.
+pub fn config_voice_playback_speed(config: &str) -> Option<f64> {
+    let root: serde_yaml::Value = serde_yaml::from_str(config).ok()?;
+    let speed = root.get("voice")?.get("playback_speed")?;
+    let speed = speed
+        .as_f64()
+        .or_else(|| speed.as_str().and_then(|s| s.trim().parse().ok()))?;
+    (speed.is_finite() && VOICE_PLAYBACK_SPEED_RANGE.contains(&speed)).then_some(speed)
 }
 
 fn read_bounded(path: &Path, limit: u64) -> std::io::Result<Vec<u8>> {
@@ -292,7 +322,22 @@ fn read_bounded(path: &Path, limit: u64) -> std::io::Result<Vec<u8>> {
     Ok(bytes)
 }
 
+/// Directories inside a profile that may hold its avatar, in precedence order.
+///
+/// Hermes writes the avatar under `assets/`; every profile in a real fleet
+/// has one there. Some profiles also carry a copy at the root, which was the
+/// only place this looked and is why a profile with the canonical layout
+/// alone came through with no avatar (#36). The root still wins when both
+/// exist so nothing changes for a profile that has one.
+const AVATAR_DIRS: [&str; 2] = ["", "assets"];
+
 fn read_avatar_data_url(dir: &Path) -> Option<String> {
+    AVATAR_DIRS
+        .iter()
+        .find_map(|sub| read_avatar_data_url_in(&dir.join(sub)))
+}
+
+fn read_avatar_data_url_in(dir: &Path) -> Option<String> {
     AVATAR_CANDIDATES.iter().find_map(|(file_name, mime)| {
         let candidate = dir.join(file_name);
         let metadata = std::fs::metadata(&candidate).ok()?;
@@ -587,6 +632,102 @@ mod tests {
         assert_eq!(
             profile.avatar_data_url.as_deref(),
             Some("data:image/jpeg;base64,/9j/4A==")
+        );
+    }
+
+    #[test]
+    fn reads_the_voice_playback_speed_from_the_config() {
+        // The rate a voice is tuned to travels with the profile pick, so the
+        // agent's notes start at it on every device.
+        let temp = tempfile::tempdir().expect("tempdir");
+        let sky = temp.path().join("sky");
+        write(&sky, "SOUL.md", b"# SOUL.md \xe2\x80\x94 Sky\n");
+        write(
+            &sky,
+            "config.yaml",
+            b"model: x\ntts:\n  provider: xai\n  speed: 1.1\nvoice:\n  auto_tts: true\n  playback_speed: 1.1\n",
+        );
+        let none = temp.path().join("bond");
+        write(&none, "SOUL.md", b"# SOUL.md \xe2\x80\x94 Bond\n");
+        write(&none, "config.yaml", b"model: x\n");
+
+        let profiles = scan(temp.path());
+        let by_slug = |slug: &str| {
+            profiles
+                .iter()
+                .find(|p| p.slug == slug)
+                .expect("profile")
+                .voice_playback_speed
+        };
+        assert_eq!(by_slug("sky"), Some(1.1));
+        assert_eq!(by_slug("bond"), None);
+    }
+
+    #[test]
+    fn voice_playback_speed_only_comes_through_when_the_clients_can_honour_it() {
+        assert_eq!(
+            config_voice_playback_speed("voice:\n  playback_speed: 1.25\n"),
+            Some(1.25)
+        );
+        // A quoted number still counts; Hermes users hand-edit this file.
+        assert_eq!(
+            config_voice_playback_speed("voice:\n  playback_speed: '0.9'\n"),
+            Some(0.9)
+        );
+        for config in [
+            "voice:\n  playback_speed: 4\n",
+            "voice:\n  playback_speed: 0.1\n",
+            "voice:\n  playback_speed: fast\n",
+            "voice:\n  playback_speed: .nan\n",
+            "voice: {}\n",
+            "tts:\n  speed: 1.1\n",
+            "not: [yaml",
+            "",
+        ] {
+            assert_eq!(
+                config_voice_playback_speed(config),
+                None,
+                "{config:?} must yield no hint"
+            );
+        }
+    }
+
+    #[test]
+    fn reads_the_avatar_from_the_assets_directory() {
+        // The canonical Hermes layout: SOUL at the root, avatar under assets/.
+        let temp = tempfile::tempdir().expect("tempdir");
+        let echo = temp.path().join("echo");
+        write(&echo, "SOUL.md", b"# SOUL.md \xe2\x80\x94 Echo\n");
+        write(&echo, "config.yaml", b"model: x\n");
+        write(
+            &echo.join("assets"),
+            "avatar.png",
+            &[0x89, 0x50, 0x4E, 0x47],
+        );
+
+        let profiles = scan(temp.path());
+        assert_eq!(profiles.len(), 1);
+        assert_eq!(
+            profiles[0].avatar_data_url.as_deref(),
+            Some("data:image/png;base64,iVBORw=="),
+            "an avatar under assets/ must be offered"
+        );
+    }
+
+    #[test]
+    fn a_root_avatar_still_wins_over_the_assets_one() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let sky = temp.path().join("sky");
+        write(&sky, "SOUL.md", b"# SOUL.md \xe2\x80\x94 Sky\n");
+        write(&sky, "config.yaml", b"model: x\n");
+        write(&sky, "avatar.jpg", &[0xFF, 0xD8, 0xFF, 0xE0]);
+        write(&sky.join("assets"), "avatar.png", &[0x89, 0x50, 0x4E, 0x47]);
+
+        let profiles = scan(temp.path());
+        assert_eq!(
+            profiles[0].avatar_data_url.as_deref(),
+            Some("data:image/jpeg;base64,/9j/4A=="),
+            "the root copy keeps precedence so existing profiles are unchanged"
         );
     }
 
@@ -963,9 +1104,11 @@ mod tests {
             description: None,
             path: "/p".into(),
             avatar_data_url: None,
+            voice_playback_speed: Some(1.1),
         };
         let json = serde_json::to_value(&profile).expect("json");
         assert_eq!(json["avatar_data_url"], serde_json::Value::Null);
+        assert_eq!(json["voice_playback_speed"], 1.1);
         assert_eq!(json["path"], "/p");
     }
 }

@@ -18,6 +18,29 @@ export const HERMES_SKIP_CONFIGURED_MCP_ENV = "HERMES_ACP_SKIP_CONFIGURED_MCP";
 /** Every Hermes engine is a full process loading MCP servers: one at a time. */
 export const HERMES_PROFILE_PARALLELISM = "1";
 
+/**
+ * buzz-acp bills a person's voice-note transcription to this Hermes profile
+ * (the endpoint and its token are machine-wide, set once in the global agent
+ * env; the profile is the one thing that differs per agent).
+ */
+export const BUZZ_TRANSCRIBE_PROFILE_ENV = "BUZZ_ACP_TRANSCRIBE_PROFILE";
+
+/**
+ * buzz-acp publishes this on every voice note the agent sends, as the imeta
+ * `playback_speed` hint both clients start the note at. Seeded from the
+ * profile's `voice.playback_speed`; absent when the profile sets none.
+ */
+export const BUZZ_VOICE_PLAYBACK_SPEED_ENV = "BUZZ_ACP_VOICE_PLAYBACK_SPEED";
+
+/**
+ * A Hermes engine answers in its reply text; buzz-acp posts that answer (or
+ * the voice note it named) in the thread of the message being answered. In
+ * the default `cli` mode the engine is told to post with `buzz messages send`
+ * as well, which put every reply in the channel twice.
+ */
+export const BUZZ_REPLY_MODE_ENV = "BUZZ_ACP_REPLY_MODE";
+export const HERMES_REPLY_MODE = "harness";
+
 /** Agent instructions seeded when a profile is picked into an empty prompt. */
 export const HERMES_PROFILE_DEFAULT_INSTRUCTIONS =
   "Your SOUL, memory, skills and tools come from your Hermes profile. Follow them.";
@@ -32,7 +55,16 @@ export type HermesProfilesStatus = "loading" | "ready" | "error";
 const HERMES_PROFILE_ENV_KEYS = [
   HERMES_HOME_ENV,
   HERMES_SKIP_CONFIGURED_MCP_ENV,
+  BUZZ_TRANSCRIBE_PROFILE_ENV,
+  BUZZ_VOICE_PLAYBACK_SPEED_ENV,
+  BUZZ_REPLY_MODE_ENV,
 ] as const;
+
+/** What a pick needs from a profile to write its env vars. */
+export type HermesProfilePick = Pick<
+  HermesProfile,
+  "path" | "slug" | "voicePlaybackSpeed"
+>;
 
 const HERMES_COMMAND_IDENTITIES = new Set([
   "hermes",
@@ -145,16 +177,34 @@ export function isSameProfilePath(a: string, b: string): boolean {
   return left.length > 0 && left === normalize(b);
 }
 
-/** Env vars with the profile pinned; every unrelated key is left untouched. */
+/**
+ * Env vars with the profile pinned; every unrelated key is left untouched.
+ *
+ * The voice rate is written only when the profile sets one, and a previous
+ * profile's rate is dropped otherwise: a voice tuned to 1.1x must not carry
+ * over to a profile whose voice was never tuned.
+ */
 export function hermesProfileEnvVars(
   envVars: Record<string, string>,
-  profilePath: string,
+  profile: HermesProfilePick,
 ): Record<string, string> {
-  return withEnvVar(
-    withEnvVar(envVars, HERMES_HOME_ENV, profilePath),
-    HERMES_SKIP_CONFIGURED_MCP_ENV,
-    "0",
+  const pinned = withEnvVar(
+    withEnvVar(
+      withEnvVar(
+        withEnvVar(envVars, HERMES_HOME_ENV, profile.path),
+        HERMES_SKIP_CONFIGURED_MCP_ENV,
+        "0",
+      ),
+      BUZZ_TRANSCRIBE_PROFILE_ENV,
+      profile.slug,
+    ),
+    BUZZ_REPLY_MODE_ENV,
+    HERMES_REPLY_MODE,
   );
+  const speed = profile.voicePlaybackSpeed;
+  return typeof speed === "number" && Number.isFinite(speed)
+    ? withEnvVar(pinned, BUZZ_VOICE_PLAYBACK_SPEED_ENV, String(speed))
+    : envVarsWithoutKeyCaseInsensitive(pinned, BUZZ_VOICE_PLAYBACK_SPEED_ENV);
 }
 
 /** Env vars with the profile pin removed; every unrelated key is kept. */
@@ -219,7 +269,7 @@ export function applyHermesProfileToDraft(
     )
       ? HERMES_PROFILE_DEFAULT_INSTRUCTIONS
       : draft.systemPrompt,
-    envVars: hermesProfileEnvVars(draft.envVars, profile.path),
+    envVars: hermesProfileEnvVars(draft.envVars, profile),
     parallelism: HERMES_PROFILE_PARALLELISM,
   };
 }

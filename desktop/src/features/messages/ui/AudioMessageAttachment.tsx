@@ -12,17 +12,18 @@ import { toast } from "sonner";
 
 import {
   formatVoiceNoteDuration,
+  formatVoiceNotePlaybackRate,
   isVoiceNoteAttachment,
   nextVoiceNotePlaybackRate,
   resolveAudioAttachment,
   resolveTranscriptOpen,
   summarizeWaveform,
   voiceNoteBarHeight,
+  voiceNoteDefaultPlaybackRate,
   voiceNoteTranscript,
   waveformPeaks,
   writeTranscriptPreference,
   type AudioAttachmentImetaEntry,
-  type VoiceNoteConversationContext,
 } from "@/features/messages/lib/audioAttachment";
 import { scheduleAudioMediaLoad } from "@/features/messages/lib/audioMediaLoadScheduler";
 import { invokeTauri } from "@/shared/api/tauri";
@@ -52,13 +53,9 @@ function dotPeaks(count: number): number[] {
   return Array.from({ length: count }, () => 0);
 }
 
-function playbackRateLabel(rate: number): string {
-  return `${rate}×`;
-}
-
 /** Accessible name for the speed pill; "x" reads the same as the glyph. */
 function playbackRateName(rate: number): string {
-  return `${rate}x`;
+  return formatVoiceNotePlaybackRate(rate).replace("×", "x");
 }
 
 /** Keyboard scrub steps on the playback position slider, in seconds. */
@@ -76,17 +73,19 @@ export function renderAudioMessageAttachment(
   if (!attachment) return null;
   const voiceNote = isVoiceNoteAttachment(entry);
   const transcript = voiceNoteTranscript(entry);
+  const ownNote = voiceNoteCard?.ownNote ?? false;
   return (
     <AudioMessageAttachment
       {...attachment}
+      defaultPlaybackRate={voiceNoteDefaultPlaybackRate(entry, ownNote)}
       downloadUrl={voiceNote ? undefined : downloadUrl}
+      ownNote={ownNote}
       sender={voiceNoteCard?.sender}
       transcript={
         transcript === undefined
           ? undefined
           : (voiceNoteCard?.renderTranscript?.(transcript) ?? transcript)
       }
-      transcriptContext={voiceNoteCard?.conversation}
     />
   );
 }
@@ -142,33 +141,36 @@ async function decodeSamples(
 
 export function AudioMessageAttachment({
   composer = false,
+  defaultPlaybackRate = 1,
   duration: taggedDuration,
   downloadUrl,
   filename,
   href,
   onRemove,
+  ownNote = false,
   sender,
   transcript,
-  transcriptContext = "channel",
 }: {
   composer?: boolean;
+  /** Rate the note starts at and the speed pill wraps back to. */
+  defaultPlaybackRate?: number;
   duration?: number;
   downloadUrl?: string;
   filename: string;
   href: string;
   onRemove?: () => void;
+  /** The viewer recorded this note: the speed pill steps by a quarter. */
+  ownNote?: boolean;
   /** Display name of the sender, shown as the card title. */
   sender?: string;
   /** The attachment's transcript, already rendered; no row when absent. */
   transcript?: React.ReactNode;
-  /** Decides the transcript default: open in DMs, folded in channels. */
-  transcriptContext?: VoiceNoteConversationContext;
 }) {
   const audioRef = React.useRef<HTMLAudioElement | null>(null);
   const playbackId = React.useId();
   const transcriptId = React.useId();
   const [transcriptOpen, setTranscriptOpen] = React.useState(() =>
-    resolveTranscriptOpen(transcriptContext),
+    resolveTranscriptOpen(),
   );
   const toggleTranscript = React.useCallback(() => {
     // The write lives in the handler, not the updater: updaters must stay
@@ -199,7 +201,7 @@ export function AudioMessageAttachment({
   const [duration, setDuration] = React.useState(taggedDuration ?? 0);
   const [currentTime, setCurrentTime] = React.useState(0);
   const [isPlaying, setIsPlaying] = React.useState(false);
-  const [playbackRate, setPlaybackRate] = React.useState(1);
+  const [playbackRate, setPlaybackRate] = React.useState(defaultPlaybackRate);
   const [playbackError, setPlaybackError] = React.useState(false);
   const [waveformError, setWaveformError] = React.useState(false);
   // A Play click before the source is fetched is remembered here so playback
@@ -428,7 +430,10 @@ export function AudioMessageAttachment({
   }, [href]);
 
   const timeLabel = `${formatVoiceNoteDuration(currentTime)} / ${formatVoiceNoteDuration(duration)}`;
-  const nextPlaybackRate = nextVoiceNotePlaybackRate(playbackRate);
+  const nextPlaybackRate = nextVoiceNotePlaybackRate(playbackRate, {
+    defaultRate: defaultPlaybackRate,
+    ownNote,
+  });
   // A seek that lands on the last frame ends the media as surely as playing
   // to it does, and the element fires `ended` either way. Only playback
   // running out rewinds the head; a scrub the user aimed at the end stays
@@ -510,7 +515,7 @@ export function AudioMessageAttachment({
       className="grid rounded-full bg-primary px-2.5 py-0.5 text-2xs font-semibold tabular-nums text-primary-foreground transition-transform duration-150 ease-out active:scale-95 focus-visible:outline-hidden focus-visible:ring-1 focus-visible:ring-ring focus-visible:ring-offset-1 motion-reduce:transition-none motion-reduce:active:scale-100"
       data-testid="voice-note-playback-rate"
       onClick={() => {
-        const next = nextVoiceNotePlaybackRate(playbackRate);
+        const next = nextPlaybackRate;
         setPlaybackRate(next);
         if (audioRef.current) {
           audioRef.current.defaultPlaybackRate = next;
@@ -520,13 +525,13 @@ export function AudioMessageAttachment({
       type="button"
     >
       <span aria-hidden="true" className="invisible col-start-1 row-start-1">
-        1.5×
+        1.75×
       </span>
       <span
         className="col-start-1 row-start-1 text-center"
         data-testid="voice-note-playback-rate-value"
       >
-        {playbackRateLabel(playbackRate)}
+        {formatVoiceNotePlaybackRate(playbackRate)}
       </span>
     </button>
   ) : null;
@@ -760,6 +765,12 @@ export function AudioMessageAttachment({
         onTimeUpdate={(event) =>
           setCurrentTime(event.currentTarget.currentTime)
         }
+        onLoadedMetadata={(event) => {
+          // A hinted default (a voice tuned to 1.1x) has to reach the element
+          // itself; a new source resets the element's rate to 1.
+          event.currentTarget.defaultPlaybackRate = playbackRate;
+          event.currentTarget.playbackRate = playbackRate;
+        }}
         preload="metadata"
         ref={audioRef}
         src={playbackHref}

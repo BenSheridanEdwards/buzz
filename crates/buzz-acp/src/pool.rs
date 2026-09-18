@@ -141,6 +141,13 @@ pub struct SessionState {
     /// Per-scope successful-delivery state. Created with the ACP session and
     /// cleared atomically with every invalidation path.
     pub deliveries: HashMap<SessionScope, ChannelDeliveryState>,
+    /// session scope → the latest real message that triggered a turn there.
+    ///
+    /// A delivery turn (a finished background result being reported back into
+    /// the thread it came from) is anchored on this event, so it publishes
+    /// exactly like a normal in-thread reply. Cleared with every invalidation
+    /// path alongside `sessions`.
+    pub last_trigger: HashMap<SessionScope, nostr::Event>,
 }
 
 impl SessionState {
@@ -165,6 +172,7 @@ impl SessionState {
         self.core_sections.remove(scope);
         self.canvas_sections.remove(scope);
         self.deliveries.remove(scope);
+        self.last_trigger.remove(scope);
         self.sessions.remove(scope).is_some()
     }
 
@@ -179,6 +187,7 @@ impl SessionState {
             .chain(self.core_sections.keys())
             .chain(self.canvas_sections.keys())
             .chain(self.deliveries.keys())
+            .chain(self.last_trigger.keys())
             .filter(|s| s.channel_id() == *channel_id)
             .cloned()
             .collect::<HashSet<_>>()
@@ -203,6 +212,7 @@ impl SessionState {
         self.core_sections.clear();
         self.canvas_sections.clear();
         self.deliveries.clear();
+        self.last_trigger.clear();
     }
 
     pub(crate) fn mark_scope_delivery_success(
@@ -762,6 +772,16 @@ impl ChannelInfoResolver {
 }
 
 pub struct PromptContext {
+    /// Hermes transcribe endpoint for inbound voice notes; empty disables it.
+    pub transcribe_endpoint: String,
+    /// Hermes profile the transcription is billed to.
+    pub transcribe_profile: String,
+    /// Session token for the Hermes transcribe endpoint.
+    pub transcribe_token: String,
+    /// Playback rate hint published on this agent's voice notes.
+    pub voice_playback_speed: Option<f64>,
+    /// Who delivers the engine's reply; see [`crate::config::ReplyMode`].
+    pub reply_mode: crate::config::ReplyMode,
     pub mcp_servers: Vec<McpServer>,
     pub initial_message: Option<String>,
     pub idle_timeout: Duration,
@@ -836,6 +856,65 @@ pub struct PromptContext {
     /// envelopes are passed through unextracted and outbound audio that the
     /// relay refuses falls back to a generic file.
     pub ffmpeg: Option<std::path::PathBuf>,
+    /// Where a reply's attachment failures go: back to the agent, as a
+    /// follow-up turn in the same thread (see [`MediaFeedback`]), so it can
+    /// fix the reference and post the file — instead of a harness-authored
+    /// error line in the channel. `None` (tests, or a closed receiver) falls
+    /// back to the channel notice.
+    pub media_feedback_tx: Option<mpsc::UnboundedSender<MediaFeedback>>,
+}
+
+/// One reply whose media did not all reach the relay, handed back to the main
+/// loop so the agent that wrote it is told in its own thread.
+#[derive(Debug)]
+pub struct MediaFeedback {
+    pub channel_id: Uuid,
+    /// The session the reply came from; the follow-up turn runs in it.
+    pub scope: SessionScope,
+    /// The message the reply answered; the follow-up is anchored on it so it
+    /// publishes as an ordinary in-thread reply.
+    pub trigger: nostr::Event,
+    /// Short human-readable summary, also the channel fallback text.
+    pub notice: String,
+    /// Every failure reason, one per reference, for the prompt.
+    pub failed: Vec<String>,
+    /// How many files did arrive.
+    pub published: usize,
+    pub created_at: std::time::Instant,
+}
+
+/// `prompt_tag` of the synthetic trigger an attachment-failure turn is
+/// anchored on.
+pub(crate) const MEDIA_FEEDBACK_PROMPT_TAG: &str = "attachment-failed";
+
+/// The follow-up prompt for one [`MediaFeedback`]: what failed, why, and what
+/// a usable reference looks like. Short on purpose — the agent already has
+/// the thread.
+pub fn media_feedback_prompt(feedback: &MediaFeedback) -> String {
+    let reasons = feedback
+        .failed
+        .iter()
+        .map(|reason| format!("- {reason}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let arrived = match feedback.published {
+        0 => "Nothing was attached.".to_string(),
+        1 => "One other file did attach.".to_string(),
+        n => format!("{n} other files did attach."),
+    };
+    format!(
+        "Your last reply in this thread was posted, but {} of its attachments could not be published:\n{reasons}\n{arrived}\n\
+Reply here with the file again: a short message and one `MEDIA:` line per file, giving the absolute path of a regular file \
+(a name without its extension is matched to the one file with that stem; paths with spaces are fine; a directory is not a file). \
+If the file does not exist or cannot be produced, say so in one line instead. Do not repeat your previous reply.",
+        feedback.failed.len()
+    )
+}
+
+/// Turns anchored on an older, already-answered trigger judge the
+/// duplicate-reply guard from their own start, not from the trigger.
+pub(crate) fn anchored_on_old_trigger(prompt_tag: &str) -> bool {
+    prompt_tag == DELIVERY_PROMPT_TAG || prompt_tag == MEDIA_FEEDBACK_PROMPT_TAG
 }
 
 impl AgentPool {
@@ -930,6 +1009,41 @@ impl AgentPool {
     /// Pass 2: any idle agent.
     ///
     /// Returns `None` if all agents are checked out.
+    /// Claim the worker that already owns `scope`'s session, and only if it is
+    /// idle. Unlike [`try_claim`](Self::try_claim) this never forks the scope
+    /// onto another worker: a delivery turn must run in the thread's own
+    /// session, because the engine routes the finished result by that session
+    /// id. `None` when the owner is busy or the scope has no session here.
+    pub fn try_claim_owner_only(&mut self, scope: &SessionScope) -> Option<OwnedAgent> {
+        let owner_idle = self.agents.iter().any(|slot| {
+            slot.as_ref()
+                .is_some_and(|agent| agent.state.sessions.contains_key(scope))
+        });
+        if !owner_idle {
+            return None;
+        }
+        // Pass 1 of try_claim returns exactly that idle owner.
+        self.try_claim(Some(scope))
+    }
+
+    /// The scope (and the thread's latest real trigger) whose ACP session id is
+    /// `session_id`, on whichever *idle* worker owns it. Lets a finished
+    /// background result — advertised by the engine under the session it was
+    /// dispatched from — be delivered back into its own thread. A busy owner's
+    /// slot is empty, so its scope is simply not found until it is idle again.
+    pub fn find_scope_for_session(&self, session_id: &str) -> Option<(SessionScope, nostr::Event)> {
+        self.agents.iter().find_map(|slot| {
+            let agent = slot.as_ref()?;
+            let (scope, _) = agent
+                .state
+                .sessions
+                .iter()
+                .find(|(_, sid)| sid.as_str() == session_id)?;
+            let trigger = agent.state.last_trigger.get(scope)?.clone();
+            Some((scope.clone(), trigger))
+        })
+    }
+
     pub fn try_claim(&mut self, scope: Option<&SessionScope>) -> Option<OwnedAgent> {
         // Pass 1: prefer agent with existing session for this scope.
         if let Some(scope) = scope {
@@ -2157,7 +2271,7 @@ async fn collect_batch_attachments(
         }
         Err(e) => {
             tracing::warn!(
-                target: "acp::media",
+                target: "buzz_acp::media",
                 "attachment directory unavailable: {e}"
             );
             crate::attachments::InboundAttachments::unavailable(
@@ -2225,6 +2339,8 @@ fn publish_reply_media(
     batch: Option<&FlushBatch>,
     turn_id: &str,
     guard: crate::attachments::LiveTurnGuard,
+    reply_text: String,
+    turn_started: nostr::Timestamp,
 ) -> Option<tokio::task::JoinHandle<()>> {
     let capture = agent.acp.take_turn_media();
     let Some(batch) = batch else {
@@ -2232,7 +2348,7 @@ fn publish_reply_media(
             // Heartbeat and initial-message replies have no channel to post
             // into; say so rather than losing the reference silently.
             tracing::warn!(
-                target: "acp::media",
+                target: "buzz_acp::media",
                 blocks = capture.blocks().len(),
                 "reply named media outside a channel turn; only channel turns can attach files"
             );
@@ -2250,9 +2366,14 @@ fn publish_reply_media(
         return None;
     }
     let trigger = batch.events.last()?;
+    // A delivery or attachment-retry turn is anchored on an older,
+    // already-answered message; the duplicate-reply guard must judge it from
+    // the turn's own start.
+    let is_delivery_turn = anchored_on_old_trigger(&trigger.prompt_tag);
     let observer = TurnObserver::for_agent(agent);
     let ctx = Arc::clone(ctx);
     let channel_id = batch.channel_id;
+    let scope = batch.scope.clone();
     let trigger = trigger.event.clone();
     let turn_id = turn_id.to_string();
     Some(tokio::spawn(async move {
@@ -2293,24 +2414,45 @@ fn publish_reply_media(
         };
         if !report.is_clean() {
             tracing::warn!(
-                target: "acp::media",
+                target: "buzz_acp::media",
                 channel = %channel_id,
                 published = report.published.len(),
                 "reply media partially failed: {}",
                 report.failed.join("; ")
             );
-            let thread_tags = crate::queue::ThreadTags {
-                root_event_id: Some(target.root_event_id.to_hex()),
-                parent_event_id: Some(target.root_event_id.to_hex()),
-                mentioned_pubkeys: Vec::new(),
-            };
-            post_failure_notice(
-                &ctx.rest_client,
+            // The agent that wrote the reply is told, in its own thread, and
+            // posts the file itself; the channel only hears from the harness
+            // when no main loop is there to carry the feedback.
+            let notice = crate::media_publish::failure_notice(&report);
+            let feedback = MediaFeedback {
                 channel_id,
-                &thread_tags,
-                &crate::media_publish::failure_notice(&report),
-            )
-            .await;
+                scope: scope.clone(),
+                trigger: trigger.clone(),
+                notice: notice.clone(),
+                failed: report.failed.clone(),
+                published: report.published.len(),
+                created_at: std::time::Instant::now(),
+            };
+            let handed_to_agent = ctx
+                .media_feedback_tx
+                .as_ref()
+                .is_some_and(|tx| tx.send(feedback).is_ok());
+            if !handed_to_agent {
+                let thread_tags = crate::queue::ThreadTags {
+                    root_event_id: Some(target.root_event_id.to_hex()),
+                    parent_event_id: Some(target.root_event_id.to_hex()),
+                    mentioned_pubkeys: Vec::new(),
+                };
+                post_failure_notice(&ctx.rest_client, channel_id, &thread_tags, &notice).await;
+            }
+        }
+        // The media message carries the reply text as its transcript, so it
+        // is the one place the words land. Only when no message reached the
+        // relay at all do the words go out on their own, and then through the
+        // same settle-and-check as a plain text turn.
+        if reply_text_needs_own_message(report.event_id.is_some(), &reply_text) {
+            let since = fallback_since(is_delivery_turn, trigger.created_at, turn_started);
+            publish_text_reply_after_settle(&ctx, channel_id, &trigger, reply_text, since).await;
         }
         observer.emit(
             "turn_media_published",
@@ -2365,7 +2507,7 @@ async fn publish_reply_media_now(
         Err(e) => return failed(format!("publish scratch unavailable: {e}")),
     };
     tracing::debug!(
-        target: "acp::media",
+        target: "buzz_acp::media",
         scratch = %scratch.dir().display(),
         "reply media staging into a private directory"
     );
@@ -2380,7 +2522,7 @@ async fn publish_reply_media_now(
     );
     if let Err(reason) = &workspace {
         tracing::error!(
-            target: "acp::media",
+            target: "buzz_acp::media",
             cwd = %ctx.cwd,
             "the working directory is not an outbound root: {reason}; only this turn's own directory is"
         );
@@ -2391,6 +2533,11 @@ async fn publish_reply_media_now(
         workspace_refused: workspace.err(),
         home,
     };
+    // The reply text the engine spoke doubles as the audio's transcript, so a
+    // voice note arrives with the words already attached instead of the
+    // listener having to play it to find out what it says. Taken before
+    // `capture` moves into the blocking task below.
+    let transcript = capture.text().trim().to_string();
     // Canonicalising, staging, and decoding inline data are disk work; keep
     // them off the runtime threads.
     let resolution = {
@@ -2409,6 +2556,8 @@ async fn publish_reply_media_now(
         rest: &ctx.rest_client,
         audio_support: &ctx.audio_support,
         ffmpeg: ctx.ffmpeg.as_deref(),
+        transcript: (!transcript.is_empty()).then_some(transcript.as_str()),
+        playback_speed: ctx.voice_playback_speed,
     };
     let deadline = tokio::time::Instant::now() + crate::media_publish::OUTBOUND_DEADLINE;
     publisher
@@ -2476,6 +2625,9 @@ pub async fn run_prompt_task(
     };
     let observer_channel_id = source.channel_id();
     let turn_started_at = chrono::Utc::now().to_rfc3339();
+    // Wall-clock start of this turn, for the duplicate-reply guard on a
+    // delivery turn (see `fallback_since`).
+    let turn_started_ts = nostr::Timestamp::now();
     // This turn's attachment directory stays out of the prune while the
     // engine may read it and, after the turn, while its reply media is
     // published (the guard moves into that task).
@@ -3137,6 +3289,7 @@ pub async fn run_prompt_task(
                 conversation_context: conversation_context.as_ref(),
                 conversation_context_had_delivered_events,
                 profile_lookup: profile_lookup.as_ref(),
+                reply_mode: ctx.reply_mode,
                 has_system_prompt_support: agent.has_system_prompt_support(),
                 base_prompt: standing.base_prompt,
                 system_prompt: standing.system_prompt,
@@ -3151,6 +3304,26 @@ pub async fn run_prompt_task(
         // sections so the section headers the observer trimmer keys on are
         // unchanged. Every failure is named in the section (rule 1).
         let inbound = collect_batch_attachments(&ctx, b, &turn_id).await;
+        // A person's own voice note reaches the relay with no transcript in
+        // its imeta, and its signature forbids adding one after the fact, so
+        // the words are published as their own event pointing back at it.
+        // Detached: the answer must not wait on someone else's speech-to-text.
+        if !ctx.transcribe_endpoint.trim().is_empty() && !inbound.is_empty() {
+            let rest = ctx.rest_client.clone();
+            let channel_id = b.channel_id;
+            let endpoint = ctx.transcribe_endpoint.clone();
+            let profile = ctx.transcribe_profile.clone();
+            let token = ctx.transcribe_token.clone();
+            let outcomes = crate::attachments::InboundAttachments {
+                outcomes: inbound.outcomes.clone(),
+            };
+            tokio::spawn(async move {
+                publish_inbound_transcripts(
+                    &rest, channel_id, &outcomes, &endpoint, &profile, &token,
+                )
+                .await;
+            });
+        }
         if let Some(section) = inbound.section() {
             sections.push(section);
         }
@@ -3159,7 +3332,7 @@ pub async fn run_prompt_task(
             let stored = inbound.stored().count();
             let total = inbound.outcomes.len();
             tracing::info!(
-                target: "acp::media",
+                target: "buzz_acp::media",
                 channel = %b.channel_id,
                 stored,
                 failed = total - stored,
@@ -3449,6 +3622,8 @@ pub async fn run_prompt_task(
                             batch.as_ref(),
                             &turn_id,
                             turn_dir_guard,
+                            String::new(),
+                            turn_started_ts,
                         );
                         let usage = agent.acp.take_turn_usage();
                         publish_agent_turn_metric(
@@ -3531,9 +3706,25 @@ pub async fn run_prompt_task(
             } else {
                 // Read before `publish_reply_media` takes the capture.
                 let reply_text = agent.acp.peek_turn_text().trim().to_string();
-                publish_reply_media(&ctx, &mut agent, batch.as_ref(), &turn_id, turn_dir_guard);
-                if !reply_text.is_empty() {
-                    publish_text_reply_fallback(&ctx, batch.as_ref(), reply_text);
+                // `MEDIA:` lines are directives to the harness, not words for
+                // a reader. Publishing one verbatim put a file path in the
+                // channel where the reply should have been.
+                let reply_text = crate::media_publish::text_without_media_directives(&reply_text);
+                // A turn that named media publishes its words on the media
+                // message (as the transcript); posting them again here raced
+                // the upload and doubled every voice reply that took longer
+                // than the settle window to land.
+                let media_task = publish_reply_media(
+                    &ctx,
+                    &mut agent,
+                    batch.as_ref(),
+                    &turn_id,
+                    turn_dir_guard,
+                    reply_text.clone(),
+                    turn_started_ts,
+                );
+                if reply_text_needs_own_message(media_task.is_some(), &reply_text) {
+                    publish_text_reply_fallback(&ctx, batch.as_ref(), reply_text, turn_started_ts);
                 }
             }
 
@@ -5589,6 +5780,82 @@ pub(crate) async fn post_text_message(
     }
 }
 
+/// Transcribe every inbound voice note on this batch and publish the words as
+/// their own event, so a person's own recording shows a transcript.
+///
+/// The note's author signed it, so its imeta `alt` cannot be amended after the
+/// fact; the transcript is a separate event tagged `e` with the note's id.
+/// Published best-effort and never awaited by the answer: a turn that cannot
+/// produce a transcript answers exactly as it did before.
+async fn publish_inbound_transcripts(
+    rest: &crate::relay::RestClient,
+    channel_id: Uuid,
+    inbound: &crate::attachments::InboundAttachments,
+    endpoint: &str,
+    profile: &str,
+    token: &str,
+) {
+    for outcome in &inbound.outcomes {
+        let crate::attachments::AttachmentOutcome::Stored { event_id, local } = outcome else {
+            continue;
+        };
+        if !crate::inbound_transcript::should_transcribe(endpoint, local.is_audio, local.size) {
+            continue;
+        }
+        let Ok(target) = nostr::EventId::from_hex(event_id) else {
+            continue;
+        };
+        let Some(text) = crate::inbound_transcript::transcribe_clip(
+            endpoint,
+            profile,
+            token,
+            &local.path,
+            &local.mime_type,
+        )
+        .await
+        else {
+            continue;
+        };
+        let builder = match buzz_sdk::build_voice_note_transcript(channel_id, target, &text) {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::debug!(channel = %channel_id, "inbound transcript: build failed: {e}");
+                continue;
+            }
+        };
+        let event = match builder.sign_with_keys(&rest.keys) {
+            Ok(e) => e,
+            Err(e) => {
+                tracing::debug!(channel = %channel_id, "inbound transcript: sign failed: {e}");
+                continue;
+            }
+        };
+        match tokio::time::timeout(Duration::from_secs(5), rest.submit_event(&event)).await {
+            Ok(Ok(_)) => tracing::info!(
+                target: "buzz_acp::media",
+                channel = %channel_id,
+                note = %event_id,
+                "published a transcript for an inbound voice note"
+            ),
+            // Warn, not debug: a relay that refuses the kind is the one failure
+            // a person notices (their note has no transcript) and it has to be
+            // findable in the log.
+            Ok(Err(e)) => tracing::warn!(
+                target: "buzz_acp::media",
+                channel = %channel_id,
+                note = %event_id,
+                "inbound transcript publish failed: {e}"
+            ),
+            Err(_) => tracing::warn!(
+                target: "buzz_acp::media",
+                channel = %channel_id,
+                note = %event_id,
+                "inbound transcript publish timed out"
+            ),
+        }
+    }
+}
+
 /// How long to wait for an engine-published reply to land on the relay before
 /// deciding the turn produced no message. A reply sent through the `buzz` CLI
 /// is submitted by a child process, so it can still be in flight when the
@@ -5648,43 +5915,110 @@ fn query_says_published(value: &serde_json::Value) -> bool {
 /// alone. An ACP engine that simply answers (the Hermes runtime does) would
 /// otherwise complete a turn, log `end_turn`, and leave the human with
 /// silence; its answer is published here, anchored exactly like a media reply.
+/// `prompt_tag` of the synthetic trigger a delivery turn is anchored on: a
+/// finished background result being reported back into its own thread. The
+/// harness dispatches such turns on the thread's *last real* message, so
+/// anything keyed on that message's age must treat the turn specially.
+pub(crate) const DELIVERY_PROMPT_TAG: &str = "background-result";
+
+/// The `since` the duplicate-reply guard should use for a turn.
+///
+/// The guard asks "did the engine already publish since `since`?". For a
+/// normal turn the trigger's timestamp is right: the engine can only have
+/// answered after the message arrived. A delivery turn reuses the thread's
+/// last real message as its trigger — a message the agent has typically
+/// already replied to — so from that timestamp the guard sees the earlier
+/// reply and swallows the report as a duplicate. Such a turn must be judged
+/// from its own start instead.
+pub(crate) fn fallback_since(
+    is_delivery_turn: bool,
+    trigger_created_at: nostr::Timestamp,
+    turn_started: nostr::Timestamp,
+) -> nostr::Timestamp {
+    if is_delivery_turn {
+        turn_started
+    } else {
+        trigger_created_at
+    }
+}
+
 fn publish_text_reply_fallback(
     ctx: &Arc<PromptContext>,
     batch: Option<&FlushBatch>,
     text: String,
+    turn_started: nostr::Timestamp,
 ) -> Option<tokio::task::JoinHandle<()>> {
     let batch = batch?;
-    let trigger = batch.events.last()?.event.clone();
+    let last = batch.events.last()?;
+    let trigger = last.event.clone();
+    let since = fallback_since(
+        anchored_on_old_trigger(&last.prompt_tag),
+        trigger.created_at,
+        turn_started,
+    );
     let channel_id = batch.channel_id;
     let ctx = Arc::clone(ctx);
     Some(tokio::spawn(async move {
-        tokio::time::sleep(TEXT_REPLY_SETTLE).await;
-        if agent_published_message_since(&ctx.rest_client, channel_id, trigger.created_at).await {
-            return;
-        }
-        // Anchor exactly like a media reply: the harness owns the reply
-        // destination and a threaded reply is the intended shape.
-        let target = crate::media_publish::ReplyTarget::for_trigger(channel_id, &trigger);
-        let thread_tags = crate::queue::ThreadTags {
-            root_event_id: Some(target.root_event_id.to_hex()),
-            parent_event_id: Some(trigger.id.to_hex()),
-            mentioned_pubkeys: Vec::new(),
-        };
-        tracing::info!(
-            target: "buzz_acp::pool::prompt",
-            channel = %channel_id,
-            bytes = text.len(),
-            "engine published no message this turn; publishing its reply text"
-        );
-        post_text_message(
-            &ctx.rest_client,
-            channel_id,
-            &thread_tags,
-            &text,
-            "text reply fallback",
-        )
-        .await;
+        publish_text_reply_after_settle(&ctx, channel_id, &trigger, text, since).await;
     }))
+}
+
+/// Whether the turn's words still need a message of their own.
+///
+/// A media reply carries them as its transcript, so while one is on its way
+/// (or has landed) a second message would only duplicate it. Words are posted
+/// alone when the turn had no media, or when the media never reached the relay.
+fn reply_text_needs_own_message(media_message_carries_text: bool, reply_text: &str) -> bool {
+    !media_message_carries_text && !reply_text.is_empty()
+}
+
+/// Thread tags for a reply the harness posts on the engine's behalf: the
+/// thread root as both root and parent, so the reply sits flat at layer 1
+/// whether the trigger was the root or a message inside the thread. The
+/// media reply (`MediaPublisher::publish_message`) anchors the same way.
+fn harness_reply_thread_tags(channel_id: Uuid, trigger: &nostr::Event) -> crate::queue::ThreadTags {
+    let target = crate::media_publish::ReplyTarget::for_trigger(channel_id, trigger);
+    crate::queue::ThreadTags {
+        root_event_id: Some(target.root_event_id.to_hex()),
+        parent_event_id: Some(target.root_event_id.to_hex()),
+        mentioned_pubkeys: Vec::new(),
+    }
+}
+
+/// Wait out [`TEXT_REPLY_SETTLE`], then post `text` unless the engine already
+/// published a message for this turn itself.
+async fn publish_text_reply_after_settle(
+    ctx: &PromptContext,
+    channel_id: Uuid,
+    trigger: &nostr::Event,
+    text: String,
+    since: nostr::Timestamp,
+) {
+    tokio::time::sleep(TEXT_REPLY_SETTLE).await;
+    // `since` is the trigger's timestamp for a normal turn and the turn's own
+    // start for a delivery turn (see `fallback_since`).
+    if agent_published_message_since(&ctx.rest_client, channel_id, since).await {
+        return;
+    }
+    // Anchor exactly like a media reply, and like the rule the prompt gives
+    // the engine: a human-facing reply stays at layer 1, parent = root. With
+    // the trigger as parent, an answer to a message written inside a thread
+    // became a reply to that reply, and every exchange nested one deeper.
+    let thread_tags = harness_reply_thread_tags(channel_id, trigger);
+    tracing::info!(
+        target: "buzz_acp::pool::prompt",
+        channel = %channel_id,
+        bytes = text.len(),
+        "engine published no message this turn; publishing its reply text"
+    );
+    post_text_message(
+        &ctx.rest_client,
+        channel_id,
+        &thread_tags,
+        &text,
+        "text reply fallback",
+    )
+    .await;
 }
 
 /// Best-effort: remove a reaction via a signed kind:5 (NIP-09) deletion event.
@@ -11189,6 +11523,11 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
         use crate::relay::RestClient;
         PromptContext {
             mcp_servers: vec![],
+            transcribe_endpoint: String::new(),
+            transcribe_profile: String::new(),
+            transcribe_token: String::new(),
+            voice_playback_speed: None,
+            reply_mode: crate::config::ReplyMode::Cli,
             initial_message: None,
             idle_timeout: Duration::from_secs(60),
             max_turn_duration: Duration::from_secs(120),
@@ -11228,6 +11567,7 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
             live_turn_dirs: crate::attachments::LiveTurnDirs::default(),
             audio_support: crate::blossom::AudioSupportCache::default(),
             ffmpeg: None,
+            media_feedback_tx: None,
         }
     }
 
@@ -13188,6 +13528,59 @@ done"#
 #[cfg(test)]
 mod text_reply_fallback_tests {
     use super::*;
+
+    fn event_with_tags(tags: Vec<Vec<&str>>) -> nostr::Event {
+        let tags: Vec<nostr::Tag> = tags
+            .into_iter()
+            .map(|t| nostr::Tag::parse(t).unwrap())
+            .collect();
+        nostr::EventBuilder::new(nostr::Kind::Custom(9), "hi")
+            .tags(tags)
+            .sign_with_keys(&nostr::Keys::generate())
+            .unwrap()
+    }
+
+    #[test]
+    fn a_reply_to_a_message_inside_a_thread_stays_at_layer_one() {
+        // Chief writes inside a thread; the answer must hang off the thread
+        // root, not off his message, or every exchange nests one deeper.
+        let root = "ab".repeat(32);
+        let trigger = event_with_tags(vec![
+            vec!["h", "chan"],
+            vec!["e", &root, "", "root"],
+            vec!["e", &root, "", "reply"],
+        ]);
+        let tags = harness_reply_thread_tags(Uuid::new_v4(), &trigger);
+        assert_eq!(tags.root_event_id.as_deref(), Some(root.as_str()));
+        assert_eq!(tags.parent_event_id.as_deref(), Some(root.as_str()));
+    }
+
+    #[test]
+    fn a_reply_to_a_top_level_message_opens_its_thread() {
+        let trigger = event_with_tags(vec![vec!["h", "chan"]]);
+        let tags = harness_reply_thread_tags(Uuid::new_v4(), &trigger);
+        let id = trigger.id.to_hex();
+        assert_eq!(tags.root_event_id.as_deref(), Some(id.as_str()));
+        assert_eq!(tags.parent_event_id.as_deref(), Some(id.as_str()));
+    }
+
+    #[test]
+    fn words_ride_on_the_media_message() {
+        // A voice reply already carries the words as its transcript; a second
+        // message would double it (seen live: text at +0.0s, clip at +0.6s).
+        assert!(!reply_text_needs_own_message(true, "hello"));
+    }
+
+    #[test]
+    fn words_go_alone_when_there_is_no_media() {
+        assert!(reply_text_needs_own_message(false, "hello"));
+    }
+
+    #[test]
+    fn nothing_to_say_needs_no_message() {
+        assert!(!reply_text_needs_own_message(false, ""));
+        assert!(!reply_text_needs_own_message(true, ""));
+    }
 
     #[test]
     fn empty_result_releases_the_fallback() {

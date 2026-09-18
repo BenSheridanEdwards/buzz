@@ -138,9 +138,9 @@ class MessageContent extends HookConsumerWidget {
   /// time row while it plays.
   final String? voiceNoteSenderName;
 
-  /// Whether a voice-note transcript unfolds when playback starts (true in
-  /// DMs) for a message without a remembered choice.
-  final bool voiceNoteTranscriptOpenByDefault;
+  /// The viewer recorded the message's voice note: its speed pill steps by
+  /// a quarter and starts at 1x rather than the sender's hint.
+  final bool voiceNoteIsOwn;
 
   /// Id of the message, keying the remembered transcript choice.
   final String? voiceNoteMessageId;
@@ -163,7 +163,7 @@ class MessageContent extends HookConsumerWidget {
     this.mediaCarouselLeadingOverflow = 0,
     this.mediaCarouselTrailingOverflow = 0,
     this.voiceNoteSenderName,
-    this.voiceNoteTranscriptOpenByDefault = false,
+    this.voiceNoteIsOwn = false,
     this.voiceNoteMessageId,
   });
 
@@ -272,9 +272,14 @@ class MessageContent extends HookConsumerWidget {
       return result;
     }, [linkNormalizedContent, resolvedMentionNames]);
 
+    // Own-ness reaches the voice-note card only through a fresh render: the
+    // markdown widget keeps the media it built for a given body, and the
+    // viewer's identity can resolve after the first frame.
+    final voiceNotePresentationKey = voiceNoteIsOwn ? 'own' : 'received';
     final markdown = KeyedSubtree(
       key: ValueKey(
-        '$finalContent\u0000$mentionPresentationKey\u0000$channelPresentationKey',
+        '$finalContent\u0000$mentionPresentationKey\u0000'
+        '$channelPresentationKey\u0000$voiceNotePresentationKey',
       ),
       child: GptMarkdown(
         finalContent,
@@ -349,7 +354,8 @@ class MessageContent extends HookConsumerWidget {
           ),
           senderName: voiceNoteSenderName,
           transcript: imeta?.alt,
-          transcriptOpenByDefault: voiceNoteTranscriptOpenByDefault,
+          ownNote: voiceNoteIsOwn,
+          playbackSpeed: imeta?.playbackSpeed,
           messageId: voiceNoteMessageId,
         ),
       );

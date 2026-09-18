@@ -773,3 +773,71 @@ test("verified agent owner may publish a suppression edit", () => {
     true,
   );
 });
+
+// ---------------------------------------------------------------------------
+// Voice-note transcripts. A person's own voice note reaches the relay with no
+// transcript in its imeta, and its signature forbids adding one afterwards, so
+// an agent publishes the words as kind:40009 pointing back at the note. These
+// pin the fold onto imeta `alt`, which is what every transcript consumer reads.
+// ---------------------------------------------------------------------------
+
+const voiceNote = (overrides = {}) =>
+  streamMessage({
+    tags: [
+      ["h", CHANNEL_ID],
+      ["imeta", "url https://blossom/voice.mp3", "m audio/mpeg", "duration 3"],
+    ],
+    ...overrides,
+  });
+
+const transcriptEvent = (targetId, content, overrides = {}) => ({
+  id: HEX64_B,
+  pubkey: PUBKEY_B,
+  kind: 40009,
+  created_at: 1_700_000_100,
+  content,
+  tags: [
+    ["h", CHANNEL_ID],
+    ["e", targetId],
+  ],
+  sig: "sig",
+  ...overrides,
+});
+
+test("a published transcript folds onto the voice note's imeta alt", () => {
+  const out = formatTimelineMessages(
+    [voiceNote(), transcriptEvent(HEX64_A, "Yes Chief, it came through.")],
+    null,
+    undefined,
+    null,
+  );
+  assert.equal(out.length, 1, "the transcript must not render its own row");
+  const imeta = out[0].tags.find((t) => t[0] === "imeta");
+  assert.ok(
+    imeta.includes("alt Yes Chief, it came through."),
+    `expected the transcript folded into imeta alt, got ${JSON.stringify(imeta)}`,
+  );
+});
+
+test("a transcript never overwrites an alt the author supplied", () => {
+  const note = voiceNote({
+    tags: [
+      ["h", CHANNEL_ID],
+      [
+        "imeta",
+        "url https://blossom/voice.mp3",
+        "m audio/mpeg",
+        "alt author's own words",
+      ],
+    ],
+  });
+  const out = formatTimelineMessages(
+    [note, transcriptEvent(HEX64_A, "published later")],
+    null,
+    undefined,
+    null,
+  );
+  const imeta = out[0].tags.find((t) => t[0] === "imeta");
+  assert.ok(imeta.includes("alt author's own words"));
+  assert.ok(!imeta.includes("alt published later"));
+});

@@ -65,6 +65,7 @@ part 'compose_bar/camera_preview.dart';
 part 'compose_bar/send_button.dart';
 part 'compose_bar/trailing_slot.dart';
 part 'compose_bar/voice_note.dart';
+part 'compose_bar/composer_notice.dart';
 part 'compose_bar/layout.dart';
 part 'compose_bar/dock.dart';
 part 'compose_bar/compose_bar_widget.dart';

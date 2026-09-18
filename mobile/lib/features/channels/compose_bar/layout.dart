@@ -8,6 +8,9 @@ class _ComposeBarLayout extends HookWidget {
   final List<_PendingAttachment> attachments;
   final ValueChanged<int> onRemoveAttachment;
   final String? uploadError;
+
+  /// Opens the system settings for the app; offered on a microphone refusal.
+  final VoidCallback? onOpenSettings;
   final bool isExpanded;
   final TextEditingController controller;
   final FocusNode focusNode;
@@ -40,6 +43,7 @@ class _ComposeBarLayout extends HookWidget {
     required this.attachments,
     required this.onRemoveAttachment,
     required this.uploadError,
+    this.onOpenSettings,
     required this.isExpanded,
     required this.controller,
     required this.focusNode,
@@ -114,15 +118,7 @@ class _ComposeBarLayout extends HookWidget {
           const SizedBox(height: Grid.xxs),
         ],
         if (uploadError case final error?) ...[
-          Align(
-            alignment: Alignment.centerLeft,
-            child: Text(
-              error,
-              style: context.textTheme.bodySmall?.copyWith(
-                color: context.colors.error,
-              ),
-            ),
-          ),
+          _ComposerNotice(message: error, onOpenSettings: onOpenSettings),
           const SizedBox(height: Grid.xxs),
         ],
         // Keep the default state out of the focus system entirely so

@@ -23,9 +23,10 @@ part 'voice_note_attachment/transcript_row.dart';
 ///
 /// The time row follows the design: `0:24 · Voice note` at idle and
 /// `0:16 · Neo · 0:24` once playback has started, with the sender inline.
-/// Remote cards cycle playback speed through the mobile rates (remembered
+/// Remote cards step playback speed (a quarter at a time for your own notes,
+/// a tenth for received ones, from the sender's hinted default; remembered
 /// per card) and fold a transcript row whose choice is remembered per
-/// message.
+/// message and, as a default for the next card, per device.
 class VoiceNoteAttachment extends HookConsumerWidget {
   const VoiceNoteAttachment.local({
     super.key,
@@ -38,7 +39,8 @@ class VoiceNoteAttachment extends HookConsumerWidget {
        isReview = false,
        senderName = null,
        transcript = null,
-       transcriptOpenByDefault = false,
+       ownNote = true,
+       playbackSpeed = null,
        messageId = null;
 
   /// Compact review row from the Preview artboard: `0:12 · Tap to review`
@@ -55,7 +57,8 @@ class VoiceNoteAttachment extends HookConsumerWidget {
        onRemove = onDismiss,
        senderName = null,
        transcript = null,
-       transcriptOpenByDefault = false,
+       ownNote = true,
+       playbackSpeed = null,
        messageId = null;
 
   const VoiceNoteAttachment.remote({
@@ -65,7 +68,8 @@ class VoiceNoteAttachment extends HookConsumerWidget {
     this.waveform = const [],
     this.senderName,
     this.transcript,
-    this.transcriptOpenByDefault = false,
+    this.ownNote = false,
+    this.playbackSpeed,
     this.messageId,
   }) : source = url,
        isRemote = true,
@@ -86,9 +90,13 @@ class VoiceNoteAttachment extends HookConsumerWidget {
   /// Transcript body from the imeta `alt` tag; the row is hidden when absent.
   final String? transcript;
 
-  /// Whether the transcript unfolds when playback starts (true in DMs) for a
-  /// message without a remembered choice. Every card starts folded.
-  final bool transcriptOpenByDefault;
+  /// The viewer recorded this note: the speed pill steps by a quarter and
+  /// always starts at 1x.
+  final bool ownNote;
+
+  /// The sender's `playback_speed` hint (imeta), the rate a received note
+  /// starts at and wraps back to. Ignored for your own notes.
+  final double? playbackSpeed;
 
   /// Message the note belongs to; keys the remembered transcript choice.
   final String? messageId;
@@ -99,8 +107,19 @@ class VoiceNoteAttachment extends HookConsumerWidget {
       source,
     ]);
     final playback = useListenable(player);
+    final defaultPlaybackRate = voiceNoteDefaultPlaybackRate(
+      playbackSpeed,
+      ownNote: ownNote,
+    );
     final playbackRate = ref.watch(
-      voiceNotePlaybackRatesProvider.select((rates) => rates[source] ?? 1.0),
+      voiceNotePlaybackRatesProvider.select(
+        (rates) => rates[source] ?? defaultPlaybackRate,
+      ),
+    );
+    final nextPlaybackRate = nextVoiceNotePlaybackRate(
+      playbackRate,
+      ownNote: ownNote,
+      defaultRate: defaultPlaybackRate,
     );
     useEffect(() {
       if (isRemote) {
@@ -115,7 +134,8 @@ class VoiceNoteAttachment extends HookConsumerWidget {
       } else {
         unawaited(player.loadLocal(source, fallbackDuration: duration));
       }
-      // A remounted card resumes the speed it was last set to.
+      // A remounted card resumes the speed it was last set to, and a hinted
+      // voice starts at its own rate rather than the player's 1x.
       if (playbackRate != 1.0) unawaited(player.setSpeed(playbackRate));
       return player.dispose;
     }, [player, source, isRemote, duration]);
@@ -261,12 +281,10 @@ class VoiceNoteAttachment extends HookConsumerWidget {
                           _VoiceNotePlaybackRateButton(
                             key: const ValueKey('voice-note-playback-rate'),
                             rate: playbackRate,
+                            next: nextPlaybackRate,
                             onPressed: () {
                               unawaited(HapticFeedback.selectionClick());
-                              final next = nextVoiceNotePlaybackRate(
-                                playbackRate,
-                                rates: voiceNoteMobilePlaybackRates,
-                              );
+                              final next = nextPlaybackRate;
                               ref
                                   .read(voiceNotePlaybackRatesProvider.notifier)
                                   .set(source, next);
@@ -291,7 +309,6 @@ class VoiceNoteAttachment extends HookConsumerWidget {
             _VoiceNoteTranscriptRow(
               messageId: messageId ?? source,
               transcript: transcriptBody,
-              opensOnPlayback: transcriptOpenByDefault,
               hasPlayed: hasPlayed.value,
             ),
         ],

@@ -21,6 +21,10 @@ import { OnboardingChrome } from "./OnboardingChrome";
 import { OnboardingFooterProvider } from "./OnboardingFooter";
 import { MembershipDenied } from "./MembershipDenied";
 import {
+  membershipRetryNotice,
+  reengageRelayForMembershipRetry,
+} from "../lib/membershipRetry";
+import {
   NostrKeyImportForm,
   type NostrKeyImportStage,
 } from "./NostrKeyImportForm";
@@ -186,6 +190,8 @@ export function OnboardingFlow({
     React.useState<OnboardingPage>("profile");
   const [isCommunityChangeOpen, setIsCommunityChangeOpen] =
     React.useState(false);
+  const [membershipRetryNoticeText, setMembershipRetryNoticeText] =
+    React.useState<string | null>(null);
   const [membershipError, setMembershipError] = React.useState<{
     kind: "unreachable" | "error";
     message?: string;
@@ -246,6 +252,15 @@ export function OnboardingFlow({
         // this passes instantly. On gated relays it prevents a 403 during save.
         const membershipStatus = await checkMembershipStatus();
         setMembershipError(null);
+        // On the denied screen a re-check that reaches no verdict has to say
+        // so; leaving the screen untouched read as "the add did not work".
+        if (currentPage === "membership-denied") {
+          setMembershipRetryNoticeText(
+            membershipStatus === "unreachable" || membershipStatus === "error"
+              ? membershipRetryNotice(membershipStatus)
+              : null,
+          );
+        }
 
         if (membershipStatus === "denied") {
           try {
@@ -484,9 +499,17 @@ export function OnboardingFlow({
           onChangeCommunity={() => setIsCommunityChangeOpen(true)}
           onImportKey={importExistingKey}
           onRetry={() => {
-            void saveProfileAndContinue(membershipRetryPage);
+            void (async () => {
+              // The denial latched the relay session terminal; "Try again"
+              // is the re-engagement that lets it reconnect (#37).
+              await reengageRelayForMembershipRetry(() =>
+                relayClient.preconnect(),
+              );
+              await saveProfileAndContinue(membershipRetryPage);
+            })();
           }}
           pubkey={deniedPubkey}
+          retryNotice={membershipRetryNoticeText}
         />
         {isCommunityChangeOpen ? (
           <CommunityChangeOverlay

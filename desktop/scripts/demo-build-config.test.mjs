@@ -167,15 +167,15 @@ test("an empty product name override means no override", () => {
 test("an icon directory swaps the bundle icon set and nothing else", () => {
   const plain = demoBuildConfig("Fleet", "51094c33a0d51d7c");
   const iconed = demoBuildConfig("Fleet", "51094c33a0d51d7c", {
-    iconDir: "icons/fleet-buzz/",
+    iconDir: "icons-fleet/",
   });
   assert.equal(plain.tauriConfig.bundle.icon, undefined);
   assert.deepEqual(iconed.tauriConfig.bundle.icon, [
-    "icons/fleet-buzz/32x32.png",
-    "icons/fleet-buzz/128x128.png",
-    "icons/fleet-buzz/128x128@2x.png",
-    "icons/fleet-buzz/icon.icns",
-    "icons/fleet-buzz/icon.ico",
+    "icons-fleet/32x32.png",
+    "icons-fleet/128x128.png",
+    "icons-fleet/128x128@2x.png",
+    "icons-fleet/icon.icns",
+    "icons-fleet/icon.ico",
   ]);
   assert.deepEqual(iconed.tauriConfig.bundle.targets, ["app"]);
   assert.equal(iconed.identifier, plain.identifier);

@@ -984,6 +984,9 @@ class ComposeBar extends HookConsumerWidget {
                 attachments: attachments.value,
                 onRemoveAttachment: removeAttachment,
                 uploadError: uploadError.value,
+                onOpenSettings: () => unawaited(
+                  ref.read(huddleMediaFactoryProvider)().openSystemSettings(),
+                ),
                 isExpanded: isComposerExpanded.value,
                 controller: controller,
                 focusNode: focusNode,

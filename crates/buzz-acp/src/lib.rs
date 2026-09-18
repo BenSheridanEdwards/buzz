@@ -4,9 +4,11 @@ mod acp;
 mod attachments;
 mod blossom;
 mod config;
+mod engagement;
 mod engram_fetch;
 mod ffmpeg;
 mod filter;
+mod inbound_transcript;
 mod media_publish;
 mod observer;
 mod pi_launcher;
@@ -30,7 +32,7 @@ use acp::{AcpClient, EnvVar, McpServer};
 use anyhow::{ensure, Context, Result};
 use buzz_core::kind::{
     KIND_MEMBER_ADDED_NOTIFICATION, KIND_MEMBER_REMOVED_NOTIFICATION, KIND_STREAM_MESSAGE,
-    KIND_STREAM_REMINDER, KIND_WORKFLOW_APPROVAL_REQUESTED,
+    KIND_STREAM_MESSAGE_V2, KIND_STREAM_REMINDER, KIND_WORKFLOW_APPROVAL_REQUESTED,
 };
 use buzz_core::observer::{
     decrypt_observer_payload, encrypt_observer_payload, OBSERVER_FRAME_TELEMETRY,
@@ -49,7 +51,7 @@ use pool::{
     PromptResult, PromptSource, SessionState, TimeoutKind,
 };
 use pool_lifecycle::PoolLifecycle;
-use queue::{CancelReason, EventQueue, FlushBatch, QueuedEvent, ThreadTags};
+use queue::{BatchEvent, CancelReason, EventQueue, FlushBatch, QueuedEvent, ThreadTags};
 use relay::{HarnessRelay, RelayEventPublisher};
 use tokio::sync::{mpsc, watch};
 use tracing_subscriber::EnvFilter;
@@ -600,13 +602,15 @@ impl AuthorizedNormalListenerEvent {
         self,
         rules: &[SubscriptionRule],
         agent_pubkey_hex: &str,
+        engaged: bool,
     ) -> Option<NormalListenerIngress> {
         let (buzz_event, effective_author) = self.0.into_parts();
-        let matched = filter::match_event(
+        let matched = filter::match_event_engaged(
             &buzz_event.event,
             buzz_event.channel_id,
             rules,
             agent_pubkey_hex,
+            engaged,
         )
         .await?;
         Some(NormalListenerIngress {
@@ -2158,6 +2162,57 @@ fn inactivity_expired(
 /// queued batch is never stranded — the caller's next loop iteration will
 /// dispatch or wake it instead.
 #[allow(clippy::too_many_arguments)]
+/// Marker the agent engine maintains (see hermes `refresh_background_work_marker`)
+/// while it has background work outstanding — delegated workers running, or
+/// finished results awaiting delivery. Lives beside the engine's durable ledger
+/// under the agent's `HERMES_HOME`.
+const BACKGROUND_WORK_MARKER: &str = ".buzz-background-work";
+
+/// A marker older than this is treated as a leftover from a crashed engine
+/// rather than live work, so a stale file can never pin an idle pool resident
+/// forever. Long enough to outlast any realistic delegation.
+const BACKGROUND_WORK_MARKER_MAX_AGE: Duration = Duration::from_secs(12 * 60 * 60);
+
+/// The agent's `HERMES_HOME` as its engine sees it: an explicit persona env
+/// entry wins, else the harness's own environment (which the child inherits).
+fn agent_hermes_home(config: &config::Config) -> Option<std::path::PathBuf> {
+    config
+        .persona_env_vars
+        .iter()
+        .find(|(key, _)| key == config::HERMES_HOME_ENV)
+        .map(|(_, value)| std::path::PathBuf::from(value))
+        .or_else(|| std::env::var_os(config::HERMES_HOME_ENV).map(std::path::PathBuf::from))
+}
+
+/// Whether the engine has advertised outstanding background work.
+///
+/// While true the harness must not tear the pool down (teardown kills the
+/// engine and every worker it owns) and should wake a torn-down pool so the
+/// pending results are drained on the next heartbeat. This is what lets an
+/// agent run a long delegated task on Buzz instead of dying at the first idle
+/// window — and lets it resume on its own after a restart.
+fn background_work_pending(config: &config::Config) -> bool {
+    let Some(home) = agent_hermes_home(config) else {
+        return false;
+    };
+    marker_is_live(
+        &home.join(BACKGROUND_WORK_MARKER),
+        std::time::SystemTime::now(),
+    )
+}
+
+/// Pure check behind [`background_work_pending`]: the marker exists and is not
+/// stale. A future mtime (clock skew) still counts as live, not stale.
+fn marker_is_live(path: &std::path::Path, now: std::time::SystemTime) -> bool {
+    let Ok(modified) = std::fs::metadata(path).and_then(|meta| meta.modified()) else {
+        return false;
+    };
+    match now.duration_since(modified) {
+        Ok(age) => age < BACKGROUND_WORK_MARKER_MAX_AGE,
+        Err(_) => true,
+    }
+}
+
 fn idle_pool_sleep_due(
     pool_ready: bool,
     last_activity: tokio::time::Instant,
@@ -2178,6 +2233,75 @@ fn idle_pool_sleep_due(
 #[cfg(test)]
 mod inactivity_tests {
     use super::*;
+
+    fn scratch_marker(name: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!("buzz-acp-marker-{}-{}", std::process::id(), name))
+    }
+
+    #[test]
+    fn background_marker_present_and_fresh_is_live() {
+        let path = scratch_marker("fresh");
+        std::fs::write(&path, "1 2\n").expect("write marker");
+        assert!(marker_is_live(&path, std::time::SystemTime::now()));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn background_marker_absent_is_not_live() {
+        let path = scratch_marker("absent");
+        let _ = std::fs::remove_file(&path);
+        assert!(!marker_is_live(&path, std::time::SystemTime::now()));
+    }
+
+    #[test]
+    fn background_marker_stale_is_not_live() {
+        // A crashed engine leaves its marker behind; past the max age it must
+        // stop pinning the pool resident.
+        let path = scratch_marker("stale");
+        std::fs::write(&path, "1 2\n").expect("write marker");
+        let far_future =
+            std::time::SystemTime::now() + BACKGROUND_WORK_MARKER_MAX_AGE + Duration::from_secs(60);
+        assert!(!marker_is_live(&path, far_future));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn pending_delivery_origins_parse_the_json_marker() {
+        let text = r#"{"pid":1,"ts":2,"pending":[{"delegation_id":"d1","origin_session":"sess-a"},{"delegation_id":"d2","origin_session":""}]}"#;
+        assert_eq!(
+            parse_pending_delivery_origins(text),
+            vec!["sess-a".to_string()],
+            "only results with a known originating session are deliverable by thread"
+        );
+    }
+
+    #[test]
+    fn pending_delivery_origins_legacy_marker_is_empty() {
+        // The plain-text marker (pid + timestamp) advertises work but no
+        // per-thread results; it must not be mistaken for a delivery list.
+        assert!(parse_pending_delivery_origins("1 2\n").is_empty());
+        assert!(parse_pending_delivery_origins("").is_empty());
+    }
+
+    #[test]
+    fn delivery_turn_duplicate_guard_uses_turn_start_not_trigger_time() {
+        // A delivery turn reuses the thread's last real message as its trigger —
+        // a message the agent typically already replied to. Judging "already
+        // published?" from that message's timestamp would see the earlier reply
+        // and swallow the report; the turn must be judged from its own start.
+        let trigger_at = nostr::Timestamp::from(1_000_u64);
+        let turn_started = nostr::Timestamp::from(2_000_u64);
+        assert_eq!(
+            pool::fallback_since(true, trigger_at, turn_started),
+            turn_started
+        );
+        // A normal turn keeps the trigger's timestamp (the engine can only have
+        // answered after the message arrived).
+        assert_eq!(
+            pool::fallback_since(false, trigger_at, turn_started),
+            trigger_at
+        );
+    }
 
     #[test]
     fn zero_disables_expiry_and_in_flight_turns_defer_it() {
@@ -2823,7 +2947,7 @@ async fn tokio_main() -> Result<()> {
         // is the host temp directory plus the agent's pubkey. The path is on
         // the log line beside it.
         tracing::error!(
-            target: "acp::media",
+            target: "buzz_acp::media",
             base = %attachment_base.display(),
             "attachment root refused: {e}; attachments are disabled"
         );
@@ -2831,13 +2955,23 @@ async fn tokio_main() -> Result<()> {
     });
     let ffmpeg = crate::ffmpeg::find_ffmpeg();
     tracing::info!(
-        target: "acp::media",
+        target: "buzz_acp::media",
         attachment_dir = %attachment_dir.as_deref().map(|p| p.display().to_string()).unwrap_or_else(|_| "disabled".into()),
         ffmpeg = ffmpeg.as_deref().map(|p| p.display().to_string()).unwrap_or_else(|| "none".into()),
         "attachment handling ready"
     );
 
+    // Attachment failures come back here from the detached publish tasks and
+    // are turned into follow-up turns for the agent (`dispatch_media_feedback`).
+    let (media_feedback_tx, mut media_feedback_rx) =
+        mpsc::unbounded_channel::<pool::MediaFeedback>();
     let ctx = Arc::new(PromptContext {
+        media_feedback_tx: Some(media_feedback_tx),
+        transcribe_endpoint: config.transcribe_endpoint.clone(),
+        transcribe_profile: config.transcribe_profile.clone(),
+        transcribe_token: config.transcribe_token.clone(),
+        voice_playback_speed: config.voice_playback_speed,
+        reply_mode: config.reply_mode,
         attachment_dir,
         live_turn_dirs: crate::attachments::LiveTurnDirs::default(),
         // Two in-flight reply-media publishes per agent slot: the tasks are
@@ -3033,6 +3167,53 @@ async fn tokio_main() -> Result<()> {
     // and capture it in TaskMeta at dispatch time.
     let mut removed_channels: HashSet<Uuid> = HashSet::new();
 
+    // Threads the agent is actively engaged in, per channel (most-recent last,
+    // bounded to MAX_ENGAGED_THREADS_PER_CHANNEL). A thread is engaged when the
+    // agent is admitted to act on any message in it; while engaged, the relay
+    // ORs a `#e` filter for these roots into the channel subscription, so
+    // subsequent replies reach the agent without a fresh mention and the
+    // conversation continues. Bounded per channel; oldest roots fall off.
+    const MAX_ENGAGED_THREADS_PER_CHANNEL: usize = 16;
+    let mut engaged_threads: HashMap<Uuid, std::collections::VecDeque<String>> = HashMap::new();
+
+    // The set is in memory, so a restart would forget every conversation in
+    // progress and the next unmentioned reply in it would never arrive. Seed
+    // it from the agent's own recent posts on the relay before the first
+    // event is read; a relay error only means the seed is skipped.
+    if matches!(config.subscribe_mode, SubscribeMode::Mentions) && !subscribed_channel_ids.is_empty() {
+        let agent_pubkey_hex = config.keys.public_key().to_hex();
+        match engagement::seed_engaged_threads(
+            &ctx.rest_client,
+            &agent_pubkey_hex,
+            &subscribed_channel_ids,
+            MAX_ENGAGED_THREADS_PER_CHANNEL,
+        )
+        .await
+        {
+            Ok(seeded) => {
+                let threads: usize = seeded.values().map(VecDeque::len).sum();
+                for (channel, roots) in seeded {
+                    let list: Vec<String> = roots.iter().cloned().collect();
+                    if let Err(e) = relay.set_engaged_threads(channel, list).await {
+                        tracing::warn!(channel_id = %channel, "failed to re-engage threads: {e}");
+                        continue;
+                    }
+                    engaged_threads.insert(channel, roots);
+                }
+                tracing::info!(
+                    channels = engaged_threads.len(),
+                    threads,
+                    lookback_days = engagement::LOOKBACK.as_secs() / 86_400,
+                    "re-engaged recent threads from relay history"
+                );
+            }
+            Err(e) => tracing::warn!("could not seed engaged threads from relay history: {e}"),
+        }
+    }
+
+    // Attachment failures waiting for their thread's worker to be free.
+    let mut pending_media_feedback: Vec<pool::MediaFeedback> = Vec::new();
+
     //
     // One SlotCircuit per agent slot. crash_times entries are pruned to the last
     // CIRCUIT_BREAKER_WINDOW on each respawn attempt. The Vec is indexed by
@@ -3065,7 +3246,11 @@ async fn tokio_main() -> Result<()> {
         // busy spin — whenever the queued work drained after a failed wake.
         let mut lazy_wake_work_pending = false;
         if config.lazy_pool && !pool_ready {
-            lazy_wake_work_pending = queue.has_flushable_work();
+            // Queued events wake the pool as before. Outstanding background
+            // work (the engine's marker) wakes it too: after a restart, an
+            // agent with pending delegation results resumes on its own instead
+            // of sitting deaf until a human happens to message it.
+            lazy_wake_work_pending = queue.has_flushable_work() || background_work_pending(&config);
             if let Some(attempt) = pool_lifecycle
                 .start_wake_if_due(lazy_wake_work_pending, tokio::time::Instant::now())
             {
@@ -3209,6 +3394,15 @@ async fn tokio_main() -> Result<()> {
                         break;
                     }
                 },
+                // A reply's attachments failed: tell the agent in its thread.
+                Some(feedback) = media_feedback_rx.recv() => {
+                    let _ = result_rx;
+                    pending_media_feedback.push(feedback);
+                    if pool_ready {
+                        dispatch_media_feedback(&mut pool, &ctx, &mut pending_media_feedback);
+                    }
+                    None
+                }
                 // Guard: join_next() returns None immediately when JoinSet is
                 // empty, which would cause a tight spin. Only poll when there
                 // are in-flight tasks.
@@ -3294,6 +3488,32 @@ async fn tokio_main() -> Result<()> {
                         Some(buzz_event) => {
                             let kind_u32 = buzz_event.event.kind.as_u16() as u32;
 
+                            // Thread engagement: for conversation messages,
+                            // resolve the canonical thread root and note whether
+                            // the agent is already engaged in it. Computed here,
+                            // before `buzz_event` is moved into the gate, so an
+                            // engaged-thread reply can bypass the mention gate
+                            // and so a newly-admitted thread can be engaged.
+                            let engagement_channel = buzz_event.channel_id;
+                            let engagement_root: Option<String> = if matches!(
+                                kind_u32,
+                                KIND_STREAM_MESSAGE | KIND_STREAM_MESSAGE_V2
+                            ) {
+                                Some(
+                                    queue::parse_thread_tags(&buzz_event.event)
+                                        .root_event_id
+                                        .unwrap_or_else(|| buzz_event.event.id.to_hex())
+                                        .to_ascii_lowercase(),
+                                )
+                            } else {
+                                None
+                            };
+                            let is_engaged = engagement_root.as_ref().is_some_and(|root| {
+                                engaged_threads
+                                    .get(&engagement_channel)
+                                    .is_some_and(|set| set.iter().any(|r| r == root))
+                            });
+
                             if kind_u32 == KIND_MEMBER_ADDED_NOTIFICATION
                                 || kind_u32 == KIND_MEMBER_REMOVED_NOTIFICATION
                             {
@@ -3354,8 +3574,19 @@ async fn tokio_main() -> Result<()> {
                                     if subscribed_channel_ids.contains(&ch) {
                                         tracing::debug!(channel_id = %ch, "membership notification: channel already subscribed");
                                     } else if let Some(filter) = config::resolve_dynamic_channel_filter(&config, ch, &rules) {
-                                        tracing::info!(channel_id = %ch, "membership notification: subscribing to new channel");
-                                        if let Err(e) = relay.subscribe_channel_from(ch, filter, Some(ts)).await {
+                                        // Backfill slightly into the past on a live join so a
+                                        // mention posted just before the add (e.g. the @-mention
+                                        // that auto-onboarded this agent) is replayed and answered
+                                        // instead of sitting behind the subscription. Only for
+                                        // mention-filtered subscriptions, so it can surface only
+                                        // mentions of this agent within the window.
+                                        let since = if filter.require_mention {
+                                            ts.saturating_sub(config.join_backfill_secs)
+                                        } else {
+                                            ts
+                                        };
+                                        tracing::info!(channel_id = %ch, subscribe_since = since, "membership notification: subscribing to new channel");
+                                        if let Err(e) = relay.subscribe_channel_from(ch, filter, Some(since)).await {
                                             tracing::warn!("failed to subscribe to new channel {ch}: {e}");
                                         } else {
                                             subscribed_channel_ids.insert(ch);
@@ -3365,6 +3596,7 @@ async fn tokio_main() -> Result<()> {
                                     }
                                 } else {
                                     subscribed_channel_ids.remove(&ch);
+                                    engaged_threads.remove(&ch);
                                     tracing::info!(channel_id = %ch, "membership notification: unsubscribing from channel");
                                     if let Err(e) = relay.unsubscribe_channel(ch).await {
                                         tracing::warn!("failed to unsubscribe from channel {ch}: {e}");
@@ -3577,12 +3809,41 @@ async fn tokio_main() -> Result<()> {
                             };
                             let Some(ingress) =
                                 AuthorizedNormalListenerEvent(authorized_event)
-                                    .match_subscription(&rules, &pubkey_hex)
+                                    .match_subscription(&rules, &pubkey_hex, is_engaged)
                                     .await
                             else {
                                 tracing::debug!("authorized event matched no rule — dropping");
                                 continue;
                             };
+
+                            // The agent is acting on this thread — engage it so
+                            // subsequent replies are delivered without a fresh
+                            // mention. Only a newly-engaged root needs a REQ
+                            // update; the set is bounded per channel.
+                            if let Some(root) = engagement_root {
+                                let set = engaged_threads.entry(engagement_channel).or_default();
+                                if !set.iter().any(|r| *r == root) {
+                                    set.push_back(root.clone());
+                                    while set.len() > MAX_ENGAGED_THREADS_PER_CHANNEL {
+                                        set.pop_front();
+                                    }
+                                    let roots: Vec<String> = set.iter().cloned().collect();
+                                    if let Err(e) =
+                                        relay.set_engaged_threads(engagement_channel, roots).await
+                                    {
+                                        tracing::warn!(
+                                            channel_id = %engagement_channel,
+                                            "failed to update engaged threads: {e}"
+                                        );
+                                    } else {
+                                        tracing::debug!(
+                                            channel_id = %engagement_channel,
+                                            thread_root = %root,
+                                            "engaged thread — following its replies without re-mention"
+                                        );
+                                    }
+                                }
+                            }
                             // Derive the session scope once, at admission, from
                             // the operator policy, DM status, and NIP-10 thread
                             // tags. Under the default `channel` policy this is
@@ -3690,7 +3951,12 @@ async fn tokio_main() -> Result<()> {
                         queue.has_undispatched_work(),
                         !wake_tasks.is_empty()
                             || any_respawn_in_flight(&crash_history),
-                    ) {
+                    ) && !background_work_pending(&config)
+                    {
+                        // Gated on the engine's background-work marker: tearing
+                        // down would kill its running delegated workers, and
+                        // strand any finished results. An idle-looking pool
+                        // with work outstanding stays warm instead.
                         tracing::info!(
                             idle_pool_sleep_seconds = config.idle_pool_sleep_secs,
                             "idle pool sleep bound reached — tearing pool back to lazy state"
@@ -3733,7 +3999,14 @@ async fn tokio_main() -> Result<()> {
                             typing_channels.insert(scope, thread_tags);
                         }
                     } else if pool.any_idle() {
-                        dispatch_heartbeat(&mut pool, &ctx, &mut heartbeat_in_flight);
+                        // Finished background results go back to their own
+                        // threads first; the generic (channel-less) heartbeat
+                        // only runs if a worker is still idle afterwards, and
+                        // drains whatever has no thread to return to.
+                        dispatch_delivery_turns(&mut pool, &ctx, &config);
+                        if pool.any_idle() {
+                            dispatch_heartbeat(&mut pool, &ctx, &mut heartbeat_in_flight);
+                        }
                     } else {
                         tracing::debug!("heartbeat_skipped_busy");
                     }
@@ -3757,6 +4030,16 @@ async fn tokio_main() -> Result<()> {
                             tracing::warn!("presence heartbeat failed: {e}");
                         }
                     }));
+                    // Every 60s: if a finished background result or an
+                    // attachment failure is waiting and its thread's worker is
+                    // idle, deliver it now instead of at the next 15-minute
+                    // heartbeat.
+                    if pool_ready && !heartbeat_in_flight {
+                        dispatch_media_feedback(&mut pool, &ctx, &mut pending_media_feedback);
+                        if pool.any_idle() {
+                            dispatch_delivery_turns(&mut pool, &ctx, &config);
+                        }
+                    }
                     None
                 }
                 _ = async {
@@ -4553,6 +4836,14 @@ fn dispatch_pending(
             }
         };
         tracing::debug!(agent = agent.index, channel = %channel_id, scope = %scope.telemetry_label(), affinity_hit, "agent_claimed");
+        // Remember the thread's latest real trigger so a later delivery turn (a
+        // finished background result) can reply into this exact thread.
+        if let Some(last) = batch.events.last() {
+            agent
+                .state
+                .last_trigger
+                .insert(scope.clone(), last.event.clone());
+        }
 
         let recoverable_batch = match ctx.dedup_mode {
             DedupMode::Queue => Some(batch.clone()),
@@ -5231,6 +5522,226 @@ fn drain_ready_join_results(
         }
     }
     LoopAction::Continue
+}
+
+/// The instruction for a delivery turn. It runs in the originating thread's own
+/// session, so the agent's reply publishes there. The engine's drain prepends
+/// the finished result itself (it routes by session id), so this only has to
+/// say what to do with it — and to override a heartbeat's silence.
+const DELIVERY_PROMPT: &str = "A background task you dispatched from this thread has finished — \
+its result is included above. Report the outcome here now: what finished, the result, and \
+what happens next. Keep it short.";
+
+/// Finished-but-undelivered background results the engine has advertised in
+/// its marker, as the ACP session id each was dispatched from. Empty for the
+/// legacy plain-text marker or when nothing is awaiting delivery.
+fn pending_delivery_origins(config: &config::Config) -> Vec<String> {
+    let Some(home) = agent_hermes_home(config) else {
+        return Vec::new();
+    };
+    let Ok(text) = std::fs::read_to_string(home.join(BACKGROUND_WORK_MARKER)) else {
+        return Vec::new();
+    };
+    parse_pending_delivery_origins(&text)
+}
+
+/// Pure parser behind [`pending_delivery_origins`].
+fn parse_pending_delivery_origins(marker_text: &str) -> Vec<String> {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(marker_text) else {
+        return Vec::new();
+    };
+    value
+        .get("pending")
+        .and_then(|pending| pending.as_array())
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| item.get("origin_session")?.as_str())
+                .filter(|origin| !origin.is_empty())
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Run a delivery turn in each originating thread that has a finished
+/// background result waiting, so the report lands where the asker is instead
+/// of being swallowed by a channel-less heartbeat.
+///
+/// Only the thread's own, idle session is used — never a forked worker — and
+/// a thread whose session or trigger is gone is left for the generic heartbeat
+/// drain. The turn is anchored on the thread's last real trigger, so the reply
+/// publishes exactly like a normal in-thread reply.
+fn dispatch_delivery_turns(
+    pool: &mut AgentPool,
+    ctx: &Arc<PromptContext>,
+    config: &config::Config,
+) {
+    for origin in pending_delivery_origins(config) {
+        let Some((scope, trigger)) = pool.find_scope_for_session(&origin) else {
+            continue;
+        };
+        let Some(agent) = pool.try_claim_owner_only(&scope) else {
+            continue;
+        };
+        let channel_id = scope.channel_id();
+        let batch = FlushBatch {
+            channel_id,
+            scope: scope.clone(),
+            events: vec![BatchEvent {
+                event: trigger,
+                prompt_tag: pool::DELIVERY_PROMPT_TAG.to_string(),
+                received_at: std::time::Instant::now(),
+            }],
+            cancelled_events: Vec::new(),
+            cancel_reason: None,
+        };
+        tracing::info!(
+            channel_id = %channel_id,
+            scope = %scope.telemetry_label(),
+            origin_session = %origin,
+            "delivering finished background result in its thread"
+        );
+        let result_tx = pool.result_tx();
+        let ctx_clone = Arc::clone(ctx);
+        let agent_index = agent.index;
+        let turn_id = Uuid::new_v4().to_string();
+        let task_turn_id = turn_id.clone();
+        let abort_handle = pool.join_set.spawn(async move {
+            pool::run_prompt_task(
+                agent,
+                Some(batch),
+                Some(DELIVERY_PROMPT.to_string()),
+                ctx_clone,
+                result_tx,
+                None,
+                task_turn_id,
+            )
+            .await;
+        });
+        pool.task_map_mut().insert(
+            abort_handle.id(),
+            pool::TaskMeta {
+                agent_index,
+                channel_id: Some(channel_id),
+                scope: Some(scope),
+                turn_id,
+                recoverable_batch: None,
+                control_tx: None,
+                steer_tx: None,
+                successful_steer_deliveries: HashSet::new(),
+            },
+        );
+    }
+}
+
+/// How long an attachment failure waits for its thread's worker before the
+/// channel is told by the harness instead.
+const MEDIA_FEEDBACK_EXPIRY: Duration = Duration::from_secs(10 * 60);
+
+/// Run a follow-up turn for each reply whose attachments failed, in the thread
+/// the reply came from, so the agent that wrote it fixes the reference and
+/// posts the file. A thread whose worker is mid-turn waits (never a forked
+/// worker); a thread whose session is gone gets a fresh one on any idle
+/// worker; a failure nobody could take within [`MEDIA_FEEDBACK_EXPIRY`] falls
+/// back to the short channel notice so it is not lost silently.
+fn dispatch_media_feedback(
+    pool: &mut AgentPool,
+    ctx: &Arc<PromptContext>,
+    pending: &mut Vec<pool::MediaFeedback>,
+) {
+    let mut waiting = Vec::new();
+    for feedback in pending.drain(..) {
+        if feedback.created_at.elapsed() > MEDIA_FEEDBACK_EXPIRY {
+            tracing::warn!(
+                target: "buzz_acp::media",
+                channel_id = %feedback.channel_id,
+                scope = %feedback.scope.telemetry_label(),
+                "attachment feedback not taken by the agent in time; posting the channel notice"
+            );
+            let rest = ctx.rest_client.clone();
+            let root = feedback.trigger.id.to_hex();
+            let thread_tags = queue::ThreadTags {
+                root_event_id: Some(
+                    queue::parse_thread_tags(&feedback.trigger)
+                        .root_event_id
+                        .unwrap_or_else(|| root.clone()),
+                ),
+                parent_event_id: Some(root),
+                mentioned_pubkeys: Vec::new(),
+            };
+            let channel_id = feedback.channel_id;
+            let notice = feedback.notice;
+            tokio::spawn(async move {
+                pool::post_failure_notice(&rest, channel_id, &thread_tags, &notice).await;
+            });
+            continue;
+        }
+        let scope_busy = pool
+            .task_map()
+            .values()
+            .any(|meta| meta.scope.as_ref() == Some(&feedback.scope));
+        if scope_busy {
+            waiting.push(feedback);
+            continue;
+        }
+        let Some(agent) = pool.try_claim(Some(&feedback.scope)) else {
+            waiting.push(feedback);
+            continue;
+        };
+        let channel_id = feedback.channel_id;
+        let scope = feedback.scope.clone();
+        let prompt = pool::media_feedback_prompt(&feedback);
+        let batch = FlushBatch {
+            channel_id,
+            scope: scope.clone(),
+            events: vec![BatchEvent {
+                event: feedback.trigger,
+                prompt_tag: pool::MEDIA_FEEDBACK_PROMPT_TAG.to_string(),
+                received_at: std::time::Instant::now(),
+            }],
+            cancelled_events: Vec::new(),
+            cancel_reason: None,
+        };
+        tracing::info!(
+            target: "buzz_acp::media",
+            channel_id = %channel_id,
+            scope = %scope.telemetry_label(),
+            failed = feedback.failed.len(),
+            "telling the agent its attachments failed, in its thread"
+        );
+        let result_tx = pool.result_tx();
+        let ctx_clone = Arc::clone(ctx);
+        let agent_index = agent.index;
+        let turn_id = Uuid::new_v4().to_string();
+        let task_turn_id = turn_id.clone();
+        let abort_handle = pool.join_set.spawn(async move {
+            pool::run_prompt_task(
+                agent,
+                Some(batch),
+                Some(prompt),
+                ctx_clone,
+                result_tx,
+                None,
+                task_turn_id,
+            )
+            .await;
+        });
+        pool.task_map_mut().insert(
+            abort_handle.id(),
+            pool::TaskMeta {
+                agent_index,
+                channel_id: Some(channel_id),
+                scope: Some(scope),
+                turn_id,
+                recoverable_batch: None,
+                control_tx: None,
+                steer_tx: None,
+                successful_steer_deliveries: HashSet::new(),
+            },
+        );
+    }
+    *pending = waiting;
 }
 
 fn dispatch_heartbeat(
@@ -9115,12 +9626,18 @@ mod build_mcp_servers_tests {
             max_turn_duration_secs: config::DEFAULT_MAX_TURN_DURATION_SECS,
             agents: 1,
             heartbeat_interval_secs: 0,
+            join_backfill_secs: 0,
             turn_liveness_secs: 10,
             heartbeat_prompt: None,
             system_prompt: None,
             team_instructions: None,
             initial_message: None,
             subscribe_mode: config::SubscribeMode::All,
+            transcribe_endpoint: String::new(),
+            transcribe_profile: String::new(),
+            transcribe_token: String::new(),
+            voice_playback_speed: None,
+            reply_mode: crate::config::ReplyMode::Cli,
             dedup_mode: config::DedupMode::Queue,
             session_policy: scope::SessionPolicy::Channel,
             multiple_event_handling: config::MultipleEventHandling::Queue,
@@ -9341,12 +9858,18 @@ mod error_outcome_emission_tests {
             max_turn_duration_secs: config::DEFAULT_MAX_TURN_DURATION_SECS,
             agents: 1,
             heartbeat_interval_secs: 0,
+            join_backfill_secs: 0,
             turn_liveness_secs: 10,
             heartbeat_prompt: None,
             system_prompt: None,
             team_instructions: None,
             initial_message: None,
             subscribe_mode: config::SubscribeMode::All,
+            transcribe_endpoint: String::new(),
+            transcribe_profile: String::new(),
+            transcribe_token: String::new(),
+            voice_playback_speed: None,
+            reply_mode: crate::config::ReplyMode::Cli,
             dedup_mode: config::DedupMode::Queue,
             session_policy: scope::SessionPolicy::Channel,
             multiple_event_handling: config::MultipleEventHandling::Queue,

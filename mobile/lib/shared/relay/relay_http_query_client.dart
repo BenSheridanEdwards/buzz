@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:io';
 
 import 'package:http/http.dart' as http;
 
@@ -30,14 +31,33 @@ class RelayHttpQueryClient {
           .post(url, headers: headers, body: body)
           .timeout(timeout);
     } on TimeoutException {
-      if (identical(_currentGeneration, generation)) {
-        _currentGeneration = null;
-      }
-      generation?.retire();
+      _retire(generation);
+      rethrow;
+    } on IOException {
+      // The transport itself failed, not the relay: a keep-alive connection
+      // the OS killed while the app was paused fails like this on the first
+      // request after resume. Handing the next query the same pool would fail
+      // it too, which is how an open thread stayed stale until the user's own
+      // next send happened to open a fresh connection.
+      _retire(generation);
+      rethrow;
+    } on http.ClientException {
+      // package:http wraps some socket failures in its own type.
+      _retire(generation);
       rethrow;
     } finally {
       generation?.release();
     }
+  }
+
+  /// Stop handing out `generation`; it closes once its in-flight requests
+  /// finish. A relay-level error (4xx/5xx) never reaches here: the socket is
+  /// fine in that case and the pool is kept.
+  void _retire(_ClientGeneration? generation) {
+    if (identical(_currentGeneration, generation)) {
+      _currentGeneration = null;
+    }
+    generation?.retire();
   }
 
   void close() {

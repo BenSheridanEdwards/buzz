@@ -41,13 +41,16 @@ export type ImetaMedia = BlobDescriptor & {
  * The `uploaded` field isn't transmitted in imeta tags — set to 0 since no
  * consumer reads it.
  *
- * Projection ceiling: NIP-92 also defines `alt`, `fallback`, and `service`
- * fields that `BlobDescriptor` doesn't carry. We drop them on edit-load,
- * which means an edit will silently strip those fields from the saved tag
- * set. In practice this only fires on cross-client edits today (our send
- * path doesn't emit them), so the data loss is bounded. If/when those
- * fields become first-class in the composer, widen `BlobDescriptor`
- * (or split `ImetaMedia` from it) and pass them through here.
+ * Projection ceiling: NIP-92 also defines `fallback` and `service` fields
+ * that `BlobDescriptor` doesn't carry. We drop them on edit-load, which
+ * means an edit will silently strip those fields from the saved tag set. In
+ * practice this only fires on cross-client edits today, so the data loss is
+ * bounded. If/when those fields become first-class in the composer, widen
+ * `BlobDescriptor` (or split `ImetaMedia` from it) and pass them through.
+ *
+ * `alt` is no longer in that set: it carries the voice-note transcript the
+ * relay produces on upload, so it round-trips through `transcript` here and
+ * survives an edit.
  */
 export function imetaMediaFromTags(
   tags: ReadonlyArray<ReadonlyArray<string>> | undefined,
@@ -67,6 +70,7 @@ export function imetaMediaFromTags(
       ...(entry.blurhash ? { blurhash: entry.blurhash } : {}),
       ...(entry.thumb ? { thumb: entry.thumb } : {}),
       ...(entry.duration != null ? { duration: entry.duration } : {}),
+      ...(entry.alt ? { transcript: entry.alt } : {}),
       ...(entry.image ? { image: entry.image } : {}),
       ...(entry.filename ? { filename: entry.filename } : {}),
     });
@@ -103,6 +107,7 @@ export function buildImetaTags(
       ...(d.duration != null ? [`duration ${d.duration}`] : []),
       ...(d.image ? [`image ${d.image}`] : []),
       ...(d.filename ? [`filename ${d.filename}`] : []),
+      ...(d.transcript ? [`alt ${d.transcript}`] : []),
     ]);
 }
 

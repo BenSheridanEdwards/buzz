@@ -1452,14 +1452,17 @@ void main() {
         hapticCalls.clear();
         await tester.tap(rateFinder);
         await tester.pump();
-        expect(tester.widget<Text>(rateValueFinder).data, '1.5×');
-        expect(player.speed, 1.5);
+        // A received note steps by a tenth.
+        expect(tester.widget<Text>(rateValueFinder).data, '1.1×');
+        expect(player.speed, 1.1);
         expect(hapticCalls.last.arguments, 'HapticFeedbackType.selectionClick');
         expect(tester.getSize(rateFinder), rateSize);
-        await tester.tap(rateFinder);
-        await tester.pump();
+        for (var taps = 0; taps < 9; taps++) {
+          await tester.tap(rateFinder);
+          await tester.pump();
+          expect(tester.getSize(rateFinder), rateSize);
+        }
         expect(tester.widget<Text>(rateValueFinder).data, '2×');
-        expect(tester.getSize(rateFinder), rateSize);
         await tester.tap(rateFinder);
         await tester.pump();
         expect(tester.widget<Text>(rateValueFinder).data, '1×');

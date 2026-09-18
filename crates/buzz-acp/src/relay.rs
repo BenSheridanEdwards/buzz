@@ -670,6 +670,12 @@ enum RelayCommand {
     },
     /// Unsubscribe from a channel (sends a NIP-01 CLOSE).
     Unsubscribe { channel_id: Uuid },
+    /// Replace the set of engaged thread roots for a channel and re-send its
+    /// REQ so the ORed `#e` thread filter reflects the new set.
+    SetEngagedThreads {
+        channel_id: Uuid,
+        roots: Vec<String>,
+    },
     /// Reconnect to the relay (re-authenticate and resubscribe).
     Reconnect,
     /// Shut down the background task.
@@ -966,6 +972,22 @@ impl HarnessRelay {
         Ok(())
     }
 
+    /// Replace the engaged thread-root set for a channel and re-issue its REQ so
+    /// the ORed `#e` thread filter reflects the new set. Roots are lowercase hex
+    /// event ids; an empty set drops the thread filter (mention-only again).
+    pub async fn set_engaged_threads(
+        &mut self,
+        channel_id: Uuid,
+        roots: Vec<String>,
+    ) -> Result<(), RelayError> {
+        self.cmd_tx
+            .send(RelayCommand::SetEngagedThreads { channel_id, roots })
+            .await
+            .map_err(|_| RelayError::ConnectionClosed)?;
+        debug!("queued engaged-threads update for channel {channel_id}");
+        Ok(())
+    }
+
     /// Wait for the next event from any subscribed channel.
     ///
     /// Reads from the background task's event channel. Returns `None` on
@@ -1144,6 +1166,12 @@ struct BgState {
     seen_ids: TwoGenDedup,
     /// Per-channel filter used on subscribe (for resubscribe after reconnect).
     active_filters: HashMap<Uuid, ChannelFilter>,
+    /// Per-channel set of engaged thread-root event ids (lowercase hex). When a
+    /// channel's mention subscription is active, its REQ carries a second,
+    /// ORed filter (`#e` = these roots, no `#p`) so replies in a thread the
+    /// agent is already engaged in are delivered even without a fresh mention.
+    /// Bounded by the main loop. Survives reconnect (read by `send_subscribe`).
+    engaged_thread_roots: HashMap<Uuid, Vec<String>>,
     /// Oldest timestamp of a membership notification that was dropped due to
     /// backpressure. If set, reconnect replay must start from this timestamp
     /// (minus skew) to re-deliver the lost event. Reset on successful reconnect.
@@ -1232,6 +1260,7 @@ impl BgState {
             last_seen: HashMap::new(),
             seen_ids: TwoGenDedup::new(SEEN_ID_LIMIT),
             active_filters: HashMap::new(),
+            engaged_thread_roots: HashMap::new(),
             membership_dropped_since: None,
             membership_last_seen: None,
             membership_sub_active: false,
@@ -1302,6 +1331,7 @@ impl BgState {
         self.subscribe_since.remove(channel_id);
         self.channel_dropped_since.remove(channel_id);
         self.active_filters.remove(channel_id);
+        self.engaged_thread_roots.remove(channel_id);
         self.rate_limited_pending.remove(channel_id);
         self.resubscribe_retry.remove(channel_id);
     }
@@ -1466,6 +1496,15 @@ fn apply_command_to_state(state: &mut BgState, cmd: RelayCommand) {
             state.active_subscriptions.remove(&channel_id);
             state.clear_channel_state(&channel_id);
         }
+        RelayCommand::SetEngagedThreads { channel_id, roots } => {
+            // State-only: the re-REQ happens when connected. Reconnect
+            // resubscribe reads this map, so the thread filter is restored.
+            if roots.is_empty() {
+                state.engaged_thread_roots.remove(&channel_id);
+            } else {
+                state.engaged_thread_roots.insert(channel_id, roots);
+            }
+        }
         RelayCommand::SubscribeMembership => {
             state.membership_sub_active = true;
         }
@@ -1626,6 +1665,40 @@ async fn execute_connected_command(
             }
             state.clear_channel_state(&channel_id);
             true
+        }
+        RelayCommand::SetEngagedThreads { channel_id, roots } => {
+            // Persist the new set first so both this re-REQ and any future
+            // reconnect resubscribe pick it up.
+            if roots.is_empty() {
+                state.engaged_thread_roots.remove(&channel_id);
+            } else {
+                state.engaged_thread_roots.insert(channel_id, roots);
+            }
+            // Only re-REQ a channel we're actually subscribed to. If rate-gated,
+            // skip the live re-send — the stored set applies on the next
+            // resubscribe — rather than flooding a saturated relay.
+            let Some(filter) = state.active_filters.get(&channel_id).cloned() else {
+                return true;
+            };
+            if state.check_rate_gate().is_some() {
+                debug!("rate-gated: deferring engaged-threads re-REQ for channel {channel_id}");
+                return true;
+            }
+            let since = state
+                .last_seen
+                .get(&channel_id)
+                .copied()
+                .or_else(|| state.subscribe_since.get(&channel_id).copied());
+            let sent =
+                send_subscribe(ws, state, channel_id, agent_pubkey_hex, since, &filter).await;
+            if sent {
+                true
+            } else {
+                warn!(
+                    "engaged-threads re-REQ failed for channel {channel_id} — reconnect will restore it"
+                );
+                false
+            }
         }
         RelayCommand::SubscribeMembership => {
             state.membership_sub_active = true;
@@ -3416,7 +3489,7 @@ async fn wait_for_reconnect(
 /// Returns `true` if the REQ was successfully written to the WebSocket.
 async fn send_subscribe(
     ws: &mut WsStream,
-    _state: &BgState,
+    state: &BgState,
     channel_id: Uuid,
     agent_pubkey_hex: &str,
     since: Option<u64>,
@@ -3450,7 +3523,34 @@ async fn send_subscribe(
     };
     req_filter.insert("since".into(), json!(since_ts));
 
-    let req = json!(["REQ", sub_id, Value::Object(req_filter)]);
+    // Thread-engagement filter (ORed as a second REQ filter object): when the
+    // mention (`#p`) filter is active and the agent is engaged in one or more
+    // threads here, also match replies in those threads (`#e` = roots) so the
+    // agent keeps receiving a conversation it is already part of without a fresh
+    // mention. Only meaningful alongside a mention filter — with require_mention
+    // off, filter A already matches everything.
+    let engaged_roots = state.engaged_thread_roots.get(&channel_id);
+    let thread_filter = if filter.require_mention {
+        engaged_roots
+            .filter(|roots| !roots.is_empty())
+            .map(|roots| {
+                let mut f = serde_json::Map::new();
+                if let Some(ref kinds) = filter.kinds {
+                    f.insert("kinds".into(), json!(kinds));
+                }
+                f.insert("#h".into(), json!([channel_id.to_string()]));
+                f.insert("#e".into(), json!(roots));
+                f.insert("since".into(), json!(since_ts));
+                Value::Object(f)
+            })
+    } else {
+        None
+    };
+
+    let req = match thread_filter {
+        Some(tf) => json!(["REQ", sub_id, Value::Object(req_filter), tf]),
+        None => json!(["REQ", sub_id, Value::Object(req_filter)]),
+    };
 
     match serde_json::to_string(&req) {
         Ok(text) => {

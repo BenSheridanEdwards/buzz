@@ -16,6 +16,11 @@ class ImetaEntry {
   final String? filename;
   final int? size;
 
+  /// `playback_speed`: the rate the sender's voice is meant to be heard at.
+  /// An agent's harness writes it from the voice's own configuration, so a
+  /// voice tuned to 1.1x starts there on every device.
+  final double? playbackSpeed;
+
   const ImetaEntry({
     required this.url,
     this.mimeType,
@@ -26,6 +31,7 @@ class ImetaEntry {
     this.duration,
     this.filename,
     this.size,
+    this.playbackSpeed,
   });
 
   bool get isVideo => mimeType?.startsWith('video/') == true;
@@ -61,6 +67,7 @@ Map<String, ImetaEntry> parseImetaTags(List<List<String>> tags) {
     double? duration;
     String? filename;
     int? size;
+    double? playbackSpeed;
 
     for (final part in tag.skip(1)) {
       final separator = part.indexOf(' ');
@@ -92,6 +99,11 @@ Map<String, ImetaEntry> parseImetaTags(List<List<String>> tags) {
           filename = value;
         case 'size':
           size = int.tryParse(value);
+        case 'playback_speed':
+          final parsedSpeed = double.tryParse(value);
+          playbackSpeed = parsedSpeed != null && parsedSpeed.isFinite
+              ? parsedSpeed
+              : null;
       }
     }
 
@@ -106,6 +118,7 @@ Map<String, ImetaEntry> parseImetaTags(List<List<String>> tags) {
       duration: duration,
       filename: filename,
       size: size,
+      playbackSpeed: playbackSpeed,
     );
   }
   return byUrl;

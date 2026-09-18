@@ -1,10 +1,19 @@
-"""Render the Fleet Buzz macOS icon: squircle, FLEET navy canvas, cyan bee glyph."""
+"""Render the Fleet Buzz icon set from the upstream bee (../icons/buzz-source.png).
+
+Writes two 1024px masters next to this script:
+  icon.png       macOS: squircle with Apple's margin (the .icns and Tauri PNGs come from this)
+  icon-1024.png  full-bleed square: the Android source scripts/fleet-branding.sh resizes
+Needs Pillow and numpy.
+"""
 import sys, math
 import numpy as np
 from PIL import Image, ImageDraw, ImageFilter, ImageChops
 
-SRC = __import__("os").path.join(__import__("os").path.dirname(__file__), "..", "buzz-source.png")
-OUT = sys.argv[1] if len(sys.argv) > 1 else "icon.png"
+import os
+HERE = os.path.dirname(os.path.abspath(__file__))
+SRC = os.path.join(HERE, "..", "icons", "buzz-source.png")
+OUT = os.path.join(HERE, "icon.png")
+OUT_FULL = os.path.join(HERE, "icon-1024.png")
 N = 1024                     # master size
 # Apple's icon grid: the squircle fills 824/1024, leaving ~100px margin each side
 ICON = 824
@@ -73,6 +82,8 @@ core.putalpha(cm)
 layer = Image.alpha_composite(layer, core)
 
 icon = Image.alpha_composite(bg, layer)
+# full-bleed master for Android (no mask, no margin; the launcher applies its own shape)
+icon.resize((N, N), Image.LANCZOS).save(OUT_FULL)
 icon.putalpha(ImageChops.multiply(icon.getchannel("A"), sq))
 
 # ---- 5. drop into the 1024 canvas with Apple's margin, subtle shadow ----
@@ -83,4 +94,4 @@ sh.putalpha(shm.filter(ImageFilter.GaussianBlur(14)).point(lambda p: int(p * 0.3
 out = Image.alpha_composite(out, sh)
 out.paste(icon, (MARGIN, MARGIN), icon)
 out.save(OUT)
-print("wrote", OUT, out.size)
+print("wrote", OUT, "and", OUT_FULL)

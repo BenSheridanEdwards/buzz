@@ -291,8 +291,8 @@ desktop-release-build target="aarch64-apple-darwin":
 # Build an unsigned named macOS demo DMG with isolated app and runtime identities.
 # Named demo build. Pass build_id to rebuild an installed demo in place (same
 # identifier, config home and keyring); product_name renames the app without
-# touching that identity; icon_dir (relative to desktop/src-tauri) swaps the icon set.
-# Example: just desktop-demo-build Fleet aarch64-apple-darwin 51094c33a0d51d7c "Fleet Buzz" icons/fleet-buzz
+# touching that identity; icon_dir (relative to desktop/src-tauri, default $BUZZ_DEMO_ICON_DIR) swaps the icon set.
+# Example: just desktop-demo-build Fleet aarch64-apple-darwin 51094c33a0d51d7c "Fleet Buzz" icons-fleet
 desktop-demo-build demo_name target="aarch64-apple-darwin" build_id="" product_name="" icon_dir="":
     #!/usr/bin/env bash
     set -euo pipefail

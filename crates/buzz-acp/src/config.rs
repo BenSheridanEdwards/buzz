@@ -30,6 +30,16 @@ pub(crate) const DEFAULT_IDLE_TIMEOUT_SECS: u64 = 1_500;
 /// Override via `--max-turn-duration` / `BUZZ_ACP_MAX_TURN_DURATION`.
 pub(crate) const DEFAULT_MAX_TURN_DURATION_SECS: u64 = 7200;
 
+/// Default backfill window (seconds) applied when the agent subscribes to a
+/// channel it was *just* added to via a live member-added notification. The
+/// triggering mention is typically posted a moment before the add lands, so the
+/// live subscription's `since` must reach slightly into the past to replay it —
+/// otherwise the agent joins silently and never sees what pulled it in. Only
+/// applied to mention-filtered subscriptions, so it can only surface mentions of
+/// the agent within the window, never unrelated channel chatter.
+/// Override via `--join-backfill-secs` / `BUZZ_ACP_JOIN_BACKFILL_SECS` (0 = off).
+pub(crate) const DEFAULT_JOIN_BACKFILL_SECS: u64 = 120;
+
 /// Upper bound for `max_turn_duration` (7 days). Any higher is operationally
 /// meaningless and risks arithmetic overflow when deriving the in-flight
 /// deadline (`max_turn_duration + IN_FLIGHT_DEADLINE_BUFFER_SECS`).
@@ -52,6 +62,23 @@ pub enum SubscribeMode {
     Mentions,
     All,
     Config,
+}
+
+/// Who delivers the engine's reply to the channel.
+///
+/// `Cli`: the engine posts its own message with `buzz messages send` and is
+/// told to thread it with `--reply-to`; the harness only steps in when the
+/// engine posted nothing. `Harness`: the engine answers in its reply text and
+/// is told not to post it; the harness publishes that text (or the media it
+/// named, with the text as transcript) in the thread of the message being
+/// answered. Engines that simply answer (Hermes under ACP) want `Harness`;
+/// with `Cli` such an engine posts once itself and the harness's media reply
+/// lands as a second message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
+pub enum ReplyMode {
+    #[default]
+    Cli,
+    Harness,
 }
 
 #[derive(Debug, Clone, Copy, clap::ValueEnum)]
@@ -303,6 +330,13 @@ pub struct CliArgs {
     #[arg(long, env = "BUZZ_ACP_HEARTBEAT_INTERVAL", default_value_t = 0)]
     pub heartbeat_interval: u64,
 
+    /// Backfill window (seconds) when subscribing to a channel the agent was just
+    /// added to live, so a mention posted just before the add is still replayed
+    /// and answered. Mention-filtered subscriptions only. 0 = subscribe from the
+    /// add timestamp with no backfill.
+    #[arg(long, env = "BUZZ_ACP_JOIN_BACKFILL_SECS", default_value_t = DEFAULT_JOIN_BACKFILL_SECS)]
+    pub join_backfill_secs: u64,
+
     /// Seconds between per-turn liveness pings (the crash backstop signal —
     /// distinct from heartbeat self-prompting). 0 = disabled.
     #[arg(long, env = "BUZZ_ACP_TURN_LIVENESS_SECS", default_value_t = 10)]
@@ -334,6 +368,46 @@ pub struct CliArgs {
         value_enum
     )]
     pub subscribe: SubscribeMode,
+
+    /// Hermes transcribe endpoint for inbound voice notes. Empty disables it.
+    ///
+    /// Loopback by default: buzz-acp runs on the same host as Hermes, so the
+    /// subscription credential never leaves that machine and nothing is
+    /// exposed to reach it.
+    #[arg(long, env = "BUZZ_ACP_TRANSCRIBE_ENDPOINT", default_value = "")]
+    pub transcribe_endpoint: String,
+
+    /// Hermes profile the transcription is billed to. Empty uses the
+    /// endpoint's default profile.
+    #[arg(long, env = "BUZZ_ACP_TRANSCRIBE_PROFILE", default_value = "")]
+    pub transcribe_profile: String,
+
+    /// Session token for the Hermes transcribe endpoint.
+    ///
+    /// Hermes requires it on every `/api/` route even on a loopback bind, so
+    /// that a stray local process cannot drive the dashboard. This is a
+    /// machine-local shared secret between two of the operator's own
+    /// processes, not a provider credential.
+    #[arg(
+        long,
+        env = "BUZZ_ACP_TRANSCRIBE_TOKEN",
+        default_value = "",
+        hide_env_values = true
+    )]
+    pub transcribe_token: String,
+
+    /// Rate this agent's voice is meant to be heard at, published on every
+    /// voice note as the imeta `playback_speed` hint so clients start there.
+    /// Empty publishes no hint. Accepted range 0.5 to 2.0, matching what the
+    /// clients will honour; anything else is refused at startup.
+    #[arg(long, env = "BUZZ_ACP_VOICE_PLAYBACK_SPEED", default_value = "")]
+    pub voice_playback_speed: String,
+
+    /// Who delivers the reply: `cli` (the engine posts it with `buzz messages
+    /// send`, the default) or `harness` (the engine answers in text and the
+    /// harness posts it in the thread; the engine is told not to post).
+    #[arg(long, env = "BUZZ_ACP_REPLY_MODE", value_enum, default_value_t = ReplyMode::Cli)]
+    pub reply_mode: ReplyMode,
 
     #[arg(long, env = "BUZZ_ACP_KINDS", value_delimiter = ',')]
     pub kinds: Option<Vec<u32>>,
@@ -547,6 +621,10 @@ pub struct Config {
     pub max_turn_duration_secs: u64,
     pub agents: u32,
     pub heartbeat_interval_secs: u64,
+    /// Backfill window (seconds) for a channel joined live via a member-added
+    /// notification, so a mention posted just before the join is replayed.
+    /// Mention-filtered subscriptions only. 0 = no backfill.
+    pub join_backfill_secs: u64,
     /// Seconds between per-turn liveness pings. 0 = disabled. Distinct from
     /// `heartbeat_interval_secs` (agent self-prompting) — this is the desktop
     /// crash-backstop signal.
@@ -557,6 +635,17 @@ pub struct Config {
     pub team_instructions: Option<String>,
     pub initial_message: Option<String>,
     pub subscribe_mode: SubscribeMode,
+    /// Hermes transcribe endpoint for inbound voice notes; empty disables it.
+    pub transcribe_endpoint: String,
+    /// Hermes profile the transcription is billed to.
+    pub transcribe_profile: String,
+    /// Session token for the Hermes transcribe endpoint.
+    pub transcribe_token: String,
+    /// Playback rate hint published on this agent's voice notes; `None`
+    /// publishes no hint.
+    pub voice_playback_speed: Option<f64>,
+    /// Who delivers the engine's reply; see [`ReplyMode`].
+    pub reply_mode: ReplyMode,
     pub dedup_mode: DedupMode,
     /// How ACP provider sessions are scoped in channels (channel vs thread).
     pub session_policy: crate::scope::SessionPolicy,
@@ -723,6 +812,32 @@ fn compose_session_title_with_limit(
 }
 
 /// Validate and deduplicate allowlist entries: each must be exactly 64 hex chars.
+/// Slowest and fastest `playback_speed` hint the clients honour; a hint
+/// outside it would be published and then ignored on every device.
+pub const VOICE_PLAYBACK_SPEED_RANGE: std::ops::RangeInclusive<f64> = 0.5..=2.0;
+
+/// Parse `BUZZ_ACP_VOICE_PLAYBACK_SPEED`: empty is no hint, anything else
+/// must be a finite rate inside [`VOICE_PLAYBACK_SPEED_RANGE`].
+fn parse_voice_playback_speed(raw: &str) -> Result<Option<f64>, ConfigError> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return Ok(None);
+    }
+    let speed: f64 = raw.parse().map_err(|_| {
+        ConfigError::ConfigFile(format!(
+            "BUZZ_ACP_VOICE_PLAYBACK_SPEED must be a number, got {raw:?}"
+        ))
+    })?;
+    if !speed.is_finite() || !VOICE_PLAYBACK_SPEED_RANGE.contains(&speed) {
+        return Err(ConfigError::ConfigFile(format!(
+            "BUZZ_ACP_VOICE_PLAYBACK_SPEED must be between {} and {}, got {raw}",
+            VOICE_PLAYBACK_SPEED_RANGE.start(),
+            VOICE_PLAYBACK_SPEED_RANGE.end()
+        )));
+    }
+    Ok(Some(speed))
+}
+
 fn validate_allowlist(entries: &[String]) -> Result<HashSet<String>, ConfigError> {
     let mut validated = HashSet::new();
     for entry in entries {
@@ -1230,6 +1345,7 @@ impl Config {
             max_turn_duration_secs,
             agents: args.agents,
             heartbeat_interval_secs: heartbeat_interval,
+            join_backfill_secs: args.join_backfill_secs,
             turn_liveness_secs,
             heartbeat_prompt,
             system_prompt,
@@ -1241,6 +1357,11 @@ impl Config {
                 .map(str::to_string),
             initial_message: args.initial_message,
             subscribe_mode: args.subscribe,
+            transcribe_endpoint: args.transcribe_endpoint.clone(),
+            transcribe_profile: args.transcribe_profile.clone(),
+            transcribe_token: args.transcribe_token.clone(),
+            voice_playback_speed: parse_voice_playback_speed(&args.voice_playback_speed)?,
+            reply_mode: args.reply_mode,
             dedup_mode: args.dedup,
             session_policy: args.session_policy,
             multiple_event_handling: args.multiple_event_handling,
@@ -1597,6 +1718,34 @@ fn rule_applies_to_channel(rule: &SubscriptionRule, channel_id: Uuid) -> bool {
 }
 
 #[cfg(test)]
+mod voice_playback_speed_tests {
+    use super::parse_voice_playback_speed;
+
+    #[test]
+    fn empty_means_no_hint() {
+        assert_eq!(parse_voice_playback_speed("").unwrap(), None);
+        assert_eq!(parse_voice_playback_speed("  ").unwrap(), None);
+    }
+
+    #[test]
+    fn a_rate_in_range_is_kept_as_given() {
+        assert_eq!(parse_voice_playback_speed("1.1").unwrap(), Some(1.1));
+        assert_eq!(parse_voice_playback_speed(" 0.5 ").unwrap(), Some(0.5));
+        assert_eq!(parse_voice_playback_speed("2").unwrap(), Some(2.0));
+    }
+
+    #[test]
+    fn a_rate_the_clients_would_ignore_is_refused_at_startup() {
+        for raw in ["0.4", "2.01", "-1", "0", "NaN", "inf", "fast"] {
+            assert!(
+                parse_voice_playback_speed(raw).is_err(),
+                "{raw:?} must be refused"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::filter::{ChannelScope, SubscriptionRule};
@@ -1614,12 +1763,18 @@ mod tests {
             max_turn_duration_secs: DEFAULT_MAX_TURN_DURATION_SECS,
             agents: 1,
             heartbeat_interval_secs: 0,
+            join_backfill_secs: DEFAULT_JOIN_BACKFILL_SECS,
             turn_liveness_secs: 10,
             heartbeat_prompt: None,
             system_prompt: None,
             team_instructions: None,
             initial_message: None,
             subscribe_mode: mode,
+            transcribe_endpoint: String::new(),
+            transcribe_profile: String::new(),
+            transcribe_token: String::new(),
+            voice_playback_speed: None,
+            reply_mode: ReplyMode::Cli,
             dedup_mode: DedupMode::Queue,
             session_policy: crate::scope::SessionPolicy::Channel,
             multiple_event_handling: MultipleEventHandling::Queue,

@@ -6,6 +6,7 @@
 use buzz_core::{
     kind::{
         KIND_AGENT_OBSERVER_FRAME, KIND_APPROVAL_DENY, KIND_APPROVAL_GRANT, KIND_DELETION,
+        KIND_VOICE_NOTE_TRANSCRIPT,
         KIND_DM_ADD_MEMBER, KIND_DM_OPEN, KIND_EMOJI_SET, KIND_GIT_ISSUE, KIND_GIT_PATCH,
         KIND_GIT_PR_UPDATE, KIND_GIT_PULL_REQUEST, KIND_GIT_REPO_ANNOUNCEMENT,
         KIND_GIT_STATUS_CLOSED, KIND_GIT_STATUS_DRAFT, KIND_GIT_STATUS_MERGED,
@@ -456,6 +457,39 @@ pub fn build_delete_message_with_options(
         tags.push(tag(&["public_reason", public_reason])?);
     }
     Ok(EventBuilder::new(Kind::Custom(9005), "").tags(tags))
+}
+
+/// Build a voice-note transcript event (kind 40009).
+///
+/// Published by the agent that transcribed the clip, not by the person who
+/// recorded it: the speech-to-text credential lives with the agents, so a
+/// human's own voice note reaches the relay with no transcript in its imeta
+/// `alt` field and nothing else can supply one.
+///
+/// The `h` tag scopes it to the channel so channel subscriptions see it, and
+/// the `e` tag points at the voice note it describes. Clients render the
+/// content on that message and must never render it as a message in its own
+/// right: it is metadata about someone else's message, authored by the agent.
+pub fn build_voice_note_transcript(
+    channel_id: Uuid,
+    target_event_id: nostr::EventId,
+    transcript: &str,
+) -> Result<EventBuilder, SdkError> {
+    let transcript = transcript.trim();
+    if transcript.is_empty() {
+        return Err(SdkError::InvalidInput(
+            "transcript must not be empty".to_string(),
+        ));
+    }
+    let tags = vec![
+        tag(&["h", &channel_id.to_string()])?,
+        tag(&["e", &target_event_id.to_hex()])?,
+    ];
+    Ok(EventBuilder::new(
+        Kind::Custom(KIND_VOICE_NOTE_TRANSCRIPT as u16),
+        transcript,
+    )
+    .tags(tags))
 }
 
 /// Build a NIP-09 deletion event (kind 5). The `h` tag is non-standard for
@@ -2819,6 +2853,30 @@ mod tests {
         assert!(has_tag(&ev, "pr", "42"));
         assert!(has_tag(&ev, "truncated", "true"));
         assert!(has_tag(&ev, "alt", "patch for bug fix"));
+    }
+
+    #[test]
+    fn voice_note_transcript_carries_the_words_and_points_at_the_note() {
+        let channel = Uuid::new_v4();
+        let target = nostr::EventId::all_zeros();
+        let ev = build_voice_note_transcript(channel, target, "  Yes Chief, it came through.  ")
+            .unwrap()
+            .sign_with_keys(&keys())
+            .expect("sign");
+        assert_eq!(ev.kind.as_u16() as u32, KIND_VOICE_NOTE_TRANSCRIPT);
+        // Trimmed, so a provider's trailing newline never reaches the timeline.
+        assert_eq!(ev.content, "Yes Chief, it came through.");
+        assert!(has_tag(&ev, "e", &target.to_hex()));
+        assert!(has_tag(&ev, "h", &channel.to_string()));
+    }
+
+    #[test]
+    fn voice_note_transcript_refuses_an_empty_transcript() {
+        // An empty transcript would render a blank row rather than no row, so
+        // the builder refuses it and the caller publishes nothing.
+        let channel = Uuid::new_v4();
+        let target = nostr::EventId::all_zeros();
+        assert!(build_voice_note_transcript(channel, target, "   \n\t ").is_err());
     }
 
     #[test]

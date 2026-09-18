@@ -34,6 +34,10 @@ abstract final class EventKind {
   static const channelWindowBounds = 39006;
   static const streamMessageEdit = 40003;
   static const streamMessageDiff = 40008;
+
+  /// Transcript of a voice note, published by the agent that transcribed it.
+  /// Overlays onto the note it references (`e` tag); never its own row.
+  static const voiceNoteTranscript = 40009;
   static const systemMessage = 40099;
   static const jobRequest = 43001;
   static const jobAccepted = 43002;
@@ -66,6 +70,7 @@ abstract final class EventKind {
     40001, // legacy pre-migration stream messages
     streamMessageEdit, // 40003
     streamMessageDiff, // 40008
+    voiceNoteTranscript, // 40009, overlays a transcript onto a voice note
     systemMessage, // 40099
     huddleStarted, // 48100 — visible huddle session row
     huddleParticipantJoined, // 48101 — huddle lifecycle metadata
@@ -79,6 +84,7 @@ abstract final class EventKind {
     reaction,
     nip29DeleteEvent,
     streamMessageEdit,
+    voiceNoteTranscript,
   ];
 
   /// Visible content kinds requested by the NIP-CW channel-window path.

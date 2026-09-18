@@ -32,9 +32,9 @@ use buzz_core::kind::{
     KIND_READ_STATE, KIND_REPORT, KIND_STREAM_MESSAGE, KIND_STREAM_MESSAGE_BOOKMARKED,
     KIND_STREAM_MESSAGE_DIFF, KIND_STREAM_MESSAGE_EDIT, KIND_STREAM_MESSAGE_PINNED,
     KIND_STREAM_MESSAGE_SCHEDULED, KIND_STREAM_MESSAGE_V2, KIND_STREAM_REMINDER, KIND_TEAM,
-    KIND_TEAM_CATALOG, KIND_TEXT_NOTE, KIND_USER_STATUS, KIND_WORKFLOW_DEF, KIND_WORKFLOW_TRIGGER,
-    RELAY_ADMIN_ADD_MEMBER, RELAY_ADMIN_CHANGE_ROLE, RELAY_ADMIN_REMOVE_MEMBER,
-    RELAY_ADMIN_SET_WORKSPACE_PROFILE,
+    KIND_TEAM_CATALOG, KIND_TEXT_NOTE, KIND_USER_STATUS, KIND_VOICE_NOTE_TRANSCRIPT,
+    KIND_WORKFLOW_DEF, KIND_WORKFLOW_TRIGGER, RELAY_ADMIN_ADD_MEMBER, RELAY_ADMIN_CHANGE_ROLE,
+    RELAY_ADMIN_REMOVE_MEMBER, RELAY_ADMIN_SET_WORKSPACE_PROFILE,
 };
 use buzz_core::tenant::TenantContext;
 use buzz_core::verification::verify_event;
@@ -481,7 +481,8 @@ fn required_scope_for_kind(kind: u32, event: &Event) -> Result<Scope, &'static s
         | KIND_STREAM_MESSAGE_DIFF
         | KIND_FORUM_POST
         | KIND_FORUM_VOTE
-        | KIND_FORUM_COMMENT => Ok(Scope::MessagesWrite),
+        | KIND_FORUM_COMMENT
+        | KIND_VOICE_NOTE_TRANSCRIPT => Ok(Scope::MessagesWrite),
         KIND_NIP29_PUT_USER | KIND_NIP29_REMOVE_USER | KIND_NIP29_DELETE_GROUP => {
             Ok(Scope::AdminChannels)
         }
@@ -719,6 +720,9 @@ pub(crate) fn requires_h_channel_scope(kind: u32) -> bool {
             | KIND_FORUM_POST
             | KIND_FORUM_VOTE
             | KIND_FORUM_COMMENT
+            // A transcript annotates a voice note in a channel; it is scoped to
+            // that channel so membership gates it and `#h` queries return it.
+            | KIND_VOICE_NOTE_TRANSCRIPT
             // NIP-29 admin kinds (except CREATE_GROUP which creates the channel)
             | KIND_NIP29_PUT_USER
             | KIND_NIP29_REMOVE_USER
@@ -1276,6 +1280,78 @@ async fn validate_forum_vote_target(
         _ => {}
     }
     Ok(())
+}
+
+/// Longest transcript the relay stores. Publishers cap at 1000 bytes; the
+/// relay allows headroom for other clients but refuses anything that could
+/// only be a payload smuggled through the annotation.
+const VOICE_NOTE_TRANSCRIPT_MAX_BYTES: usize = 4096;
+
+/// Shape check for a kind:40009 voice note transcript, before the DB lookup.
+///
+/// Returns the annotated note's id. The `e` tag must be bare (no NIP-10
+/// marker): a transcript is an annotation, never a reply, and the thread
+/// counters must not move when one lands. `validate_voice_note_transcript`
+/// then checks the target against the store.
+fn validate_voice_note_transcript_shape(event: &Event) -> Result<Vec<u8>, String> {
+    let content = event.content.trim();
+    if content.is_empty() {
+        return Err("transcript content is empty".to_string());
+    }
+    if event.content.len() > VOICE_NOTE_TRANSCRIPT_MAX_BYTES {
+        return Err(format!(
+            "transcript exceeds {VOICE_NOTE_TRANSCRIPT_MAX_BYTES} bytes (got {})",
+            event.content.len()
+        ));
+    }
+
+    let e_tags: Vec<&[String]> = event
+        .tags
+        .iter()
+        .map(nostr::Tag::as_slice)
+        .filter(|parts| parts.first().map(String::as_str) == Some("e"))
+        .collect();
+    let [parts] = e_tags.as_slice() else {
+        return Err(format!(
+            "transcript must carry exactly one e tag (got {})",
+            e_tags.len()
+        ));
+    };
+    // `["e", <id>, <relay hint>, <marker>]`: the hint is harmless, the marker
+    // is what `parse_thread_markers` reads.
+    if parts.get(3).is_some_and(|marker| !marker.is_empty()) {
+        return Err("transcript e tag must not carry a NIP-10 marker".to_string());
+    }
+    let target_hex = parts.get(1).map(String::as_str).unwrap_or_default();
+    if target_hex.len() != 64 || !target_hex.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err("invalid transcript target event ID".to_string());
+    }
+    hex::decode(target_hex).map_err(|_| "invalid transcript target event ID".to_string())
+}
+
+/// Validate a kind:40009 voice note transcript against the store: the note it
+/// annotates must exist and live in the transcript's own channel, so a
+/// transcript can never surface words on a message in another channel.
+async fn validate_voice_note_transcript(
+    community_id: CommunityId,
+    event: &Event,
+    state: &AppState,
+) -> Result<(), String> {
+    let target_bytes = validate_voice_note_transcript_shape(event)?;
+    let target_event = state
+        .db
+        .get_event_by_id_for_event_write(community_id, &target_bytes)
+        .await
+        .map_err(|e| format!("db error: {e}"))?
+        .ok_or_else(|| "transcript target event not found".to_string())?;
+
+    match (extract_channel_id(event), target_event.channel_id) {
+        (Some(own), Some(target)) if own != target => {
+            Err("target event belongs to a different channel".to_string())
+        }
+        (Some(_), None) => Err("target event has no channel".to_string()),
+        _ => Ok(()),
+    }
 }
 
 /// Validate kind:40008 diff event metadata tags.
@@ -2739,6 +2815,12 @@ async fn ingest_event_inner(
         validate_diff_event(&event).map_err(|e| IngestError::Rejected(format!("invalid: {e}")))?;
     }
 
+    if kind_u32 == KIND_VOICE_NOTE_TRANSCRIPT {
+        validate_voice_note_transcript(tenant.community(), &event, state)
+            .await
+            .map_err(|e| IngestError::Rejected(format!("invalid: {e}")))?;
+    }
+
     if kind_u32 == KIND_AGENT_ENGRAM {
         validate_engram_envelope(&event)
             .map_err(|e| IngestError::Rejected(format!("invalid: {e}")))?;
@@ -3225,6 +3307,13 @@ async fn ingest_event_inner(
         }
     }
 
+    // Auto-onboard an owner's agent when they @-mention it in a channel it is
+    // not a member of yet. Owner-only and best-effort: mirrors a manual kind:9000
+    // add, and its failure never fails the (already-stored) message.
+    if matches!(kind_u32, KIND_STREAM_MESSAGE | KIND_STREAM_MESSAGE_V2) {
+        crate::handlers::side_effects::maybe_autojoin_owned_agents(tenant, &event, state).await;
+    }
+
     // A freshly inserted reply changed its thread's counters (updated in the
     // same transaction as the insert) — push a fresh relay-signed 39005 so
     // subscribed clients can update badge counts without refetching the head
@@ -3679,12 +3768,124 @@ mod postgres_tests {
             KIND_FORUM_POST,
             KIND_FORUM_VOTE,
             KIND_FORUM_COMMENT,
+            KIND_VOICE_NOTE_TRANSCRIPT,
         ] {
             assert!(
                 requires_h_channel_scope(kind),
                 "kind {kind} should require h"
             );
         }
+    }
+
+    fn transcript_event(content: &str, tags: &[&[&str]]) -> Event {
+        make_event_with_tags(KIND_VOICE_NOTE_TRANSCRIPT, content, tags)
+    }
+
+    #[test]
+    fn voice_note_transcript_is_a_messages_write() {
+        let event = transcript_event("hello", &[&["h", "chan"]]);
+        assert_eq!(
+            required_scope_for_kind(KIND_VOICE_NOTE_TRANSCRIPT, &event),
+            Ok(Scope::MessagesWrite)
+        );
+    }
+
+    #[test]
+    fn voice_note_transcript_shape_accepts_a_bare_e_tag() {
+        let note = "ab".repeat(32);
+        let event = transcript_event("hello there", &[&["h", "chan"], &["e", &note]]);
+        assert_eq!(
+            validate_voice_note_transcript_shape(&event),
+            Ok(hex::decode(&note).unwrap())
+        );
+    }
+
+    #[test]
+    fn voice_note_transcript_shape_accepts_a_relay_hint_without_a_marker() {
+        let note = "ab".repeat(32);
+        for tag in [
+            vec!["e", &note, ""],
+            vec!["e", &note, "wss://relay.example"],
+            vec!["e", &note, "wss://relay.example", ""],
+        ] {
+            let event = transcript_event("hello there", &[&tag]);
+            assert!(
+                validate_voice_note_transcript_shape(&event).is_ok(),
+                "tag {tag:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn voice_note_transcript_shape_rejects_a_nip10_marker() {
+        let note = "ab".repeat(32);
+        for marker in ["root", "reply", "mention"] {
+            let event = transcript_event("hello", &[&["e", &note, "", marker]]);
+            assert_eq!(
+                validate_voice_note_transcript_shape(&event),
+                Err("transcript e tag must not carry a NIP-10 marker".to_string()),
+                "marker {marker}"
+            );
+        }
+    }
+
+    #[test]
+    fn voice_note_transcript_shape_rejects_wrong_e_tag_count() {
+        let note = "ab".repeat(32);
+        let none = transcript_event("hello", &[&["h", "chan"]]);
+        assert_eq!(
+            validate_voice_note_transcript_shape(&none),
+            Err("transcript must carry exactly one e tag (got 0)".to_string())
+        );
+        let two = transcript_event("hello", &[&["e", &note], &["e", &note]]);
+        assert_eq!(
+            validate_voice_note_transcript_shape(&two),
+            Err("transcript must carry exactly one e tag (got 2)".to_string())
+        );
+    }
+
+    #[test]
+    fn voice_note_transcript_shape_rejects_bad_target_ids() {
+        for bad in ["", "abc", &"zz".repeat(32)] {
+            let event = transcript_event("hello", &[&["e", bad]]);
+            assert_eq!(
+                validate_voice_note_transcript_shape(&event),
+                Err("invalid transcript target event ID".to_string()),
+                "target {bad:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn voice_note_transcript_shape_rejects_empty_and_oversized_content() {
+        let note = "ab".repeat(32);
+        let blank = transcript_event("   ", &[&["e", &note]]);
+        assert_eq!(
+            validate_voice_note_transcript_shape(&blank),
+            Err("transcript content is empty".to_string())
+        );
+        let big = "x".repeat(VOICE_NOTE_TRANSCRIPT_MAX_BYTES + 1);
+        let huge = transcript_event(&big, &[&["e", &note]]);
+        assert!(validate_voice_note_transcript_shape(&huge)
+            .unwrap_err()
+            .starts_with("transcript exceeds"));
+        let edge = "x".repeat(VOICE_NOTE_TRANSCRIPT_MAX_BYTES);
+        assert!(
+            validate_voice_note_transcript_shape(&transcript_event(&edge, &[&["e", &note]]))
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn voice_note_transcript_never_resolves_as_a_reply() {
+        let note = "ab".repeat(32);
+        let event = transcript_event("hello", &[&["h", "chan"], &["e", &note]]);
+        assert!(
+            buzz_core::nip10::parse_thread_markers(&event.tags)
+                .resolve()
+                .is_none(),
+            "a bare e tag must not produce thread metadata"
+        );
     }
 
     #[test]
@@ -3898,6 +4099,7 @@ mod postgres_tests {
             KIND_FORUM_POST,
             KIND_FORUM_VOTE,
             KIND_FORUM_COMMENT,
+            KIND_VOICE_NOTE_TRANSCRIPT,
             KIND_LONG_FORM,
             KIND_USER_STATUS,
             // NIP-51 lists + sets, NIP-65 relay list

@@ -45,6 +45,10 @@ import { formatTime } from "@/features/messages/lib/dateFormatters";
 // Pure overlay helper lives in a sibling .mjs so node:test (no TS loader)
 // can exercise the exact same source the renderer uses.
 import { applyEditTagOverlay } from "@/features/messages/lib/applyEditTagOverlay.mjs";
+import {
+  applyTranscriptToTags,
+  indexVoiceNoteTranscripts,
+} from "@/features/messages/lib/voiceNoteTranscriptOverlay.mjs";
 import { truncatePubkey } from "@/shared/lib/pubkey";
 
 const HEX_RE = /^[0-9a-f]+$/i;
@@ -297,6 +301,14 @@ export function formatTimelineMessages(
     }
   }
 
+  // Transcripts an agent published for voice notes whose author could not
+  // supply one. Overlaid onto the note's imeta `alt` below, so every consumer
+  // that already reads `alt` needs no change.
+  const transcriptsByTargetId = indexVoiceNoteTranscripts(
+    events,
+    deletedEventIds,
+  );
+
   const visibleEvents = events.filter(
     (event) => isTimelineContentEvent(event) && !deletedEventIds.has(event.id),
   );
@@ -516,7 +528,10 @@ export function formatTimelineMessages(
       // Logic lives in `applyEditTagOverlay.mjs` so prod and tests share
       // a single source.
       tags: (() => {
-        const effectiveTags = applyEditTagOverlay(event.tags, edit?.tags);
+        const effectiveTags = applyTranscriptToTags(
+          applyEditTagOverlay(event.tags, edit?.tags),
+          transcriptsByTargetId.get(event.id),
+        );
         if (
           hasLinkPreviewSuppression(event.tags) ||
           previewSuppressedTargetIds.has(event.id)

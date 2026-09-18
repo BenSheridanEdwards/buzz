@@ -50,8 +50,9 @@ function normalizeName(raw, label, maxLength) {
  *
  * `options.productName` overrides the human-facing app name only; it never
  * touches the slug, so an installed demo can be renamed without losing its
- * agents or credentials. `options.iconDir` (relative to `src-tauri`) swaps the
- * bundle icon set for the standard Tauri file names inside that directory.
+ * agents or credentials. `options.iconDir` (relative to `src-tauri`, default
+ * `BUZZ_DEMO_ICON_DIR`) swaps the bundle icon set for the standard Tauri file
+ * names inside that directory, so a demo's icon replaces production's wholesale.
  */
 export function demoBuildConfig(
   rawName,
@@ -75,8 +76,9 @@ export function demoBuildConfig(
     ? normalizeName(options.productName, "Demo product name")
     : `Buzz ${name}`;
   const bundle = { targets: ["app"] };
-  if (options.iconDir) {
-    const iconDir = String(options.iconDir).replace(/\/+$/, "");
+  const rawIconDir = options.iconDir ?? process.env.BUZZ_DEMO_ICON_DIR;
+  if (rawIconDir) {
+    const iconDir = String(rawIconDir).replace(/\/+$/, "");
     if (
       !/^[A-Za-z0-9][A-Za-z0-9_./-]*$/.test(iconDir) ||
       iconDir.includes("..")
