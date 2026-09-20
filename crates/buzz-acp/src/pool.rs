@@ -335,6 +335,7 @@ impl OwnedAgent {
 /// (running inside a spawned task). The `task_map` tracks in-flight
 /// tasks for panic recovery.
 pub struct AgentPool {
+    pub(crate) recovery_retries: Arc<Mutex<crate::background_recovery::RecoveryRetries>>,
     agents: Vec<Option<OwnedAgent>>,
     result_tx: mpsc::UnboundedSender<PromptResult>,
     result_rx: mpsc::UnboundedReceiver<PromptResult>,
@@ -930,6 +931,7 @@ impl AgentPool {
         let (result_tx, result_rx) = mpsc::unbounded_channel();
         Self {
             agents: slots,
+            recovery_retries: Default::default(),
             result_tx,
             result_rx,
             join_set: JoinSet::new(),
@@ -947,8 +949,10 @@ impl AgentPool {
     }
 
     /// Drain unsolicited worker notifications even after the parent has replied.
-    pub async fn drain_background_updates(&mut self) {
-        for agent in self.agents.iter_mut().flatten() {
+    pub async fn drain_background_updates(&mut self) -> Vec<OwnedAgent> {
+        let mut failed = Vec::new();
+        for slot in &mut self.agents {
+            let Some(agent) = slot.as_mut() else { continue };
             let contexts = agent
                 .state
                 .sessions
@@ -960,10 +964,24 @@ impl AgentPool {
                     )
                 })
                 .collect();
-            if let Err(error) = agent.acp.drain_idle_updates(&contexts).await {
+            // A blocked permission response must not stall relay input for
+            // the normal 30-second write timeout. A cancelled partial write
+            // poisons this pipe: remove it and respawn, never reuse it.
+            let budget = Duration::from_millis(250);
+            let outcome = tokio::time::timeout(budget, agent.acp.drain_idle_updates(&contexts))
+                .await
+                .unwrap_or(Err(AcpError::WriteTimeout(budget)));
+            if let Err(error) = outcome {
                 tracing::warn!(agent = agent.index, %error, "background notification stream failed");
+                agent
+                    .acp
+                    .observe_stream_closed(&contexts, &error.to_string());
+                if let Some(agent) = slot.take() {
+                    failed.push(agent);
+                }
             }
         }
+        failed
     }
 
     /// Record which worker is handling `scope` so a later dispatch can detect a
@@ -1053,6 +1071,15 @@ impl AgentPool {
         }
         // Pass 1 of try_claim returns exactly that idle owner.
         self.try_claim(Some(scope))
+    }
+
+    /// Claim the exact session that owns a result, even when a scope was forked.
+    pub fn try_claim_session(&mut self, session_id: &str) -> Option<OwnedAgent> {
+        let idx = self.agents.iter().position(|slot| {
+            slot.as_ref()
+                .is_some_and(|agent| agent.state.sessions.values().any(|sid| sid == session_id))
+        })?;
+        self.agents[idx].take()
     }
 
     /// The scope (and the thread's latest real trigger) whose ACP session id is
@@ -2647,6 +2674,9 @@ pub async fn run_prompt_task(
     control_rx: Option<tokio::sync::oneshot::Receiver<ControlSignal>>,
     turn_id: String,
 ) {
+    agent
+        .acp
+        .set_background_routes_dir(ctx.background_routes_dir.clone());
     // Is this a channel prompt or a heartbeat?
     let source = match &batch {
         Some(b) => PromptSource::Channel(b.scope.clone()),
@@ -3014,9 +3044,28 @@ pub async fn run_prompt_task(
         }
     };
     if let (Some(dir), PromptSource::Channel(scope)) = (&ctx.background_routes_dir, &source) {
-        if let Some(trigger) = agent.state.last_trigger.get(scope) {
-            if let Err(error) = crate::background_routes::save(dir, &session_id, scope, trigger) {
+        let trigger = agent.state.last_trigger.get(scope).cloned().or_else(|| {
+            batch
+                .as_ref()?
+                .events
+                .last()
+                .map(|event| event.event.clone())
+        });
+        if let Some(trigger) = trigger {
+            agent
+                .state
+                .last_trigger
+                .insert(scope.clone(), trigger.clone());
+            if let Err(error) = crate::background_routes::save(dir, &session_id, scope, &trigger) {
                 tracing::error!(%error, "could not persist background return address");
+                send_prompt_result(
+                    &result_tx, &turn_id, agent, source,
+                    PromptOutcome::Error(AcpError::AgentError {
+                        code: -32603,
+                        message: format!("Cannot start work because its background return address could not be saved: {error}"),
+                    }), batch,
+                );
+                return;
             }
         }
     }
@@ -10158,6 +10207,275 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
         };
         agent.state.sessions.insert(scope, "sess".into());
         agent
+    }
+
+    #[tokio::test]
+    async fn background_recovery_preserves_newer_session_after_success_and_error() {
+        for (fail, load_fails) in [(false, false), (true, false), (false, true)] {
+            let tmp = tempfile::tempdir().unwrap();
+            let scope = SessionScope::Conversation {
+                channel_id: Uuid::new_v4(),
+            };
+            let trigger = nostr::EventBuilder::text_note("original request")
+                .sign_with_keys(&nostr::Keys::generate())
+                .unwrap();
+            let mut context = make_prompt_context_no_owner();
+            let (resolver, _, server) = counting_resolver(serde_json::json!([])).await;
+            context.rest_client = resolver.rest_client.clone();
+            context.channel_info = resolver;
+            let dir = tmp.path().join("routes");
+            crate::background_routes::save(&dir, "old-origin", &scope, &trigger).unwrap();
+            context.background_routes_dir = Some(dir);
+            let mut config = crate::error_outcome_emission_tests::test_config();
+            config.persona_env_vars.push((
+                crate::config::HERMES_HOME_ENV.into(),
+                tmp.path().to_string_lossy().into_owned(),
+            ));
+            std::fs::write(
+                tmp.path().join(crate::BACKGROUND_WORK_MARKER),
+                r#"{"pending":[{"origin_session":"old-origin"}]}"#,
+            )
+            .unwrap();
+            let response = if fail {
+                r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32000,"message":"provider unavailable"}}"#
+            } else {
+                r#"{"jsonrpc":"2.0","id":1,"result":{"stopReason":"end_turn"}}"#
+            };
+            let load_response = if load_fails {
+                r#"{"jsonrpc":"2.0","id":0,"error":{"code":-32000,"message":"session missing"}}"#
+            } else {
+                r#"{"jsonrpc":"2.0","id":0,"result":{}}"#
+            };
+            let script = format!(
+                r#"
+                read -t 5 request
+                [[ "$request" == *'"session/load"'* ]] || exit 2
+                echo '{load_response}'
+                read -t 5 request
+                [[ "$request" == *'"sessionId":"old-origin"'* ]] || exit 3
+                echo '{response}'
+                read -t 5 request
+            "#
+            );
+            let mut agent = idle_agent_with_session(scope.clone()).await;
+            agent.acp.shutdown().await;
+            agent.acp = AcpClient::spawn("bash", &["-c".into(), script], &[], false)
+                .await
+                .unwrap();
+            agent
+                .state
+                .sessions
+                .insert(scope.clone(), "new-session".into());
+            agent.state.turn_counts.insert(scope.clone(), 7);
+            agent
+                .state
+                .last_trigger
+                .insert(scope.clone(), trigger.clone());
+            agent.state.deliveries.insert(
+                scope.clone(),
+                ChannelDeliveryState {
+                    standing_context_sent: true,
+                    delivered_event_ids: HashSet::from(["new-message".into()]),
+                },
+            );
+            let mut pool = AgentPool::from_slots(vec![Some(agent)]);
+            let context = Arc::new(context);
+            crate::dispatch_delivery_turns(
+                &mut pool,
+                &context,
+                &config,
+                &HashSet::from([scope.channel_id()]),
+            );
+            let result = tokio::time::timeout(Duration::from_secs(5), pool.result_rx.recv()).await;
+            assert!(
+                result.is_ok(),
+                "delivery timed out; task={:?}",
+                pool.join_set.try_join_next()
+            );
+            let result = result.unwrap().unwrap();
+            assert_eq!(
+                result.agent.state.sessions.get(&scope).map(String::as_str),
+                Some("new-session")
+            );
+            assert_eq!(result.agent.state.turn_counts[&scope], 7);
+            assert!(result.agent.state.deliveries[&scope]
+                .delivered_event_ids
+                .contains("new-message"));
+            assert_eq!(result.agent.state.last_trigger[&scope].id, trigger.id);
+            if fail || load_fails {
+                assert!(matches!(result.outcome, PromptOutcome::Error(_)));
+            } else {
+                assert!(matches!(result.outcome, PromptOutcome::Ok(_)));
+            }
+            if load_fails {
+                assert!(!pool
+                    .recovery_retries
+                    .lock()
+                    .unwrap()
+                    .ready("old-origin", &tokio::time::Instant::now()));
+                assert!(tmp.path().join(crate::BACKGROUND_WORK_MARKER).exists());
+                pool.join_set.join_next().await.unwrap().unwrap();
+                pool.task_map.clear();
+                pool.return_agent(result.agent);
+                crate::dispatch_delivery_turns(
+                    &mut pool,
+                    &context,
+                    &config,
+                    &HashSet::from([scope.channel_id()]),
+                );
+                assert!(
+                    pool.join_set.is_empty(),
+                    "failed recovery must back off before loading again"
+                );
+            }
+            server.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn background_route_save_failure_prevents_prompt_dispatch() {
+        let tmp = tempfile::tempdir().unwrap();
+        let blocked_dir = tmp.path().join("not-a-directory");
+        std::fs::write(&blocked_dir, "file").unwrap();
+        let scope = SessionScope::Conversation {
+            channel_id: Uuid::new_v4(),
+        };
+        let trigger = nostr::EventBuilder::text_note("work")
+            .sign_with_keys(&nostr::Keys::generate())
+            .unwrap();
+        let mut agent = idle_agent_with_session(scope.clone()).await;
+        agent
+            .state
+            .last_trigger
+            .insert(scope.clone(), trigger.clone());
+        let observer = crate::observer::ObserverHandle::in_process();
+        agent.acp.set_observer(Some(observer.clone()), 0);
+        let mut context = make_prompt_context_no_owner();
+        let (resolver, _, server) = counting_resolver(serde_json::json!([])).await;
+        context.rest_client = resolver.rest_client.clone();
+        context.channel_info = resolver;
+        context.background_routes_dir = Some(blocked_dir);
+        let batch = FlushBatch {
+            channel_id: scope.channel_id(),
+            scope,
+            events: vec![crate::queue::BatchEvent {
+                event: trigger,
+                prompt_tag: "message".into(),
+                received_at: std::time::Instant::now(),
+            }],
+            cancelled_events: vec![],
+            cancel_reason: None,
+        };
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            run_prompt_task(
+                agent,
+                Some(batch),
+                Some("do work".into()),
+                Arc::new(context),
+                tx,
+                None,
+                "test".into(),
+            ),
+        )
+        .await
+        .unwrap();
+        let result = rx.recv().await.unwrap();
+        server.abort();
+        assert!(matches!(
+            result.outcome,
+            PromptOutcome::Error(AcpError::AgentError { .. })
+        ));
+        assert!(
+            !observer.snapshot().iter().any(|event| event
+                .payload
+                .get("method")
+                .and_then(|v| v.as_str())
+                == Some("session/prompt")),
+            "work must not reach ACP without its return address"
+        );
+    }
+
+    #[tokio::test]
+    async fn background_blocked_permission_write_discards_poisoned_pipe_promptly() {
+        let scope = SessionScope::Conversation {
+            channel_id: Uuid::new_v4(),
+        };
+        let mut agent = idle_agent_with_session(scope).await;
+        agent.acp.shutdown().await;
+        let script = r#"
+            printf -v option '%*s' 1048576 ''
+            printf '{"jsonrpc":"2.0","id":1,"method":"session/request_permission","params":{"sessionId":"sess","options":[{"kind":"allow_once","optionId":"%s"}]}}\n' "$option"
+            sleep 10
+        "#;
+        agent.acp = AcpClient::spawn("bash", &["-c".into(), script.into()], &[], false)
+            .await
+            .unwrap();
+        let mut pool = AgentPool::from_slots(vec![Some(agent)]);
+        let failed = tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let failed = pool.drain_background_updates().await;
+                if !failed.is_empty() {
+                    break failed;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("blocked write must not consume normal 30-second timeout");
+        assert_eq!(failed.len(), 1);
+        assert_eq!(
+            pool.live_count(),
+            0,
+            "partially written JSON must never be reused"
+        );
+    }
+
+    #[tokio::test]
+    async fn background_stream_exit_removes_dead_slot_for_respawn() {
+        let scope = SessionScope::Conversation {
+            channel_id: Uuid::new_v4(),
+        };
+        let mut agent = idle_agent_with_session(scope).await;
+        agent.acp.shutdown().await;
+        let mut pool = AgentPool::from_slots(vec![Some(agent)]);
+        let failed = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let failed = pool.drain_background_updates().await;
+                if !failed.is_empty() {
+                    break failed;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(failed.len(), 1);
+        assert_eq!(failed[0].index, 0);
+        assert_eq!(pool.live_count(), 0);
+        assert!(pool.drain_background_updates().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn background_delivery_claims_exact_session_when_scope_is_forked() {
+        let scope = SessionScope::Conversation {
+            channel_id: Uuid::new_v4(),
+        };
+        let first = idle_agent_with_session(scope.clone()).await;
+        let mut second = idle_agent_with_session(scope.clone()).await;
+        second.index = 1;
+        second
+            .state
+            .sessions
+            .insert(scope, "background-origin".into());
+        let mut pool = AgentPool::from_slots(vec![Some(first), Some(second)]);
+        assert_eq!(
+            pool.try_claim_session("background-origin").unwrap().index,
+            1
+        );
+        assert_eq!(pool.try_claim_session("sess").unwrap().index, 0);
+        assert!(pool.try_claim_session("missing").is_none());
     }
 
     // `hold_decision` is gated on the scope variant (not session policy),

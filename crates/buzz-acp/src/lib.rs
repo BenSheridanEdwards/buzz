@@ -2,6 +2,7 @@
 
 mod acp;
 mod attachments;
+mod background_recovery;
 mod background_routes;
 mod blossom;
 mod config;
@@ -3388,7 +3389,17 @@ async fn tokio_main() -> Result<()> {
             }
         }
 
-        pool.drain_background_updates().await;
+        for agent in pool.drain_background_updates().await {
+            let index = agent.index;
+            spawn_respawn_task(
+                agent,
+                &config,
+                &mut crash_history[index],
+                &respawn_tx,
+                &mut respawn_tasks,
+                observer.clone(),
+            );
+        }
 
         // Borrow result_rx and join_set simultaneously via split-borrow helper.
         let pool_event: Option<PoolEvent> = {
@@ -5590,9 +5601,21 @@ fn dispatch_delivery_turns(
     config: &config::Config,
     subscribed: &HashSet<Uuid>,
 ) {
-    for origin in pending_delivery_origins(config) {
+    let pending: HashSet<String> = pending_delivery_origins(config).into_iter().collect();
+    if let Ok(mut retries) = pool.recovery_retries.lock() {
+        retries.retain_pending(&pending);
+    }
+    for origin in pending {
         let live = pool.find_scope_for_session(&origin);
         let recovering = live.is_none();
+        if recovering
+            && !pool
+                .recovery_retries
+                .lock()
+                .is_ok_and(|retries| retries.ready(&origin, &tokio::time::Instant::now()))
+        {
+            continue;
+        }
         let route = live.or_else(|| {
             let route = background_routes::load(ctx.background_routes_dir.as_ref()?, &origin)?;
             Some((route.scope, route.trigger))
@@ -5613,7 +5636,7 @@ fn dispatch_delivery_turns(
                 }
             })
         } else {
-            pool.try_claim_owner_only(&scope)
+            pool.try_claim_session(&origin)
         };
         let Some(mut agent) = claimed else {
             continue;
@@ -5643,16 +5666,29 @@ fn dispatch_delivery_turns(
         let turn_id = Uuid::new_v4().to_string();
         let task_turn_id = turn_id.clone();
         let delivery_scope = scope.clone();
+        let recovery_retries = Arc::clone(&pool.recovery_retries);
         let abort_handle = pool.join_set.spawn(async move {
+            let mut saved_state = None;
             if recovering {
                 agent.acp.set_observer_context(observer::context_for(Some(channel_id), Some(origin.clone()), None));
                 if let Err(error) = agent.acp.session_load(&origin, &ctx_clone.cwd, ctx_clone.mcp_servers.clone()).await {
-                    tracing::error!(%error, %origin, "background session recovery failed; result remains pending");
+                    let notice = recovery_retries.lock().map(|mut retries| retries.fail(&origin, tokio::time::Instant::now()))
+                        .unwrap_or_else(|_| "Recovery retry state unavailable; result remains pending.".into());
+                    tracing::error!(%error, %origin, %notice, "background session recovery failed; result remains pending");
+                    agent.acp.observe("turn_error", serde_json::json!({
+                        "outcome": "background_recovery_failed", "error": format!("{error}. {notice}")
+                    }));
                     let _ = result_tx.send(PromptResult {
                         agent, source: PromptSource::Channel(delivery_scope), turn_id: task_turn_id,
                         outcome: PromptOutcome::Error(error), batch: None,
                     });
                     return;
+                }
+                if let Ok(mut retries) = recovery_retries.lock() {
+                    retries.clear(&origin);
+                }
+                if agent.state.sessions.contains_key(&delivery_scope) {
+                    saved_state = Some(std::mem::take(&mut agent.state));
                 }
                 agent.state.sessions.insert(delivery_scope.clone(), origin);
                 agent.state.last_trigger.insert(delivery_scope.clone(), batch.events[0].event.clone());
@@ -5660,16 +5696,25 @@ fn dispatch_delivery_turns(
                     standing_context_sent: true, ..Default::default()
                 });
             }
+            // Recovery must not replace a newer conversational session. Keep
+            // the delivery's result local until its temporary state is restored.
+            let (delivery_tx, mut delivery_rx) = mpsc::unbounded_channel();
             pool::run_prompt_task(
                 agent,
                 Some(batch),
                 Some(DELIVERY_PROMPT.to_string()),
                 ctx_clone,
-                result_tx,
+                delivery_tx,
                 None,
                 task_turn_id,
             )
             .await;
+            if let Some(mut result) = delivery_rx.recv().await {
+                if let Some(state) = saved_state {
+                    result.agent.state = state;
+                }
+                let _ = result_tx.send(result);
+            }
         });
         pool.task_map_mut().insert(
             abort_handle.id(),
@@ -5948,7 +5993,7 @@ fn default_heartbeat_prompt() -> String {
 ///
 /// Returns `true` if a respawn task was spawned, `false` if the circuit is open.
 fn spawn_respawn_task(
-    old_agent: OwnedAgent,
+    mut old_agent: OwnedAgent,
     config: &Config,
     slot: &mut SlotCircuit,
     respawn_tx: &mpsc::Sender<RespawnResult>,
@@ -5956,6 +6001,21 @@ fn spawn_respawn_task(
     observer: Option<observer::ObserverHandle>,
 ) -> bool {
     let index = old_agent.index;
+    let contexts = old_agent
+        .state
+        .sessions
+        .iter()
+        .map(|(scope, sid)| {
+            (
+                sid.clone(),
+                observer::context_for(Some(scope.channel_id()), Some(sid.clone()), None),
+            )
+        })
+        .collect();
+    old_agent.acp.observe_stream_closed(
+        &contexts,
+        "Agent runtime stopped after a failure; its unfinished workers did not complete.",
+    );
 
     // Circuit breaker: record crash, decide whether to respawn.
     let delay = match slot.record_crash() {
@@ -9896,7 +9956,7 @@ mod error_outcome_emission_tests {
     use nostr::{EventBuilder, Keys, Kind};
     use std::collections::HashSet;
 
-    fn test_config() -> Config {
+    pub(crate) fn test_config() -> Config {
         Config {
             keys: nostr::Keys::generate(),
             relay_url: "ws://localhost:3000".into(),
