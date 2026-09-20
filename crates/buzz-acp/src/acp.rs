@@ -3525,6 +3525,7 @@ mod tests {
     /// runs. That is safe only because no other test in this crate reads
     /// `HERMES_HOME` or `HERMES_ACP_SKIP_CONFIGURED_MCP`. Anything new that
     /// does must take this lock too — it is not a process-wide env lock.
+    #[cfg(unix)]
     static HERMES_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
     /// Remove the Hermes env layering keys from this process for the lifetime
