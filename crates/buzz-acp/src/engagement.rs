@@ -34,11 +34,11 @@ pub fn engaged_roots_from_history(
 ) -> HashMap<Uuid, VecDeque<String>> {
     let mut posts: Vec<(u64, Uuid, String)> = events
         .iter()
-        .filter_map(|event| thread_of(event))
+        .filter_map(thread_of)
         .filter(|(_, channel, _)| subscribed.contains(channel))
         .collect();
     // Newest first, so the per-channel cap keeps the threads that matter.
-    posts.sort_by(|a, b| b.0.cmp(&a.0));
+    posts.sort_by_key(|post| std::cmp::Reverse(post.0));
     let mut out: HashMap<Uuid, VecDeque<String>> = HashMap::new();
     for (_, channel, root) in posts {
         let set = out.entry(channel).or_default();
@@ -96,7 +96,11 @@ pub async fn seed_engaged_threads(
         .query_raw_all(filter)
         .await
         .map_err(|e| e.to_string())?;
-    Ok(engaged_roots_from_history(&events, subscribed, max_per_channel))
+    Ok(engaged_roots_from_history(
+        &events,
+        subscribed,
+        max_per_channel,
+    ))
 }
 
 #[cfg(test)]
@@ -121,7 +125,12 @@ mod tests {
         let events = vec![
             post(0xaa, 100, &channel.to_string(), &[(ROOT, "reply")]),
             post(0xbb, 200, &channel.to_string(), &[]),
-            post(0xcc, 300, &channel.to_string(), &[(OTHER, "root"), (ROOT, "reply")]),
+            post(
+                0xcc,
+                300,
+                &channel.to_string(),
+                &[(OTHER, "root"), (ROOT, "reply")],
+            ),
         ];
         let roots = engaged_roots_from_history(&events, &HashSet::from([channel]), 16);
         let set: Vec<String> = roots[&channel].iter().cloned().collect();

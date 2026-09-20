@@ -288,7 +288,7 @@ pub fn extract_media_refs(text: &str) -> MediaRefs {
             // path and a symlink to it) are two references, and the second
             // earns a note in `resolve_outbound_files`.
             if let Some(path) = media_path_from_segment(after) {
-                if is_absolute_or_home(&path) && !refs.paths.iter().any(|p| *p == path) {
+                if is_absolute_or_home(&path) && !refs.paths.contains(&path) {
                     refs.paths.push(path);
                 }
             }
@@ -529,7 +529,9 @@ pub fn locate_named_file(path: &Path, roots: &OutboundRoots) -> Result<PathBuf, 
         let candidate = Path::new(candidate);
         if let Ok(meta) = std::fs::symlink_metadata(candidate) {
             if meta.is_dir() {
-                return Err("skipped: is a directory; name a file inside it or zip it first".into());
+                return Err(
+                    "skipped: is a directory; name a file inside it or zip it first".into(),
+                );
             }
             return Ok(candidate.to_path_buf());
         }
@@ -2084,7 +2086,10 @@ mod tests {
         );
         assert_eq!(
             extract_media_paths("MEDIA:\"/out/My Deck.pptx\" and MEDIA:`/out/notes final`."),
-            vec!["/out/My Deck.pptx".to_string(), "/out/notes final".to_string()],
+            vec![
+                "/out/My Deck.pptx".to_string(),
+                "/out/notes final".to_string()
+            ],
             "quotes and backticks delimit the path exactly"
         );
         assert_eq!(
@@ -2113,22 +2118,40 @@ mod tests {
             home: None,
         };
 
-        assert_eq!(locate_named_file(&root.join("report.pdf"), &roots).unwrap(), root.join("report.pdf"));
+        assert_eq!(
+            locate_named_file(&root.join("report.pdf"), &roots).unwrap(),
+            root.join("report.pdf")
+        );
         assert_eq!(
             locate_named_file(&root.join("report"), &roots).unwrap(),
             root.join("report.pdf"),
             "an extensionless name resolves to its single sibling"
         );
         assert_eq!(
-            locate_named_file(&PathBuf::from(format!("{} is attached above", root.join("report").display())), &roots).unwrap(),
+            locate_named_file(
+                &PathBuf::from(format!(
+                    "{} is attached above",
+                    root.join("report").display()
+                )),
+                &roots
+            )
+            .unwrap(),
             root.join("report.pdf"),
             "prose after the path is narrowed away"
         );
-        assert_eq!(locate_named_file(&root.join("plain"), &roots).unwrap(), root.join("plain"));
+        assert_eq!(
+            locate_named_file(&root.join("plain"), &roots).unwrap(),
+            root.join("plain")
+        );
         let ambiguous = locate_named_file(&root.join("shot"), &roots).unwrap_err();
         assert!(ambiguous.contains("shot.html, shot.png"), "{ambiguous}");
-        assert!(locate_named_file(&root.join("folder"), &roots).unwrap_err().contains("directory"));
-        assert_eq!(locate_named_file(&root.join("missing"), &roots).unwrap_err(), "skipped: no such file");
+        assert!(locate_named_file(&root.join("folder"), &roots)
+            .unwrap_err()
+            .contains("directory"));
+        assert_eq!(
+            locate_named_file(&root.join("missing"), &roots).unwrap_err(),
+            "skipped: no such file"
+        );
         let elsewhere = temp_root();
         std::fs::write(elsewhere.join("secret.pdf"), b"%PDF").unwrap();
         let outside = locate_named_file(&elsewhere.join("secret"), &roots).unwrap_err();
@@ -2138,7 +2161,10 @@ mod tests {
         );
 
         assert_eq!(sniff_mime(&root.join("shot.png")), Some("image/png"));
-        assert_eq!(sniff_mime(&root.join("report.pdf")), Some("application/pdf"));
+        assert_eq!(
+            sniff_mime(&root.join("report.pdf")),
+            Some("application/pdf")
+        );
         assert_eq!(sniff_mime(&root.join("shot.html")), Some("text/html"));
         assert_eq!(sniff_mime(&root.join("plain")), Some("text/plain"));
         std::fs::write(root.join("bin"), [0u8, 1, 2, 3]).unwrap();
