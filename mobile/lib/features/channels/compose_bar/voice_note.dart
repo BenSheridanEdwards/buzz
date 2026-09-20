@@ -93,18 +93,20 @@ _ComposerVoiceNote _useComposerVoiceNote({
       case VoiceNoteRecorderPhase.finishing when isPreparing.value:
         // Diagnostic for the on-device keyboard-race report; debug builds only.
         assert(() {
-          debugPrint('[voice] compose-bar guard fired: finishing while '
-              'isPreparing=true, isRecording=${isRecording.value}');
+          debugPrint(
+            '[voice] compose-bar guard fired: finishing while '
+            'isPreparing=true, isRecording=${isRecording.value}',
+          );
           return true;
         }());
-        // Released while the start was still deferred behind the keyboard, so
-        // the recorder never mounted and nothing was captured: say why
-        // instead of vanishing. Gated on isPreparing, not !isRecording: once
-        // the recorder has mounted it owns the capture and decides whether a
-        // take is too short (voice_note_composer_recorder.finish). A bare
-        // !isRecording fired this on a real recording whose flag had already
-        // cleared, showing a false "needs at least one second" and resetting
-        // the phase out from under a genuine 5-second note (keyboard-up path).
+      // Released while the start was still deferred behind the keyboard, so
+      // the recorder never mounted and nothing was captured: say why
+      // instead of vanishing. Gated on isPreparing, not !isRecording: once
+      // the recorder has mounted it owns the capture and decides whether a
+      // take is too short (voice_note_composer_recorder.finish). A bare
+      // !isRecording fired this on a real recording whose flag had already
+      // cleared, showing a false "needs at least one second" and resetting
+      // the phase out from under a genuine 5-second note (keyboard-up path).
       case VoiceNoteRecorderPhase.holding:
       case VoiceNoteRecorderPhase.locked:
       case VoiceNoteRecorderPhase.paused:
