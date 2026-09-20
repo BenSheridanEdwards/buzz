@@ -68,8 +68,8 @@ export function sanitizePublishedTranscript(text) {
   // Strip C0/C1 controls and the bidirectional overrides that can visually
   // reverse a sentence, then collapse the remaining whitespace.
   const stripped = text
-    // biome-ignore lint/suspicious/noControlCharactersInRegex: intentionally strip control characters before rendering
     .replace(
+      // biome-ignore lint/suspicious/noControlCharactersInRegex: intentionally strip control characters before rendering
       /[\u0000-\u001f\u007f-\u009f\u200e\u200f\u202a-\u202e\u2066-\u2069]/g,
       " ",
     )

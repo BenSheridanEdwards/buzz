@@ -9,7 +9,13 @@ export function scopeByChannel<T extends { channelId?: string | null }>(
   channelId: string | null | undefined,
 ): T[] {
   if (!channelId) return items as T[];
-  return items.filter((item) => item.channelId === channelId);
+  return items.filter(
+    (item) =>
+      item.channelId === channelId ||
+      (item.channelId == null &&
+        "kind" in item &&
+        item.kind === "agent_stream_closed"),
+  );
 }
 
 /**

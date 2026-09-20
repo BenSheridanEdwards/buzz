@@ -27,6 +27,7 @@ import {
   parsePromptBlocks,
   parseSystemPromptSections,
 } from "./agentSessionTranscriptHelpers";
+import { retiredToolUpdates } from "./agentSessionToolRetirement";
 import { friendlyTurnErrorCopy } from "../lib/friendlyAgentLastError";
 
 export { describeRawEvent } from "./agentSessionTranscriptHelpers";
@@ -278,6 +279,7 @@ function rawPayloadTitle(payload: unknown) {
 }
 
 type TranscriptItemContext = {
+  agentIndex?: number | null;
   channelId: string | null;
   turnId: string | null;
   sessionId: string | null;
@@ -651,6 +653,7 @@ function upsertTool(
       toolName: updatedToolName,
       buzzToolName: updatedBuzzToolName,
       status: mergedStatus,
+      agentIndex: ctx.agentIndex ?? existing.agentIndex,
       args: updatedArgs,
       result: updatedResult,
       isError: updatedIsError,
@@ -684,6 +687,7 @@ function upsertTool(
     toolName: resolvedToolName,
     buzzToolName: canonicalBuzzToolName,
     status,
+    agentIndex: ctx.agentIndex,
     args,
     result,
     isError,
@@ -710,12 +714,17 @@ export function processTranscriptEvent(
   const channelId = event.channelId ?? null;
   const ch = channelId ?? "global";
   const ctx: TranscriptItemContext = {
+    agentIndex: event.agentIndex,
     channelId,
     turnId: event.turnId,
     sessionId: event.sessionId ?? d.latestSessionId,
   };
 
-  if (event.kind === "raw_json_rpc") {
+  if (event.kind === "agent_stream_closed") {
+    for (const item of retiredToolUpdates(d.items, event)) {
+      replaceItem(d, item.id, item);
+    }
+  } else if (event.kind === "raw_json_rpc") {
     upsertMetadata(
       d,
       `raw-json-rpc:${ch}:${event.seq}`,
