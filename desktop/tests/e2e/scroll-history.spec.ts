@@ -1339,6 +1339,12 @@ test("fast middle-page scroll settles with continuous mounted coverage", async (
   // stop. The final evaluate emits the last scroll event; all coverage samples
   // after it are passive observations.
   await timeline.evaluate((element) => {
+    // A real trackpad gesture retires automatic bottom-following. Geometry-only
+    // scroll assignments do not express reader intent and can be repinned by a
+    // late row measurement, leaving this test observing the seeded tail instead.
+    element.dispatchEvent(
+      new WheelEvent("wheel", { deltaY: -400, bubbles: true }),
+    );
     const maxOffset = element.scrollHeight - element.clientHeight;
     for (const fraction of [0.72, 0.28, 0.64, 0.36, 0.58, 0.44, 0.52]) {
       element.scrollTop = maxOffset * fraction;
@@ -1373,6 +1379,11 @@ test("fast middle-page scroll settles with continuous mounted coverage", async (
   // the stale-range failure leaves a viewport-scale hole. Check repeatedly
   // while idle so a transient good frame cannot mask a stuck blank range.
   for (let sample = 0; sample < 5; sample += 1) {
+    const metrics = await getTimelineMetrics(page);
+    const relativeOffset =
+      metrics.scrollTop / (metrics.scrollHeight - metrics.clientHeight);
+    expect(relativeOffset).toBeGreaterThan(0.45);
+    expect(relativeOffset).toBeLessThan(0.6);
     expect(await viewportCoverage()).toBeLessThan(100);
     await page.waitForTimeout(100);
   }
