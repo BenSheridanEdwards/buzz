@@ -75,7 +75,7 @@ function emitMockMessage(
             content: string;
             extraTags?: string[][];
             parentEventId?: string;
-          }) => unknown;
+          }) => { id: string };
         }
       ).__BUZZ_E2E_EMIT_MOCK_MESSAGE__;
       if (!emit) {
@@ -895,18 +895,25 @@ test("inline video hover reveals a timeline without a second play control", asyn
     )
     .toBe("50%");
 
-  const restingControlsBox = await controls.boundingBox();
+  // Hover may scroll the timeline to make the video actionable. Measure
+  // anchoring within the player, not its changing viewport position.
+  const controlsOffset = () =>
+    controls.evaluate((element) => {
+      const player = element.closest('[data-testid="video-player"]');
+      if (!player) throw new Error("Video controls must belong to a player");
+      return (
+        element.getBoundingClientRect().y - player.getBoundingClientRect().y
+      );
+    });
+  const restingControlsOffset = await controlsOffset();
   const restingIconTransform = await centerIcon.evaluate(
     (element) => window.getComputedStyle(element).transform,
   );
-  expect(restingControlsBox).not.toBeNull();
   await expect(controls).toHaveCSS("opacity", "0");
   await surface.hover();
   await expect(controls).toHaveCSS("opacity", "1");
-  const hoveredControlsBox = await controls.boundingBox();
-  expect(hoveredControlsBox).not.toBeNull();
   expect(
-    Math.abs((hoveredControlsBox?.y ?? 0) - (restingControlsBox?.y ?? 0)),
+    Math.abs((await controlsOffset()) - restingControlsOffset),
   ).toBeLessThan(0.5);
   await expect
     .poll(() =>
@@ -1466,6 +1473,20 @@ function emitVideoMessage(
   });
 }
 
+async function findEmittedVideo(page: Page, emitted: { id: string }) {
+  const player = page
+    .locator(`[data-message-id="${emitted.id}"]`)
+    .getByTestId("video-player");
+  // Interacting with the previous player can leave the timeline off-tail.
+  // Follow its real new-message affordance before expecting the next row.
+  await expect(async () => {
+    const latest = page.getByTestId("message-scroll-to-latest");
+    if (await latest.isVisible()) await latest.click();
+    await expect(player).toBeVisible({ timeout: 500 });
+  }).toPass({ timeout: 5000 });
+  return player;
+}
+
 test("right-click menus expose distinct selectors for links, relay video, and off-relay video", async ({
   page,
 }) => {
@@ -1513,13 +1534,12 @@ test("right-click menus expose distinct selectors for links, relay video, and of
 
   // ── Relay video menu: Download video + Copy link, appearing only once the
   // relay origin resolves (the reactivity fix) ─────────────────────────────
-  await emitVideoMessage(page, {
+  const relayMessage = await emitVideoMessage(page, {
     url: MENU_RELAY_VIDEO_URL,
     sha: MENU_RELAY_VIDEO_SHA,
     filename: "relay-clip.mp4",
   });
-  const relayPlayer = page.getByTestId("video-player").last();
-  await expect(relayPlayer).toBeVisible();
+  const relayPlayer = await findEmittedVideo(page, relayMessage);
   // Right-click the player surface. `force` skips the actionability guard: the
   // Play-button overlay sits above the video, but the contextmenu event still
   // capture-bubbles to the surface handler that opens the menu.
@@ -1559,13 +1579,12 @@ test("right-click menus expose distinct selectors for links, relay video, and of
   await expect(page.locator("[data-video-context-menu]")).toHaveCount(0);
 
   // ── Off-relay video control: renders and offers Copy link, never Download ─
-  await emitVideoMessage(page, {
+  const offRelayMessage = await emitVideoMessage(page, {
     url: MENU_OFF_RELAY_VIDEO_URL,
     sha: MENU_OFF_RELAY_VIDEO_SHA,
     filename: "external-clip.mp4",
   });
-  const offRelayPlayer = page.getByTestId("video-player").last();
-  await expect(offRelayPlayer).toBeVisible();
+  const offRelayPlayer = await findEmittedVideo(page, offRelayMessage);
   await offRelayPlayer.click({ button: "right", force: true });
 
   const offRelayMenu = page.locator("[data-video-context-menu]");
@@ -1611,10 +1630,7 @@ test("playback speed persists across videos and reloads", async ({ page }) => {
         ],
       },
     )) as { id: string };
-    const player = page
-      .locator(`[data-message-id="${emitted.id}"]`)
-      .getByTestId("video-player");
-    await expect(player).toBeVisible();
+    const player = await findEmittedVideo(page, emitted);
     await player.getByRole("button", { name: "Play video" }).click();
     return player;
   };
