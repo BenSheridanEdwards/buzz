@@ -8,7 +8,7 @@
 //! 4. [`AcpClient::session_prompt_with_idle_timeout`] — send prompt with idle/hard deadline, return stop reason
 //! 5. [`AcpClient::session_cancel`] / [`AcpClient::cancel_with_cleanup`] — cancel in-flight turn
 
-use futures_util::StreamExt;
+use futures_util::{FutureExt, StreamExt};
 use tokio::io::AsyncWriteExt;
 use tokio::process::{Child, ChildStdin, ChildStdout};
 use tokio_util::codec::{FramedRead, LinesCodec, LinesCodecError};
@@ -174,6 +174,12 @@ pub struct AcpClient {
     observer_agent_index: Option<usize>,
     /// Best-effort context attached to raw ACP wire events.
     observer_context: ObserverContext,
+    session_observer_contexts: std::collections::HashMap<String, ObserverContext>,
+    session_observer_order: std::collections::VecDeque<String>,
+    // Channel membership bounds this independently of provider session rotation.
+    observer_channels: std::collections::HashSet<String>,
+    background_routes_dir: Option<std::path::PathBuf>,
+    stream_closed_observed: bool,
     /// Most recently observed `_meta.goose.activeRunId` from a
     /// `session/update` notification of kind `session_info_update`.
     ///
@@ -426,6 +432,10 @@ impl AcpClient {
     /// Call this when you need guaranteed cleanup — e.g., in `run_models`
     /// before process exit.
     pub async fn shutdown(&mut self) {
+        self.observe_stream_closed(
+            &Default::default(),
+            "Agent runtime stopped before its unfinished workers completed.",
+        );
         // Kill the entire process group when possible. The child was spawned
         // with process_group(0), so its PID == its PGID. Killing the group
         // ensures subprocesses (MCP servers, tool processes) are cleaned up
@@ -578,6 +588,11 @@ impl AcpClient {
             observer: None,
             observer_agent_index: None,
             observer_context: ObserverContext::default(),
+            session_observer_contexts: Default::default(),
+            session_observer_order: Default::default(),
+            observer_channels: Default::default(),
+            background_routes_dir: None,
+            stream_closed_observed: false,
             active_run_id: None,
             steering_supported: false,
             steer_rx: None,
@@ -596,6 +611,24 @@ impl AcpClient {
 
     /// Update metadata that will be attached to subsequent raw wire events.
     pub fn set_observer_context(&mut self, context: ObserverContext) {
+        if let Some(channel) = &context.channel_id {
+            self.observer_channels.insert(channel.clone());
+        }
+        if let Some(sid) = &context.session_id {
+            let mut background = context.clone();
+            background.turn_id = None;
+            background.started_at = None;
+            if !self.session_observer_contexts.contains_key(sid) {
+                self.session_observer_order.push_back(sid.clone());
+                if self.session_observer_order.len() > 256 {
+                    if let Some(old) = self.session_observer_order.pop_front() {
+                        self.session_observer_contexts.remove(&old);
+                    }
+                }
+            }
+            self.session_observer_contexts
+                .insert(sid.clone(), background);
+        }
         self.observer_context = context;
     }
 
@@ -623,6 +656,86 @@ impl AcpClient {
                 &self.observer_context,
                 payload,
             );
+        }
+    }
+
+    pub(crate) fn set_background_routes_dir(&mut self, dir: Option<std::path::PathBuf>) {
+        self.background_routes_dir = dir;
+    }
+
+    fn background_observer_context(&self, sid: &str) -> Option<ObserverContext> {
+        self.session_observer_contexts
+            .get(sid)
+            .cloned()
+            .or_else(|| {
+                let route =
+                    crate::background_routes::load(self.background_routes_dir.as_ref()?, sid)?;
+                Some(crate::observer::context_for(
+                    Some(route.scope.channel_id()),
+                    Some(sid.into()),
+                    None,
+                ))
+            })
+    }
+
+    pub(crate) fn observe_stream_closed(
+        &mut self,
+        contexts: &std::collections::HashMap<String, ObserverContext>,
+        error: &str,
+    ) {
+        if self.stream_closed_observed {
+            return;
+        }
+        self.stream_closed_observed = true;
+        let Some(observer) = &self.observer else {
+            return;
+        };
+        // Authoritative process retirement also covers quiet workers whose
+        // old session has aged out of the bounded context cache. Observer seq
+        // orders this before any replacement process can emit new tool calls.
+        observer.emit(
+            "agent_stream_closed",
+            self.observer_agent_index,
+            &ObserverContext::default(),
+            serde_json::json!({"error": error, "processClosed": true, "sessionIds": []}),
+        );
+        let mut all = self.session_observer_contexts.clone();
+        all.extend(contexts.clone());
+        let mut channels = self.observer_channels.clone();
+        channels.extend(
+            all.values()
+                .filter_map(|context| context.channel_id.clone()),
+        );
+        for channel in channels {
+            observer.emit(
+                "agent_stream_closed",
+                self.observer_agent_index,
+                &ObserverContext {
+                    channel_id: Some(channel),
+                    ..Default::default()
+                },
+                serde_json::json!({"error": error, "processClosed": true, "sessionIds": []}),
+            );
+        }
+        for (sid, context) in all {
+            observer.emit(
+                "agent_stream_closed",
+                self.observer_agent_index,
+                &context,
+                serde_json::json!({"error": error, "sessionIds": [sid]}),
+            );
+        }
+    }
+
+    fn observe_wire(&self, msg: &serde_json::Value) {
+        let sid = msg.pointer("/params/sessionId").and_then(|v| v.as_str());
+        if sid.is_none() || sid == self.observer_context.session_id.as_deref() {
+            self.observe("acp_read", msg.clone());
+        } else if let (Some(observer), Some(context)) = (
+            &self.observer,
+            sid.and_then(|sid| self.background_observer_context(sid)),
+        ) {
+            observer.emit("acp_read", self.observer_agent_index, &context, msg.clone());
         }
     }
 
@@ -654,6 +767,72 @@ impl AcpClient {
             "methodId": method_id,
         });
         self.send_request("authenticate", params).await
+    }
+
+    /// Restore the original Hermes session before delivering its background result.
+    pub async fn session_load(
+        &mut self,
+        session_id: &str,
+        cwd: &str,
+        mcp_servers: Vec<McpServer>,
+    ) -> Result<(), AcpError> {
+        self.send_request(
+            "session/load",
+            serde_json::json!({
+                "sessionId": session_id, "cwd": cwd, "mcpServers": mcp_servers,
+            }),
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// Consume only immediately available notifications while no request is in flight.
+    /// FramedRead retains partial lines across polls; the cap prevents a noisy worker
+    /// from starving relay input. Route by the notification's session, never the last turn.
+    pub async fn drain_idle_updates(
+        &mut self,
+        contexts: &std::collections::HashMap<String, ObserverContext>,
+    ) -> Result<(), AcpError> {
+        for _ in 0..128 {
+            let Some(line) = self.reader.next().now_or_never() else {
+                break;
+            };
+            let Some(line) = line else {
+                return Err(AcpError::AgentExited);
+            };
+            let line = line.map_err(|e| AcpError::Protocol(e.to_string()))?;
+            let Ok(msg) = serde_json::from_str::<serde_json::Value>(&line) else {
+                continue;
+            };
+            if let Some(sid) = msg.pointer("/params/sessionId").and_then(|v| v.as_str()) {
+                if let (Some(observer), Some(context)) = (
+                    &self.observer,
+                    contexts
+                        .get(sid)
+                        .cloned()
+                        .or_else(|| self.background_observer_context(sid)),
+                ) {
+                    observer.emit("acp_read", self.observer_agent_index, &context, msg.clone());
+                }
+            }
+            match msg.get("method").and_then(|v| v.as_str()) {
+                Some("session/update") => {
+                    self.handle_session_update(&msg);
+                }
+                Some("session/request_permission") => {
+                    self.handle_permission_request(&msg).await?;
+                }
+                Some(method) if msg.get("id").is_some() => {
+                    self.write_ndjson(&serde_json::json!({
+                        "jsonrpc": "2.0", "id": msg["id"],
+                        "error": {"code": -32601, "message": format!("Method not found: {method}")}
+                    }))
+                    .await?;
+                }
+                _ => {}
+            }
+        }
+        Ok(())
     }
 
     /// Send `session/new` and return the full response alongside the session ID.
@@ -1303,7 +1482,7 @@ impl AcpClient {
                     continue;
                 }
             };
-            self.observe("acp_read", msg.clone());
+            self.observe_wire(&msg);
 
             // Check if this is a response to our expected request (has matching id
             // AND no `method` field — a `method` field means it's an agent-initiated
@@ -1626,7 +1805,7 @@ impl AcpClient {
                             continue;
                         }
                     };
-                    self.observe("acp_read", msg.clone());
+                    self.observe_wire(&msg);
 
                     let activity_now = Instant::now();
                     idle_deadline = activity_now + idle_timeout;
@@ -1815,6 +1994,18 @@ impl AcpClient {
     /// leave it `None` and are steered via `_session/steering` instead, which
     /// needs no run id.
     fn handle_session_update(&mut self, msg: &serde_json::Value) -> bool {
+        // Updates from a previous session's workers must not mutate the
+        // current turn's media, steering run id, or usage accounting.
+        if let Some(sid) = msg.pointer("/params/sessionId").and_then(|v| v.as_str()) {
+            if self
+                .observer_context
+                .session_id
+                .as_deref()
+                .is_some_and(|active| active != sid)
+            {
+                return false;
+            }
+        }
         let update = &msg["params"]["update"];
         let update_type = update
             .get("sessionUpdate")
@@ -2456,6 +2647,12 @@ pub fn model_in_catalog(
 
 impl Drop for AcpClient {
     fn drop(&mut self) {
+        // Includes panic/abort and circuit-open retirement paths. This only
+        // emits once, before any replacement slot can produce new progress.
+        self.observe_stream_closed(
+            &Default::default(),
+            "Agent runtime stopped before its unfinished workers completed.",
+        );
         // Best-effort SIGKILL + reap. We cannot `await` in Drop (sync context).
         // Kill the process group when possible so subprocesses don't leak.
         // Callers SHOULD still call `shutdown().await` for guaranteed reaping.
@@ -3328,6 +3525,7 @@ mod tests {
     /// runs. That is safe only because no other test in this crate reads
     /// `HERMES_HOME` or `HERMES_ACP_SKIP_CONFIGURED_MCP`. Anything new that
     /// does must take this lock too — it is not a process-wide env lock.
+    #[cfg(unix)]
     static HERMES_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
     /// Remove the Hermes env layering keys from this process for the lifetime
@@ -5439,6 +5637,188 @@ mod tests {
         assert!(
             msg.contains("sandbox_workspace_write"),
             "error must mention sandbox_workspace_write"
+        );
+    }
+}
+
+#[cfg(test)]
+mod background_delivery_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn background_context_cache_is_bounded_with_durable_fallback() {
+        let tmp = tempfile::tempdir().unwrap();
+        let scope = crate::scope::SessionScope::Conversation {
+            channel_id: uuid::Uuid::new_v4(),
+        };
+        let trigger = nostr::EventBuilder::text_note("work")
+            .sign_with_keys(&nostr::Keys::generate())
+            .unwrap();
+        crate::background_routes::save(tmp.path(), "old-origin", &scope, &trigger).unwrap();
+        let mut client = AcpClient::spawn("cat", &[], &[], false).await.unwrap();
+        client.set_background_routes_dir(Some(tmp.path().to_path_buf()));
+        client.set_observer_context(crate::observer::context_for(
+            Some(scope.channel_id()),
+            Some("old-origin".into()),
+            None,
+        ));
+        for index in 0..300 {
+            client.set_observer_context(crate::observer::context_for(
+                None,
+                Some(format!("new-{index}")),
+                None,
+            ));
+        }
+        assert_eq!(client.session_observer_contexts.len(), 256);
+        assert_eq!(client.session_observer_order.len(), 256);
+        assert!(!client.session_observer_contexts.contains_key("old-origin"));
+        let restored = client.background_observer_context("old-origin").unwrap();
+        assert_eq!(restored.channel_id, Some(scope.channel_id().to_string()));
+        assert_eq!(restored.session_id.as_deref(), Some("old-origin"));
+        assert!(restored.turn_id.is_none());
+        let observer = ObserverHandle::in_process();
+        client.set_observer(Some(observer.clone()), 0);
+        client.observe_stream_closed(&Default::default(), "process died");
+        client.observe_stream_closed(&Default::default(), "duplicate retirement");
+        let global: Vec<_> = observer
+            .snapshot()
+            .into_iter()
+            .filter(|event| {
+                event.kind == "agent_stream_closed"
+                    && event.channel_id.is_none()
+                    && event.session_id.is_none()
+            })
+            .collect();
+        assert_eq!(
+            global.len(),
+            1,
+            "one authoritative global closure covers evicted quiet sessions"
+        );
+        assert_eq!(global[0].payload["processClosed"], true);
+        assert_eq!(global[0].agent_index, Some(0));
+        assert!(
+            observer
+                .snapshot()
+                .iter()
+                .any(|event| event.kind == "agent_stream_closed"
+                    && event.channel_id.as_deref()
+                        == Some(scope.channel_id().to_string().as_str())
+                    && event.session_id.is_none()
+                    && event.payload["processClosed"] == true),
+            "archive must receive channel-wide closure even after its origin session is evicted"
+        );
+    }
+
+    #[tokio::test]
+    async fn background_progress_during_another_prompt_keeps_original_context() {
+        let script = r#"
+            read -t 5 request
+            echo '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"origin","update":{"sessionUpdate":"tool_call_update","toolCallId":"subagent-child","status":"failed"}}}'
+            echo '{"jsonrpc":"2.0","id":0,"result":{"stopReason":"end_turn"}}'
+            read -t 5 request
+        "#;
+        let mut client = AcpClient::spawn("bash", &["-c".into(), script.into()], &[], false)
+            .await
+            .unwrap();
+        let observer = ObserverHandle::in_process();
+        client.set_observer(Some(observer.clone()), 0);
+        let original_channel = uuid::Uuid::new_v4();
+        client.set_observer_context(crate::observer::context_for(
+            Some(original_channel),
+            Some("origin".into()),
+            Some("old-turn".into()),
+        ));
+        client.set_observer_context(crate::observer::context_for(
+            Some(uuid::Uuid::new_v4()),
+            Some("other".into()),
+            Some("new-turn".into()),
+        ));
+        client
+            .session_prompt_with_idle_timeout(
+                "other",
+                "go",
+                std::time::Duration::from_secs(5),
+                std::time::Duration::from_secs(5),
+            )
+            .await
+            .unwrap();
+        let event = observer
+            .snapshot()
+            .into_iter()
+            .find(|event| {
+                event
+                    .payload
+                    .pointer("/params/update/status")
+                    .and_then(|v| v.as_str())
+                    == Some("failed")
+            })
+            .unwrap();
+        assert_eq!(event.channel_id, Some(original_channel.to_string()));
+        assert_eq!(event.session_id.as_deref(), Some("origin"));
+        assert!(event.turn_id.is_none());
+    }
+
+    #[tokio::test]
+    async fn progress_after_parent_response_is_read_without_another_prompt() {
+        let script = r#"
+            read -t 5 request
+            echo '{"jsonrpc":"2.0","id":0,"result":{"stopReason":"end_turn"}}'
+            echo '{"jsonrpc":"2.0","id":"worker-permission","method":"session/request_permission","params":{"sessionId":"origin","options":[{"kind":"allow_once","optionId":"permit-this-edit"}]}}'
+            read -t 5 permission
+            [[ "$permission" == *'"optionId":"permit-this-edit"'* ]] || exit 2
+            echo '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"origin","update":{"sessionUpdate":"tool_call_update","toolCallId":"subagent-child","status":"failed"}}}'
+            read -t 5 request
+        "#;
+        let mut client = AcpClient::spawn("bash", &["-c".into(), script.into()], &[], false)
+            .await
+            .unwrap();
+        let observer = ObserverHandle::in_process();
+        client.set_observer(Some(observer.clone()), 0);
+        client
+            .session_prompt_with_idle_timeout(
+                "origin",
+                "go",
+                std::time::Duration::from_secs(5),
+                std::time::Duration::from_secs(5),
+            )
+            .await
+            .unwrap();
+        let channel = uuid::Uuid::new_v4();
+        let contexts = std::collections::HashMap::from([(
+            "origin".into(),
+            crate::observer::context_for(Some(channel), Some("origin".into()), None),
+        )]);
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            loop {
+                client.drain_idle_updates(&contexts).await.unwrap();
+                if observer.snapshot().iter().any(|e| {
+                    e.payload
+                        .pointer("/params/update/status")
+                        .and_then(|v| v.as_str())
+                        == Some("failed")
+                }) {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let event = observer
+            .snapshot()
+            .into_iter()
+            .find(|e| {
+                e.payload
+                    .pointer("/params/update/status")
+                    .and_then(|v| v.as_str())
+                    == Some("failed")
+            })
+            .unwrap();
+        assert_eq!(event.channel_id, Some(channel.to_string()));
+        assert_eq!(event.session_id.as_deref(), Some("origin"));
+        assert!(
+            event.turn_id.is_none(),
+            "background work must not impersonate the next parent turn"
         );
     }
 }

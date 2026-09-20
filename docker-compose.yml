@@ -101,7 +101,7 @@ services:
     restart: unless-stopped
 
   minio:
-    image: minio/minio:latest
+    image: quay.io/minio/minio:latest
     container_name: buzz-minio
     command: server /data --console-address ":9001"
     environment:
@@ -130,7 +130,7 @@ services:
     restart: unless-stopped
 
   minio-init:
-    image: minio/mc:latest
+    image: quay.io/minio/mc:latest
     container_name: buzz-minio-init
     depends_on:
       minio:

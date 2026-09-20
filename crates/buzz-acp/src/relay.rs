@@ -2690,6 +2690,9 @@ async fn handle_ws_message(
                         return true;
                     }
                     state.acknowledge_observer_frame(&event_id);
+                    if !accepted {
+                        warn!("relay rejected published event {event_id}: {message}");
+                    }
                     debug!("OK for event {event_id}: accepted={accepted} message={message}");
                 }
             }

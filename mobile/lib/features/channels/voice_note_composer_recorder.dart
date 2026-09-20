@@ -201,10 +201,12 @@ class VoiceNoteComposerRecorder extends HookConsumerWidget {
             final pressedFor = beganAt == null
                 ? Duration.zero
                 : clock.now().difference(beganAt);
-            debugPrint('[voice] recorder rejected take as too short: '
-                'captured=${recording.duration.inMilliseconds}ms '
-                'pressedFor=${pressedFor.inMilliseconds}ms '
-                'beganAt=${beganAt == null ? "null" : "set"}');
+            debugPrint(
+              '[voice] recorder rejected take as too short: '
+              'captured=${recording.duration.inMilliseconds}ms '
+              'pressedFor=${pressedFor.inMilliseconds}ms '
+              'beganAt=${beganAt == null ? "null" : "set"}',
+            );
             return true;
           }());
           unawaited(deleteDroppedVoiceNoteRecording(recording.file.path));

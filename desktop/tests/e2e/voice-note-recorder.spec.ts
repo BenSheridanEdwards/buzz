@@ -1249,19 +1249,28 @@ test("Escape while the note is being prepared does not discard it", async ({
   await expect(liveStatus(page)).toHaveText("Voice note sent");
 });
 
-test("a cancelled press does not lock a recording", async ({ page }) => {
-  await openGeneral(page);
-  await pressMic(page);
-  // Well inside the tap window, so a release here would lock hands free.
-  await page.evaluate(() => {
-    window.dispatchEvent(
-      new PointerEvent("pointercancel", { bubbles: true, pointerId: 1 }),
-    );
+for (const hold of [false, true]) {
+  test(`a cancelled ${hold ? "hold" : "press"} discards without locking or sending`, async ({
+    page,
+  }) => {
+    await openGeneral(page);
+    if (hold) await holdMic(page);
+    else await pressMic(page);
+    // The long hold has enough audio that an accidental finish would send a note.
+    await page.evaluate(() => {
+      for (let attempt = 0; attempt < 2; attempt += 1) {
+        window.dispatchEvent(
+          new PointerEvent("pointercancel", { bubbles: true, pointerId: 1 }),
+        );
+      }
+    });
+    await expect(recorder(page)).toHaveCount(0);
+    await expect(liveStatus(page)).toHaveText("Voice note discarded");
+    expect(await mediaRecorderStops(page)).toBe(1);
+    await page.mouse.up();
+    await page.waitForTimeout(200);
+    await expect(recorder(page)).toHaveCount(0);
+    await expect(sentCards(page)).toHaveCount(0);
+    await expect(page.getByTestId("composer-voice-note-card")).toHaveCount(0);
   });
-  await expect(recorder(page)).toHaveCount(0);
-  await page.mouse.up();
-  await page.waitForTimeout(200);
-  await expect(recorder(page)).toHaveCount(0);
-  await expect(sentCards(page)).toHaveCount(0);
-  await expect(page.getByTestId("composer-voice-note-card")).toHaveCount(0);
-});
+}
