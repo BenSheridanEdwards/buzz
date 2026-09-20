@@ -71,8 +71,8 @@ enum BufferedUploadKind {
 /// Images go first. Audio takes its own validated path only when the
 /// operator has enabled it, on both `/upload` and the legacy `/media/upload`
 /// alias (audio is media). With audio disabled, an MP3 falls through to the
-/// generic path, which rejects recognised audio exactly as before the
-/// feature existed. Anything the audio sniff does not claim, such as text
+/// generic path, which also uses the audio detector to reject it. Anything
+/// the audio sniff does not claim, such as text
 /// whose leading bytes merely look like one frame header, keeps its old
 /// route regardless of the flag.
 fn classify_buffered_upload(
@@ -1219,8 +1219,8 @@ mod tests {
                 "audio on: {route:?}"
             );
         }
-        // Audio off: the old behaviour, byte for byte. `/upload` hands the
-        // MP3 to the generic validator (which rejects recognised audio); the
+        // Audio off: `/upload` hands the MP3 to the generic validator
+        // (which also uses the native audio detector to reject it); the
         // legacy alias rejects it outright.
         assert_eq!(
             classify_buffered_upload(CLEAN_MP3, false, UploadRouteMode::Upload),

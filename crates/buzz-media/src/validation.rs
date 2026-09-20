@@ -190,6 +190,13 @@ pub fn validate_file_content(
         return Err(MediaError::DisallowedContentType(mime));
     }
 
+    // MPEG-2 streams can evade infer's MP3 signature. Use the same detector
+    // as the audio route so disabling audio cannot turn it into an opaque
+    // attachment, and enabling it cannot bypass the metadata validator.
+    if let Some(mime) = crate::audio::sniff_audio_mime(bytes) {
+        return Err(MediaError::DisallowedContentType(mime.to_string()));
+    }
+
     // 2. Sniff. `None` means no magic signature (text/csv/json/source) — that's
     //    fine for the generic path; treat as opaque binary served as a download.
     match infer::get(bytes) {
@@ -197,8 +204,7 @@ pub fn validate_file_content(
             let mime = kind.mime_type().to_string();
             // Recognized media must never fall through exact-byte attachment
             // storage. Images and video use their canonical media validators;
-            // audio is rejected until Buzz has an explicit sanitizer and
-            // location-metadata validator for its container.
+            // audio must use its gated metadata validator.
             if mime.starts_with("image/")
                 || mime.starts_with("video/")
                 || mime.starts_with("audio/")
@@ -1687,6 +1693,24 @@ mod tests {
         assert!(
             matches!(validate_file_content(proprietary_major, &config), Err(MediaError::DisallowedContentType(m)) if m == "application/iso-bmff")
         );
+    }
+
+    #[test]
+    fn test_generic_file_path_rejects_mpeg_audio_with_either_feature_setting() {
+        let clean = include_bytes!("../tests/fixtures/audio/sine-clean.mp3");
+        let tagged = include_bytes!("../tests/fixtures/audio/sine-tagged.mp3");
+        // This real MPEG-2 stream evades infer's narrower MP3 signature.
+        assert!(infer::get(clean).is_none());
+        for enabled in [false, true] {
+            let mut config = test_config();
+            config.audio_uploads_enabled = enabled;
+            for bytes in [clean.as_slice(), tagged.as_slice()] {
+                assert!(matches!(
+                    validate_file_content(bytes, &config),
+                    Err(MediaError::DisallowedContentType(mime)) if mime == "audio/mpeg"
+                ));
+            }
+        }
     }
 
     #[test]
