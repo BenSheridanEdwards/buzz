@@ -35,7 +35,10 @@ jobs:
   desktop-e2e-relay:
     name: Desktop E2E Relay
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    # A cold build compiles the relay and two distinct test archives. The first
+    # two stages alone take about 24 minutes on a standard hosted runner; allow
+    # the PostgreSQL archive to finish even when trusted caches are unavailable.
+    timeout-minutes: 60
     if: inputs.lane == 'artifacts' && (github.event_name == 'push' || inputs.desktop || inputs.desktop_rust || inputs.rust)
     permissions:
       contents: read
