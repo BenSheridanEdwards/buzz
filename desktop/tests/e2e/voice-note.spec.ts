@@ -7,6 +7,7 @@ import { expectSmoothCorners } from "../helpers/css";
 
 const AUDIO_URL = "http://127.0.0.1:4173/sounds/ping.mp3";
 const IMAGE_URL = "http://127.0.0.1:4173/app-icon@2x.png";
+let voiceNoteCreatedAt = 0;
 
 async function openMoreActionsMenu(page: Page, messageId: string) {
   const row = page.locator(`[data-message-id="${messageId}"]`);
@@ -39,8 +40,13 @@ async function emitVoiceNoteMessage(
   transcript?: string,
   { caption, imageUrl }: { caption?: string; imageUrl?: string } = {},
 ) {
-  await page.evaluate(
-    ({ audioUrl, caption, channelName, imageUrl, transcript }) => {
+  // Keep arrival order across reloads despite second-resolution relay timestamps.
+  voiceNoteCreatedAt = Math.max(
+    Math.floor(Date.now() / 1000),
+    voiceNoteCreatedAt + 1,
+  );
+  return page.evaluate(
+    ({ audioUrl, caption, channelName, createdAt, imageUrl, transcript }) => {
       const emit = window.__BUZZ_E2E_EMIT_MOCK_MESSAGE__;
       if (!emit) throw new Error("Mock message emitter is unavailable.");
       const lines = [
@@ -48,8 +54,9 @@ async function emitVoiceNoteMessage(
         imageUrl ? `![pic](${imageUrl})` : undefined,
         `[voice-note-123.mp4](${audioUrl})`,
       ].filter((line): line is string => line !== undefined);
-      emit({
+      return emit({
         channelName,
+        createdAt,
         // Alice is the peer in the mock DM; the emitter otherwise defaults to us.
         pubkey:
           "953d3363262e86b770419834c53d2446409db6d918a57f8f339d495d54ab001f",
@@ -75,9 +82,16 @@ async function emitVoiceNoteMessage(
               ]
             : []),
         ],
-      });
+      }).id;
     },
-    { audioUrl, caption, channelName, imageUrl, transcript },
+    {
+      audioUrl,
+      caption,
+      channelName,
+      createdAt: voiceNoteCreatedAt,
+      imageUrl,
+      transcript,
+    },
   );
 }
 
@@ -90,10 +104,14 @@ async function waitForMockLiveSubscription(page: Page, channelName: string) {
             window as Window & {
               __BUZZ_E2E_HAS_MOCK_LIVE_SUBSCRIPTION__?: (input: {
                 channelName: string;
+                kind: number;
               }) => boolean;
             }
           ).__BUZZ_E2E_HAS_MOCK_LIVE_SUBSCRIPTION__?.({
             channelName: currentChannelName,
+            // Thread summaries are exclusive to the selected window's live
+            // subscription. Kind 9 also matches background unread listeners.
+            kind: 39005,
           }) ?? false,
         channelName,
       ),
@@ -102,6 +120,7 @@ async function waitForMockLiveSubscription(page: Page, channelName: string) {
 }
 
 test.beforeEach(async ({ page }, testInfo) => {
+  voiceNoteCreatedAt = 0;
   // These specs exercise the review flow (finished note waits in the composer
   // for Send). Release-sends coverage lives in voice-note-recorder.spec.ts.
   await page.addInitScript(() => {
@@ -1120,14 +1139,20 @@ test("received card titles the sender and folds the transcript in a channel", as
   await waitForMockLiveSubscription(page, "general");
   const transcript = "Status is **green** on the Studio. Say the word.";
   const caption = "Hey **team**, here is the update";
-  await emitVoiceNoteMessage(page, "general", AUDIO_URL, transcript, {
-    caption,
-    imageUrl: IMAGE_URL,
-  });
+  const messageId = await emitVoiceNoteMessage(
+    page,
+    "general",
+    AUDIO_URL,
+    transcript,
+    {
+      caption,
+      imageUrl: IMAGE_URL,
+    },
+  );
 
-  const card = page.getByTestId("audio-message-attachment").last();
+  const row = page.locator(`[data-message-id="${messageId}"]`);
+  const card = row.getByTestId("audio-message-attachment");
   await expect(card).toBeVisible();
-  const row = page.locator("[data-message-id]").filter({ has: card });
   const author = (
     await row.locator('[data-testid="message-author"]').first().innerText()
   ).trim();
@@ -1183,8 +1208,15 @@ test("received card titles the sender and folds the transcript in a channel", as
   await page.reload();
   await page.getByTestId("channel-general").click();
   await waitForMockLiveSubscription(page, "general");
-  await emitVoiceNoteMessage(page, "general", AUDIO_URL, transcript);
-  const reloadedCard = page.getByTestId("audio-message-attachment").last();
+  const reloadedId = await emitVoiceNoteMessage(
+    page,
+    "general",
+    AUDIO_URL,
+    transcript,
+  );
+  const reloadedCard = page
+    .locator(`[data-message-id="${reloadedId}"]`)
+    .getByTestId("audio-message-attachment");
   await expect(
     reloadedCard.getByRole("button", { name: "Transcript" }),
   ).toHaveAttribute("aria-expanded", "true");
@@ -1196,13 +1228,19 @@ test("received card titles the sender and folds the transcript in a channel", as
   ).toBe("closed");
 
   // No transcript on the attachment: no Transcript row, even with a caption.
-  await emitVoiceNoteMessage(page, "general", AUDIO_URL, undefined, {
-    caption: "Just a caption",
-  });
-  const bareCard = page.getByTestId("audio-message-attachment").last();
+  const bareId = await emitVoiceNoteMessage(
+    page,
+    "general",
+    AUDIO_URL,
+    undefined,
+    {
+      caption: "Just a caption",
+    },
+  );
+  const bareRow = page.locator(`[data-message-id="${bareId}"]`);
+  const bareCard = bareRow.getByTestId("audio-message-attachment");
   await expect(bareCard).toBeVisible();
   await expect(bareCard.getByTestId("voice-note-transcript")).toHaveCount(0);
-  const bareRow = page.locator("[data-message-id]").filter({ has: bareCard });
   await expect(bareRow.getByText("Just a caption")).toHaveCount(1);
   await expect(bareCard.getByText("Just a caption")).toHaveCount(0);
 });
@@ -1213,14 +1251,16 @@ test("received card folds the transcript by default in a DM and remembers its to
   await page.goto("/");
   await page.getByTestId("dm-list").getByTestId("channel-alice-tyler").click();
   await waitForMockLiveSubscription(page, "alice-tyler");
-  await emitVoiceNoteMessage(
+  const messageId = await emitVoiceNoteMessage(
     page,
     "alice-tyler",
     AUDIO_URL,
     "Chief, it's Neo. Two things need your eyes.",
   );
 
-  const card = page.getByTestId("audio-message-attachment").last();
+  const card = page
+    .locator(`[data-message-id="${messageId}"]`)
+    .getByTestId("audio-message-attachment");
   await expect(card).toBeVisible();
   const toggle = card.getByRole("button", { name: "Transcript" });
   const text = card.getByTestId("voice-note-transcript-text");
