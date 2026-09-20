@@ -2296,10 +2296,6 @@ mod tests {
         std::fs::write(&ws_file, b"%PDF report").unwrap();
         let owned = turn_dir.join("1-voice-note.mp3");
         std::fs::write(&owned, b"mp3").unwrap();
-        let link_out = turn_dir.join("out-link.pdf");
-        std::os::unix::fs::symlink(&secret, &link_out).unwrap();
-        let link_in = workspace.join("in-link.pdf");
-        std::os::unix::fs::symlink(&ws_file, &link_in).unwrap();
         let traversal = format!("{}/../elsewhere/passport.pdf", workspace.display());
         // `~/` expands through the harness HOME; point HOME somewhere the
         // roots do not cover so the expansion itself cannot rescue it.
@@ -2310,10 +2306,20 @@ mod tests {
         capture.record_chunk(&serde_json::json!({
             "type": "text",
             "text": format!(
-                "MEDIA:{}\nMEDIA:{}\nMEDIA:{}\nMEDIA:{}\nMEDIA:{}\nMEDIA:{traversal}\nMEDIA:../../etc/passwd\nMEDIA:/etc/passwd.txt",
-                secret.display(), ws_file.display(), owned.display(), link_out.display(), link_in.display()
+                "MEDIA:{}\nMEDIA:{}\nMEDIA:{}\nMEDIA:{traversal}\nMEDIA:../../etc/passwd\nMEDIA:/etc/passwd.txt",
+                secret.display(), ws_file.display(), owned.display()
             )
         }));
+        #[cfg(unix)]
+        {
+            let link_out = turn_dir.join("out-link.pdf");
+            std::os::unix::fs::symlink(&secret, &link_out).unwrap();
+            let link_in = workspace.join("in-link.pdf");
+            std::os::unix::fs::symlink(&ws_file, &link_in).unwrap();
+            capture.record_chunk(&serde_json::json!({
+                "type": "text", "text": format!("\nMEDIA:{}\nMEDIA:{}", link_out.display(), link_in.display())
+            }));
+        }
         capture.record_chunk(&serde_json::json!({
             "type": "resource_link", "uri": format!("file://{}", secret.display()), "name": "passport.pdf"
         }));
@@ -2362,12 +2368,14 @@ mod tests {
         };
         // N2: the second reference to an already-staged file is skipped with
         // a reason, like every other reference that produces no upload.
+        #[cfg(unix)]
         assert!(
             refused("in-link.pdf skipped").contains("already attached in this reply"),
             "{:?}",
             resolved.notes
         );
         assert!(refused("passport.pdf refused").contains("outside the turn directory"));
+        #[cfg(unix)]
         assert!(refused("out-link.pdf refused").contains("symlink resolves outside"));
         assert!(refused("passport.pdf refused: path traversal").contains(".."));
         assert!(
@@ -2401,6 +2409,7 @@ mod tests {
     /// all now, and every scratch file is created with `O_EXCL | O_NOFOLLOW`
     /// at a random name, so a planted link cannot be followed.
     #[test]
+    #[cfg(unix)]
     fn planted_symlinks_in_the_turn_dir_cannot_be_written_through() {
         let base = temp_root();
         let turn_dir = base.join("turn");
@@ -2464,6 +2473,7 @@ mod tests {
     /// staged snapshot, so replacing the resolved path with a link to a
     /// secret after resolution leaks nothing.
     #[test]
+    #[cfg(unix)]
     fn a_post_resolve_symlink_swap_is_not_read() {
         let base = temp_root();
         let turn_dir = base.join("turn");
@@ -2633,6 +2643,7 @@ mod tests {
     /// S2, staging half: a source that turns into a symlink between the
     /// confine and the open is refused by `O_NOFOLLOW` rather than copied.
     #[test]
+    #[cfg(unix)]
     fn stage_file_refuses_a_symlink_source() {
         let base = temp_root();
         let secret = base.join("secret.txt");

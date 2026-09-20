@@ -1826,40 +1826,47 @@ mod tests {
 
     #[test]
     fn attachment_root_is_private_and_refuses_symlinks() {
+        #[cfg(unix)]
         use std::os::unix::fs::PermissionsExt as _;
         let base = std::env::temp_dir().join(format!("buzz-acp-root-{}", uuid::Uuid::new_v4()));
         let root = prepare_attachment_root(&base, "abcdef0123456789").unwrap();
         assert_eq!(root, base.join("buzz-acp/abcdef0123456789/attachments"));
-        for dir in [root.as_path(), root.parent().unwrap()] {
-            let mode = std::fs::metadata(dir).unwrap().permissions().mode() & 0o777;
-            assert_eq!(mode, 0o700, "{} is {mode:o}", dir.display());
+        #[cfg(unix)]
+        {
+            for dir in [root.as_path(), root.parent().unwrap()] {
+                let mode = std::fs::metadata(dir).unwrap().permissions().mode() & 0o777;
+                assert_eq!(mode, 0o700, "{} is {mode:o}", dir.display());
+            }
+            // A pre-existing root that is too open is tightened, not refused.
+            std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o755)).unwrap();
+            prepare_attachment_root(&base, "abcdef0123456789").unwrap();
+            let mode = std::fs::metadata(&root).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o700);
         }
-        // A pre-existing root that is too open is tightened, not refused.
-        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o755)).unwrap();
-        prepare_attachment_root(&base, "abcdef0123456789").unwrap();
-        let mode = std::fs::metadata(&root).unwrap().permissions().mode() & 0o777;
-        assert_eq!(mode, 0o700);
-
-        // A symlink planted where the root should be is an error.
-        let planted =
-            std::env::temp_dir().join(format!("buzz-acp-planted-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&planted).unwrap();
-        std::fs::create_dir_all(base.join("buzz-acp/victim")).unwrap();
-        std::os::unix::fs::symlink(&planted, base.join("buzz-acp/victim/attachments")).unwrap();
-        let err = prepare_attachment_root(&base, "victim").unwrap_err();
-        assert!(err.to_string().contains("symlink"), "{err}");
+        #[cfg(unix)]
+        {
+            // A symlink planted where the root should be is an error.
+            let planted =
+                std::env::temp_dir().join(format!("buzz-acp-planted-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir_all(&planted).unwrap();
+            std::fs::create_dir_all(base.join("buzz-acp/victim")).unwrap();
+            std::os::unix::fs::symlink(&planted, base.join("buzz-acp/victim/attachments")).unwrap();
+            let err = prepare_attachment_root(&base, "victim").unwrap_err();
+            assert!(err.to_string().contains("symlink"), "{err}");
+            let _ = std::fs::remove_dir_all(&planted);
+        }
         // So is a regular file.
         std::fs::create_dir_all(base.join("buzz-acp/plain")).unwrap();
         std::fs::write(base.join("buzz-acp/plain/attachments"), b"").unwrap();
         assert!(prepare_attachment_root(&base, "plain").is_err());
         let _ = std::fs::remove_dir_all(&base);
-        let _ = std::fs::remove_dir_all(&planted);
     }
 
     /// S6 from the confirmation pass: on the shared `/tmp` fallback the
     /// `<base>/buzz-acp` component is the one another local user can create
     /// first, so it is checked like the two below it.
     #[test]
+    #[cfg(unix)]
     fn the_shared_component_of_the_root_is_checked_too() {
         let base = std::env::temp_dir().join(format!("buzz-acp-shared-{}", uuid::Uuid::new_v4()));
         let planted =
@@ -1890,33 +1897,35 @@ mod tests {
     /// name nothing else knows, outside every directory the engine was
     /// handed, and it takes its files with it when it drops.
     fn set_dir_mtime(dir: &Path, when: std::time::SystemTime) {
-        let spec = |t: std::time::SystemTime| {
-            let d = t.duration_since(std::time::UNIX_EPOCH).unwrap();
-            nix::sys::time::TimeSpec::new(d.as_secs() as i64, d.subsec_nanos() as i64)
-        };
-        nix::sys::stat::utimensat(
-            nix::fcntl::AT_FDCWD,
-            dir,
-            &spec(when),
-            &spec(when),
-            nix::sys::stat::UtimensatFlags::NoFollowSymlink,
-        )
-        .unwrap();
+        let mut options = std::fs::OpenOptions::new();
+        options.read(true);
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt as _;
+            // FILE_WRITE_ATTRIBUTES + FILE_FLAG_BACKUP_SEMANTICS let Windows
+            // open a directory handle specifically to update its timestamps.
+            options.access_mode(0x100).custom_flags(0x0200_0000);
+        }
+        options.open(dir).unwrap().set_modified(when).unwrap();
     }
 
     #[test]
     fn publish_scratch_is_private_fresh_and_removed_with_its_publish() {
+        #[cfg(unix)]
         use std::os::unix::fs::PermissionsExt as _;
         let root = std::env::temp_dir().join(format!("buzz-acp-scratch-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&root).unwrap();
         let dir = {
             let scratch = PublishScratch::create(&root).unwrap();
-            let mode = std::fs::metadata(scratch.dir())
-                .unwrap()
-                .permissions()
-                .mode()
-                & 0o777;
-            assert_eq!(mode, 0o700, "{mode:o}");
+            #[cfg(unix)]
+            {
+                let mode = std::fs::metadata(scratch.dir())
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777;
+                assert_eq!(mode, 0o700, "{mode:o}");
+            }
             let second = PublishScratch::create(&root).unwrap();
             assert_ne!(
                 scratch.dir(),
@@ -1928,25 +1937,30 @@ mod tests {
             let (_, again) = scratch.create_file("txt").unwrap();
             assert_ne!(first, again, "names are not predictable");
             assert!(first.starts_with(scratch.dir()));
-            let mode = std::fs::metadata(&first).unwrap().permissions().mode() & 0o777;
-            assert_eq!(mode, 0o600, "{mode:o}");
-
-            // A link planted at a scratch name is never written through:
-            // `create_at` is the open every scratch file is created with,
-            // and the name is the only thing the test chooses.
-            let victim = root.join("victim.txt");
-            std::fs::write(&victim, b"victim").unwrap();
-            std::os::unix::fs::symlink(&victim, scratch.dir().join("planted.txt")).unwrap();
-            let err = scratch
-                .dir
-                .create_at(std::ffi::OsStr::new("planted.txt"))
-                .expect_err("a planted symlink is not written through");
-            assert!(
-                err.kind() == std::io::ErrorKind::AlreadyExists
-                    || err.raw_os_error() == Some(nix::libc::ELOOP),
-                "{err:?}"
-            );
-            assert_eq!(std::fs::read(&victim).unwrap(), b"victim");
+            #[cfg(unix)]
+            {
+                let mode = std::fs::metadata(&first).unwrap().permissions().mode() & 0o777;
+                assert_eq!(mode, 0o600, "{mode:o}");
+            }
+            #[cfg(unix)]
+            {
+                // A link planted at a scratch name is never written through:
+                // `create_at` is the open every scratch file is created with,
+                // and the name is the only thing the test chooses.
+                let victim = root.join("victim.txt");
+                std::fs::write(&victim, b"victim").unwrap();
+                std::os::unix::fs::symlink(&victim, scratch.dir().join("planted.txt")).unwrap();
+                let err = scratch
+                    .dir
+                    .create_at(std::ffi::OsStr::new("planted.txt"))
+                    .expect_err("a planted symlink is not written through");
+                assert!(
+                    err.kind() == std::io::ErrorKind::AlreadyExists
+                        || err.raw_os_error() == Some(nix::libc::ELOOP),
+                    "{err:?}"
+                );
+                assert_eq!(std::fs::read(&victim).unwrap(), b"victim");
+            }
             // And so is a plain existing file.
             std::fs::write(scratch.dir().join("taken.txt"), b"first").unwrap();
             assert!(scratch
@@ -1983,6 +1997,7 @@ mod tests {
     /// empty. Replacing `create_at`/`open_at` with a path-based open puts
     /// the file in `victim` instead and fails this test.
     #[test]
+    #[cfg(unix)]
     fn a_swapped_scratch_directory_redirects_nothing() {
         let root = std::env::temp_dir().join(format!("buzz-acp-swap-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&root).unwrap();
