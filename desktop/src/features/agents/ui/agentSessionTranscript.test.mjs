@@ -2125,3 +2125,20 @@ test("buildTranscript session/new bare systemPrompt field takes precedence over 
     "_meta.systemPrompt.append must not appear when bare field is present",
   );
 });
+
+test("background worker stays visible and records failure after its parent turn ends", () => {
+  const start = acpToolUpdate(20, {
+    sessionUpdate: "tool_call", toolCallId: "subagent-child",
+    title: "Worker: verify repair", kind: "execute", status: "in_progress",
+  });
+  const done = { ...acpToolUpdate(21, {
+    sessionUpdate: "tool_call_update", toolCallId: "subagent-child",
+    status: "failed", content: [{type: "content", content: {type: "text", text: "Worker failed: subprocess exited"}}],
+  }), turnId: null };
+  const [running] = toolItems([start]);
+  assert.equal(running.status, "executing");
+  const items = toolItems([start, done]);
+  assert.equal(items.length, 1);
+  assert.equal(items[0].status, "failed");
+  assert.match(items[0].result, /subprocess exited/);
+});

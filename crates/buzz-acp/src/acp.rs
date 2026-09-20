@@ -8,7 +8,7 @@
 //! 4. [`AcpClient::session_prompt_with_idle_timeout`] — send prompt with idle/hard deadline, return stop reason
 //! 5. [`AcpClient::session_cancel`] / [`AcpClient::cancel_with_cleanup`] — cancel in-flight turn
 
-use futures_util::StreamExt;
+use futures_util::{FutureExt, StreamExt};
 use tokio::io::AsyncWriteExt;
 use tokio::process::{Child, ChildStdin, ChildStdout};
 use tokio_util::codec::{FramedRead, LinesCodec, LinesCodecError};
@@ -654,6 +654,59 @@ impl AcpClient {
             "methodId": method_id,
         });
         self.send_request("authenticate", params).await
+    }
+
+    /// Restore the original Hermes session before delivering its background result.
+    pub async fn session_load(
+        &mut self,
+        session_id: &str,
+        cwd: &str,
+        mcp_servers: Vec<McpServer>,
+    ) -> Result<(), AcpError> {
+        self.send_request(
+            "session/load",
+            serde_json::json!({
+                "sessionId": session_id, "cwd": cwd, "mcpServers": mcp_servers,
+            }),
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// Consume only immediately available notifications while no request is in flight.
+    /// FramedRead retains partial lines across polls; the cap prevents a noisy worker
+    /// from starving relay input. Route by the notification's session, never the last turn.
+    pub async fn drain_idle_updates(
+        &mut self,
+        contexts: &std::collections::HashMap<String, ObserverContext>,
+    ) -> Result<(), AcpError> {
+        for _ in 0..128 {
+            let Some(line) = self.reader.next().now_or_never() else {
+                break;
+            };
+            let Some(line) = line else {
+                return Err(AcpError::AgentExited);
+            };
+            let line = line.map_err(|e| AcpError::Protocol(e.to_string()))?;
+            let Ok(msg) = serde_json::from_str::<serde_json::Value>(&line) else {
+                continue;
+            };
+            if let Some(sid) = msg.pointer("/params/sessionId").and_then(|v| v.as_str()) {
+                if let (Some(observer), Some(context)) = (&self.observer, contexts.get(sid)) {
+                    observer.emit("acp_read", self.observer_agent_index, context, msg.clone());
+                }
+            }
+            match msg.get("method").and_then(|v| v.as_str()) {
+                Some("session/update") => {
+                    self.handle_session_update(&msg);
+                }
+                Some("session/request_permission") => {
+                    self.handle_permission_request(&msg).await?;
+                }
+                _ => {}
+            }
+        }
+        Ok(())
     }
 
     /// Send `session/new` and return the full response alongside the session ID.
@@ -5439,6 +5492,75 @@ mod tests {
         assert!(
             msg.contains("sandbox_workspace_write"),
             "error must mention sandbox_workspace_write"
+        );
+    }
+}
+
+#[cfg(test)]
+mod background_delivery_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn progress_after_parent_response_is_read_without_another_prompt() {
+        let script = r#"
+            read -t 5 request
+            echo '{"jsonrpc":"2.0","id":0,"result":{"stopReason":"end_turn"}}'
+            echo '{"jsonrpc":"2.0","id":"worker-permission","method":"session/request_permission","params":{"sessionId":"origin","options":[{"kind":"allow_once","optionId":"permit-this-edit"}]}}'
+            read -t 5 permission
+            [[ "$permission" == *'"optionId":"permit-this-edit"'* ]] || exit 2
+            echo '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"origin","update":{"sessionUpdate":"tool_call_update","toolCallId":"subagent-child","status":"failed"}}}'
+            read -t 5 request
+        "#;
+        let mut client = AcpClient::spawn("bash", &["-c".into(), script.into()], &[], false)
+            .await
+            .unwrap();
+        let observer = ObserverHandle::in_process();
+        client.set_observer(Some(observer.clone()), 0);
+        client
+            .session_prompt_with_idle_timeout(
+                "origin",
+                "go",
+                std::time::Duration::from_secs(5),
+                std::time::Duration::from_secs(5),
+            )
+            .await
+            .unwrap();
+        let channel = uuid::Uuid::new_v4();
+        let contexts = std::collections::HashMap::from([(
+            "origin".into(),
+            crate::observer::context_for(Some(channel), Some("origin".into()), None),
+        )]);
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            loop {
+                client.drain_idle_updates(&contexts).await.unwrap();
+                if observer.snapshot().iter().any(|e| {
+                    e.payload
+                        .pointer("/params/update/status")
+                        .and_then(|v| v.as_str())
+                        == Some("failed")
+                }) {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let event = observer
+            .snapshot()
+            .into_iter()
+            .find(|e| {
+                e.payload
+                    .pointer("/params/update/status")
+                    .and_then(|v| v.as_str())
+                    == Some("failed")
+            })
+            .unwrap();
+        assert_eq!(event.channel_id, Some(channel.to_string()));
+        assert_eq!(event.session_id.as_deref(), Some("origin"));
+        assert!(
+            event.turn_id.is_none(),
+            "background work must not impersonate the next parent turn"
         );
     }
 }

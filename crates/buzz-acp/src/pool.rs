@@ -772,6 +772,8 @@ impl ChannelInfoResolver {
 }
 
 pub struct PromptContext {
+    /// Private, tenant-scoped return addresses for background completions.
+    pub background_routes_dir: Option<std::path::PathBuf>,
     /// Hermes transcribe endpoint for inbound voice notes; empty disables it.
     pub transcribe_endpoint: String,
     /// Hermes profile the transcription is billed to.
@@ -934,6 +936,33 @@ impl AgentPool {
             task_map: HashMap::new(),
             session_owners: HashMap::new(),
             held_since: HashMap::new(),
+        }
+    }
+
+    /// Whether an in-flight turn already owns this scope.
+    pub fn scope_is_busy(&self, scope: &SessionScope) -> bool {
+        self.task_map
+            .values()
+            .any(|task| task.scope.as_ref() == Some(scope))
+    }
+
+    /// Drain unsolicited worker notifications even after the parent has replied.
+    pub async fn drain_background_updates(&mut self) {
+        for agent in self.agents.iter_mut().flatten() {
+            let contexts = agent
+                .state
+                .sessions
+                .iter()
+                .map(|(scope, sid)| {
+                    (
+                        sid.clone(),
+                        observer::context_for(Some(scope.channel_id()), Some(sid.clone()), None),
+                    )
+                })
+                .collect();
+            if let Err(error) = agent.acp.drain_idle_updates(&contexts).await {
+                tracing::warn!(agent = agent.index, %error, "background notification stream failed");
+            }
         }
     }
 
@@ -2984,6 +3013,13 @@ pub async fn run_prompt_task(
             }
         }
     };
+    if let (Some(dir), PromptSource::Channel(scope)) = (&ctx.background_routes_dir, &source) {
+        if let Some(trigger) = agent.state.last_trigger.get(scope) {
+            if let Err(error) = crate::background_routes::save(dir, &session_id, scope, trigger) {
+                tracing::error!(%error, "could not persist background return address");
+            }
+        }
+    }
     agent.acp.set_observer_context(observer::context_for_turn(
         observer_channel_id,
         Some(session_id.clone()),
@@ -11522,6 +11558,7 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
     ) -> PromptContext {
         use crate::relay::RestClient;
         PromptContext {
+            background_routes_dir: None,
             mcp_servers: vec![],
             transcribe_endpoint: String::new(),
             transcribe_profile: String::new(),

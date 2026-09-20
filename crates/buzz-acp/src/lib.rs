@@ -2,6 +2,7 @@
 
 mod acp;
 mod attachments;
+mod background_routes;
 mod blossom;
 mod config;
 mod engagement;
@@ -2161,7 +2162,6 @@ fn inactivity_expired(
 /// the queue (or a wake/respawn already in flight) blocks this decision, so a
 /// queued batch is never stranded — the caller's next loop iteration will
 /// dispatch or wake it instead.
-#[allow(clippy::too_many_arguments)]
 /// Marker the agent engine maintains (see hermes `refresh_background_work_marker`)
 /// while it has background work outstanding — delegated workers running, or
 /// finished results awaiting delivery. Lives beside the engine's durable ledger
@@ -2213,6 +2213,7 @@ fn marker_is_live(path: &std::path::Path, now: std::time::SystemTime) -> bool {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn idle_pool_sleep_due(
     pool_ready: bool,
     last_activity: tokio::time::Instant,
@@ -2966,6 +2967,8 @@ async fn tokio_main() -> Result<()> {
     let (media_feedback_tx, mut media_feedback_rx) =
         mpsc::unbounded_channel::<pool::MediaFeedback>();
     let ctx = Arc::new(PromptContext {
+        background_routes_dir: agent_hermes_home(&config)
+            .map(|home| background_routes::directory(&home, &config.relay_url, &pubkey_hex)),
         media_feedback_tx: Some(media_feedback_tx),
         transcribe_endpoint: config.transcribe_endpoint.clone(),
         transcribe_profile: config.transcribe_profile.clone(),
@@ -3180,7 +3183,9 @@ async fn tokio_main() -> Result<()> {
     // progress and the next unmentioned reply in it would never arrive. Seed
     // it from the agent's own recent posts on the relay before the first
     // event is read; a relay error only means the seed is skipped.
-    if matches!(config.subscribe_mode, SubscribeMode::Mentions) && !subscribed_channel_ids.is_empty() {
+    if matches!(config.subscribe_mode, SubscribeMode::Mentions)
+        && !subscribed_channel_ids.is_empty()
+    {
         let agent_pubkey_hex = config.keys.public_key().to_hex();
         match engagement::seed_engaged_threads(
             &ctx.rest_client,
@@ -3231,6 +3236,9 @@ async fn tokio_main() -> Result<()> {
     // Branches 1 & 2 both need to borrow `pool`, but they access different
     // fields (result_rx vs join_set). We use `rx_and_join_set()` to split the
     // borrow, yielding a typed enum so the outer code can dispatch cleanly.
+    let mut background_poll = tokio::time::interval(Duration::from_secs(1));
+    background_poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
     enum PoolEvent {
         Result(Box<PromptResult>),
         Panic(tokio::task::JoinError),
@@ -3380,11 +3388,14 @@ async fn tokio_main() -> Result<()> {
             }
         }
 
+        pool.drain_background_updates().await;
+
         // Borrow result_rx and join_set simultaneously via split-borrow helper.
         let pool_event: Option<PoolEvent> = {
             let (result_rx, join_set) = pool.rx_and_join_set();
             tokio::select! {
                 biased;
+                _ = background_poll.tick() => None,
                 // recv() returning None means all senders dropped (pool was torn down).
                 // Break cleanly instead of panicking.
                 r = result_rx.recv(), if pool_ready => match r {
@@ -3917,7 +3928,7 @@ async fn tokio_main() -> Result<()> {
                         last_activity,
                         tokio::time::Instant::now(),
                         inactivity_bound,
-                        queue.has_in_flight() || heartbeat_in_flight,
+                        queue.has_in_flight() || heartbeat_in_flight || background_work_pending(&config),
                     ) {
                         tracing::info!(
                             inactivity_seconds = config.exit_after_inactivity_secs,
@@ -4003,7 +4014,7 @@ async fn tokio_main() -> Result<()> {
                         // threads first; the generic (channel-less) heartbeat
                         // only runs if a worker is still idle afterwards, and
                         // drains whatever has no thread to return to.
-                        dispatch_delivery_turns(&mut pool, &ctx, &config);
+                        dispatch_delivery_turns(&mut pool, &ctx, &config, &subscribed_channel_ids);
                         if pool.any_idle() {
                             dispatch_heartbeat(&mut pool, &ctx, &mut heartbeat_in_flight);
                         }
@@ -4037,7 +4048,7 @@ async fn tokio_main() -> Result<()> {
                     if pool_ready && !heartbeat_in_flight {
                         dispatch_media_feedback(&mut pool, &ctx, &mut pending_media_feedback);
                         if pool.any_idle() {
-                            dispatch_delivery_turns(&mut pool, &ctx, &config);
+                            dispatch_delivery_turns(&mut pool, &ctx, &config, &subscribed_channel_ids);
                         }
                     }
                     None
@@ -5528,9 +5539,11 @@ fn drain_ready_join_results(
 /// session, so the agent's reply publishes there. The engine's drain prepends
 /// the finished result itself (it routes by session id), so this only has to
 /// say what to do with it — and to override a heartbeat's silence.
-const DELIVERY_PROMPT: &str = "A background task you dispatched from this thread has finished — \
-its result is included above. Report the outcome here now: what finished, the result, and \
-what happens next. Keep it short.";
+const DELIVERY_PROMPT: &str = "A background task you dispatched from this thread has finished or stopped — \
+its result is included above. Check current artifacts and recent conversation history before retrying: \
+later work may already have resolved an old failure. Do not duplicate completed work. \
+Inspect the result and continue any unfinished authorized work. \
+Verify the overall task before claiming completion; report meaningful progress here.";
 
 /// Finished-but-undelivered background results the engine has advertised in
 /// its marker, as the ACP session id each was dispatched from. Empty for the
@@ -5569,19 +5582,40 @@ fn parse_pending_delivery_origins(marker_text: &str) -> Vec<String> {
 /// of being swallowed by a channel-less heartbeat.
 ///
 /// Only the thread's own, idle session is used — never a forked worker — and
-/// a thread whose session or trigger is gone is left for the generic heartbeat
-/// drain. The turn is anchored on the thread's last real trigger, so the reply
+/// a lost in-memory session is restored from its private durable return address. The turn is anchored on the thread's last real trigger, so the reply
 /// publishes exactly like a normal in-thread reply.
 fn dispatch_delivery_turns(
     pool: &mut AgentPool,
     ctx: &Arc<PromptContext>,
     config: &config::Config,
+    subscribed: &HashSet<Uuid>,
 ) {
     for origin in pending_delivery_origins(config) {
-        let Some((scope, trigger)) = pool.find_scope_for_session(&origin) else {
+        let live = pool.find_scope_for_session(&origin);
+        let recovering = live.is_none();
+        let route = live.or_else(|| {
+            let route = background_routes::load(ctx.background_routes_dir.as_ref()?, &origin)?;
+            Some((route.scope, route.trigger))
+        });
+        let Some((scope, trigger)) = route else {
             continue;
         };
-        let Some(agent) = pool.try_claim_owner_only(&scope) else {
+        if !subscribed.contains(&scope.channel_id()) || pool.scope_is_busy(&scope) {
+            continue;
+        }
+        let claimed = if recovering {
+            // A busy owner must finish before this result can take its slot.
+            pool.try_claim_owner_only(&scope).or_else(|| {
+                if pool.has_session_for(&scope) {
+                    None
+                } else {
+                    pool.try_claim(None)
+                }
+            })
+        } else {
+            pool.try_claim_owner_only(&scope)
+        };
+        let Some(mut agent) = claimed else {
             continue;
         };
         let channel_id = scope.channel_id();
@@ -5605,9 +5639,27 @@ fn dispatch_delivery_turns(
         let result_tx = pool.result_tx();
         let ctx_clone = Arc::clone(ctx);
         let agent_index = agent.index;
+        pool.record_scope_owner(scope.clone(), agent_index);
         let turn_id = Uuid::new_v4().to_string();
         let task_turn_id = turn_id.clone();
+        let delivery_scope = scope.clone();
         let abort_handle = pool.join_set.spawn(async move {
+            if recovering {
+                agent.acp.set_observer_context(observer::context_for(Some(channel_id), Some(origin.clone()), None));
+                if let Err(error) = agent.acp.session_load(&origin, &ctx_clone.cwd, ctx_clone.mcp_servers.clone()).await {
+                    tracing::error!(%error, %origin, "background session recovery failed; result remains pending");
+                    let _ = result_tx.send(PromptResult {
+                        agent, source: PromptSource::Channel(delivery_scope), turn_id: task_turn_id,
+                        outcome: PromptOutcome::Error(error), batch: None,
+                    });
+                    return;
+                }
+                agent.state.sessions.insert(delivery_scope.clone(), origin);
+                agent.state.last_trigger.insert(delivery_scope.clone(), batch.events[0].event.clone());
+                agent.state.deliveries.insert(delivery_scope, pool::ChannelDeliveryState {
+                    standing_context_sent: true, ..Default::default()
+                });
+            }
             pool::run_prompt_task(
                 agent,
                 Some(batch),

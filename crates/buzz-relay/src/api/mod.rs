@@ -147,8 +147,9 @@ pub mod relay_members {
     /// immediately — no membership check is performed. Callers that need NIP-OA
     /// owner extraction on open relays should call [`extract_nip_oa_owner`] directly.
     ///
-    /// Returns `Ok(None)` when the caller is a direct member (closed relay) or when
-    /// no NIP-OA tag is present/applicable (open relay without auth tag).
+    /// Direct members also return a cryptographically verified owner when an
+    /// attestation is present. Membership admission and owner materialization
+    /// are separate: already being a member must not suppress observer ownership.
     pub async fn enforce_relay_membership(
         state: &AppState,
         community: CommunityId,
@@ -165,7 +166,12 @@ pub mod relay_members {
         )
         .await
         {
-            Ok(MembershipDecision::OpenRelay) | Ok(MembershipDecision::Member) => Ok(None),
+            Ok(MembershipDecision::OpenRelay) => Ok(None),
+            Ok(MembershipDecision::Member) => Ok(direct_member_owner(
+                pubkey_bytes,
+                auth_tag_header,
+                signed_auth_created_at,
+            )),
             Ok(MembershipDecision::ViaOwner(owner)) => Ok(Some(owner)),
             Ok(MembershipDecision::Denied) => Err((
                 StatusCode::FORBIDDEN,
@@ -179,6 +185,16 @@ pub mod relay_members {
                 Err(super::internal_error(&e))
             }
         }
+    }
+
+    // Called only after direct membership is confirmed. Invalid/missing proof
+    // leaves membership intact but must never establish an owner relationship.
+    fn direct_member_owner(
+        pubkey: &[u8],
+        tag: Option<&str>,
+        signed_at: Option<u64>,
+    ) -> Option<nostr::PublicKey> {
+        extract_nip_oa_owner(pubkey, tag, signed_at)
     }
 
     /// Extract NIP-OA owner from an auth tag without membership enforcement.
@@ -295,6 +311,34 @@ pub mod relay_members {
 
             headers.append("x-auth-tag", HeaderValue::from_static("credential-two"));
             assert_eq!(extract_auth_tag_header(&headers), None);
+        }
+
+        #[test]
+        fn existing_member_keeps_verified_owner_for_observer_backfill() {
+            let owner = Keys::generate();
+            let agent = Keys::generate().public_key();
+            let proof = compute_auth_tag(&owner, &agent, "created_at>100&created_at<300").unwrap();
+            assert_eq!(
+                direct_member_owner(agent.as_bytes(), Some(&proof), Some(200)),
+                Some(owner.public_key())
+            );
+            assert_eq!(
+                direct_member_owner(agent.as_bytes(), Some(&proof), Some(300)),
+                None
+            );
+            assert_eq!(
+                direct_member_owner(agent.as_bytes(), Some(&proof), None),
+                None
+            );
+            assert_eq!(
+                direct_member_owner(
+                    Keys::generate().public_key().as_bytes(),
+                    Some(&proof),
+                    Some(200)
+                ),
+                None
+            );
+            assert_eq!(direct_member_owner(agent.as_bytes(), None, Some(200)), None);
         }
 
         /// Valid NIP-OA auth tag → returns Some(owner_pubkey).
