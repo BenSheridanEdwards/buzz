@@ -50,6 +50,9 @@ async function emitVoiceNoteMessage(
       ].filter((line): line is string => line !== undefined);
       emit({
         channelName,
+        // Alice is the peer in the mock DM; the emitter otherwise defaults to us.
+        pubkey:
+          "953d3363262e86b770419834c53d2446409db6d918a57f8f339d495d54ab001f",
         content: lines.join("\n"),
         extraTags: [
           [
@@ -897,7 +900,7 @@ test("records from the composer and renders an inline waveform card", async ({
   // The speed pill is always visible, not a hover reveal.
   await expect(playbackRate).toHaveCSS("opacity", "1");
   await expect(playbackRate).toHaveAccessibleName(
-    "Playback speed 1x; next 1.5x",
+    "Playback speed 1x; next 1.25x",
   );
   await waitForAnimations(page);
   await expectSmoothCorners(playbackRate);
@@ -916,24 +919,19 @@ test("records from the composer and renders an inline waveform card", async ({
   const widestPlaybackRateWidth = (await playbackRate.boundingBox())?.width;
   expect(widestPlaybackRateWidth).toBeGreaterThan(0);
   await expect(playbackRateValue).toHaveText("1×");
-  await playbackRate.click();
-  await expect(playbackRateValue).toHaveText("1.5×");
-  expect((await playbackRate.boundingBox())?.width).toBe(
-    widestPlaybackRateWidth,
-  );
-  await expect(card.locator("audio")).toHaveJSProperty("playbackRate", 1.5);
-  await expect(playbackRate).toHaveAccessibleName(
-    "Playback speed 1.5x; next 2x",
-  );
-  await playbackRate.click();
-  await expect(playbackRateValue).toHaveText("2×");
-  expect((await playbackRate.boundingBox())?.width).toBe(
-    widestPlaybackRateWidth,
-  );
-  await expect(card.locator("audio")).toHaveJSProperty("playbackRate", 2);
-  await playbackRate.click();
-  await expect(playbackRateValue).toHaveText("1×");
-  await expect(card.locator("audio")).toHaveJSProperty("playbackRate", 1);
+  // This is the viewer's freshly sent note: quarter steps, then wrap to 1x.
+  for (const rate of [1.25, 1.5, 1.75, 2, 1]) {
+    await playbackRate.click();
+    await expect(playbackRateValue).toHaveText(`${rate}×`);
+    expect((await playbackRate.boundingBox())?.width).toBe(
+      widestPlaybackRateWidth,
+    );
+    await expect(card.locator("audio")).toHaveJSProperty("playbackRate", rate);
+    const next = rate === 2 ? 1 : rate + 0.25;
+    await expect(playbackRate).toHaveAccessibleName(
+      `Playback speed ${rate}x; next ${next}x`,
+    );
+  }
 
   const slider = card.getByRole("slider", {
     name: "Voice note playback position",
@@ -1209,7 +1207,7 @@ test("received card titles the sender and folds the transcript in a channel", as
   await expect(bareCard.getByText("Just a caption")).toHaveCount(0);
 });
 
-test("received card opens the transcript by default in a DM", async ({
+test("received card folds the transcript by default in a DM and remembers its toggle", async ({
   page,
 }) => {
   await page.goto("/");
@@ -1225,6 +1223,33 @@ test("received card opens the transcript by default in a DM", async ({
   const card = page.getByTestId("audio-message-attachment").last();
   await expect(card).toBeVisible();
   const toggle = card.getByRole("button", { name: "Transcript" });
+  const text = card.getByTestId("voice-note-transcript-text");
+  await expect(toggle).toHaveAttribute("aria-expanded", "false");
+  await expect(text).toBeHidden();
+  await toggle.click();
   await expect(toggle).toHaveAttribute("aria-expanded", "true");
-  await expect(card.getByTestId("voice-note-transcript-text")).toBeVisible();
+  await expect(text).toBeVisible();
+  expect(
+    await page.evaluate(() =>
+      localStorage.getItem("buzz.voiceNote.transcriptOpen"),
+    ),
+  ).toBe("open");
+  await toggle.click();
+  await expect(toggle).toHaveAttribute("aria-expanded", "false");
+  await expect(text).toBeHidden();
+  expect(
+    await page.evaluate(() =>
+      localStorage.getItem("buzz.voiceNote.transcriptOpen"),
+    ),
+  ).toBe("closed");
+
+  // Received notes retain their finer tenth-step tuning, distinct from own notes.
+  const speed = card.getByTestId("voice-note-playback-rate");
+  for (const rate of [1.1, 1.2, 1.3, 1.4, 1.5, 1.6, 1.7, 1.8, 1.9, 2, 1]) {
+    await speed.click();
+    await expect(card.getByTestId("voice-note-playback-rate-value")).toHaveText(
+      `${rate}×`,
+    );
+    await expect(card.locator("audio")).toHaveJSProperty("playbackRate", rate);
+  }
 });
