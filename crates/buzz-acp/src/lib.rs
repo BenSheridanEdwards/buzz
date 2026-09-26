@@ -5601,7 +5601,20 @@ fn dispatch_delivery_turns(
     config: &config::Config,
     subscribed: &HashSet<Uuid>,
 ) {
-    let pending: HashSet<String> = pending_delivery_origins(config).into_iter().collect();
+    let mut pending: HashSet<String> = pending_delivery_origins(config).into_iter().collect();
+    if pool
+        .agents_mut()
+        .iter()
+        .flatten()
+        .any(|a| a.acp.canonical_attachment())
+    {
+        if let Some(dir) = &ctx.background_routes_dir {
+            match background_routes::canonical_routes(dir) {
+                Ok(routes) => pending.extend(routes.into_iter().map(|r| r.session_id)),
+                Err(error) => tracing::error!(%error, "canonical routes require reconciliation"),
+            }
+        }
+    }
     if let Ok(mut retries) = pool.recovery_retries.lock() {
         retries.retain_pending(&pending);
     }
@@ -5668,6 +5681,22 @@ fn dispatch_delivery_turns(
         let delivery_scope = scope.clone();
         let recovery_retries = Arc::clone(&pool.recovery_retries);
         let abort_handle = pool.join_set.spawn(async move {
+            if agent.acp.canonical_attachment() {
+                // The gateway owns wakes. Observe its journal, never ask another
+                // model turn to rediscover or deliver completed work.
+                let outcome = match async {
+                    agent.acp.session_load(&origin, &ctx_clone.cwd, Vec::new()).await?;
+                    pool::publish_canonical_outbox(&ctx_clone, &origin).await
+                }.await {
+                    Ok(()) => pool::PromptOutcome::Ok(acp::StopReason::EndTurn),
+                    Err(error) => pool::PromptOutcome::Error(error),
+                };
+                let _ = result_tx.send(PromptResult {
+                    agent, source: PromptSource::Channel(delivery_scope),
+                    turn_id: task_turn_id, outcome, batch: None,
+                });
+                return;
+            }
             let mut saved_state = None;
             if recovering {
                 agent.acp.set_observer_context(observer::context_for(Some(channel_id), Some(origin.clone()), None));

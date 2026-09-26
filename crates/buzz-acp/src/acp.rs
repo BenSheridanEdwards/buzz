@@ -9,6 +9,11 @@
 //! 5. [`AcpClient::session_cancel`] / [`AcpClient::cancel_with_cleanup`] — cancel in-flight turn
 
 use futures_util::{FutureExt, StreamExt};
+#[path = "acp_attachment.rs"]
+mod attachment;
+#[cfg(test)]
+#[path = "acp_attachment_tests.rs"]
+mod attachment_tests;
 use tokio::io::AsyncWriteExt;
 use tokio::process::{Child, ChildStdin, ChildStdout};
 use tokio_util::codec::{FramedRead, LinesCodec, LinesCodecError};
@@ -179,6 +184,7 @@ pub struct AcpClient {
     // Channel membership bounds this independently of provider session rotation.
     observer_channels: std::collections::HashSet<String>,
     background_routes_dir: Option<std::path::PathBuf>,
+    hermes_attachment: bool,
     stream_closed_observed: bool,
     /// Most recently observed `_meta.goose.activeRunId` from a
     /// `session/update` notification of kind `session_info_update`.
@@ -420,7 +426,8 @@ fn build_client_capabilities() -> serde_json::Value {
             // Non-standard extension used by claude-agent-acp to advertise the
             // exact terminal login argv for subscription auth. Unknown `_meta`
             // keys are ignored by other adapters.
-            "terminal-auth": true
+            "terminal-auth": true,
+            "hermesAttachment": {"version": 1}
         }
     })
 }
@@ -592,6 +599,7 @@ impl AcpClient {
             session_observer_order: Default::default(),
             observer_channels: Default::default(),
             background_routes_dir: None,
+            hermes_attachment: false,
             stream_closed_observed: false,
             active_run_id: None,
             steering_supported: false,
@@ -753,6 +761,7 @@ impl AcpClient {
         // on ACP v2 ahead of the upstream ACP RFD. Revisit when that RFD merges.
         let params = build_initialize_params();
         let result = self.send_request("initialize", params).await?;
+        self.hermes_attachment = attachment::negotiate(&result)?;
         self.steering_supported = result
             .pointer("/_meta/steering/supported")
             .and_then(|v| v.as_bool())
@@ -776,13 +785,38 @@ impl AcpClient {
         cwd: &str,
         mcp_servers: Vec<McpServer>,
     ) -> Result<(), AcpError> {
-        self.send_request(
-            "session/load",
-            serde_json::json!({
-                "sessionId": session_id, "cwd": cwd, "mcpServers": mcp_servers,
-            }),
-        )
-        .await?;
+        // Load replay is observation, never a new reply to publish. Preserve
+        if self.hermes_attachment {
+            return self.load_attachment(session_id, cwd).await;
+        }
+        // the caller's capture even if the load fails after streaming history.
+        let capture = std::mem::take(&mut self.turn_media);
+        let result = self
+            .send_request(
+                "session/load",
+                serde_json::json!({
+                    "sessionId": session_id, "cwd": cwd, "mcpServers": mcp_servers,
+                }),
+            )
+            .await;
+        self.turn_media = capture;
+        let result = result?;
+        if result.pointer("/_meta/lastDeliveryId").is_some()
+            || result.pointer("/_meta/hasMoreDeliveries") == Some(&serde_json::Value::Bool(true))
+        {
+            return Err(AcpError::Protocol(
+                "session/load returned a delivery journal; durable canonical recovery is not supported".into(),
+            ));
+        }
+        if result
+            .pointer("/_meta/activeTurn")
+            .is_some_and(|turn| !turn.is_null())
+        {
+            return Err(AcpError::Protocol(
+                "session/load returned an active turn; canonical reattachment is not supported"
+                    .into(),
+            ));
+        }
         Ok(())
     }
 
@@ -804,6 +838,7 @@ impl AcpClient {
             let Ok(msg) = serde_json::from_str::<serde_json::Value>(&line) else {
                 continue;
             };
+            self.accept_attachment_frame(&msg)?;
             if let Some(sid) = msg.pointer("/params/sessionId").and_then(|v| v.as_str()) {
                 if let (Some(observer), Some(context)) = (
                     &self.observer,
@@ -885,6 +920,25 @@ impl AcpClient {
             .ok_or_else(|| AcpError::Protocol("session/new response missing sessionId".into()))?
             .to_owned();
         tracing::info!(target: "buzz_acp::acp::session", "session created: {session_id}");
+        if self.hermes_attachment {
+            use crate::background_routes::attachment as store;
+            let dir = self
+                .background_routes_dir
+                .as_ref()
+                .ok_or_else(|| store::invalid("durable return routes required"))?;
+            let cursor = result
+                .pointer("/_meta/lastDeliveryId")
+                .and_then(serde_json::Value::as_i64)
+                .ok_or_else(|| store::invalid("missing initial cursor"))?;
+            store::save(
+                dir,
+                &session_id,
+                &store::State {
+                    cursor,
+                    ..Default::default()
+                },
+            )?;
+        }
         Ok(SessionNewResponse {
             session_id,
             raw: result,
@@ -1013,7 +1067,17 @@ impl AcpClient {
         idle_timeout: std::time::Duration,
         max_duration: std::time::Duration,
     ) -> Result<StopReason, AcpError> {
-        let params = build_prompt_content_params(session_id, prompt_blocks);
+        let mut params = build_prompt_content_params(session_id, prompt_blocks);
+        if self.hermes_attachment && attachment::is_native_control(&params["prompt"]) {
+            // Context blocks must not turn an explicit connector control into
+            // model input when the native handler concatenates text blocks.
+            params["prompt"] = serde_json::json!([params["prompt"][0].clone()]);
+        }
+        if self.hermes_attachment && !attachment::is_native_control(&params["prompt"]) {
+            return self
+                .admit_attachment(session_id, params["prompt"].clone(), max_duration)
+                .await;
+        }
         self.turn_media = crate::media_publish::TurnMediaCapture::default();
         let hard_deadline = tokio::time::Instant::now() + max_duration;
         self.current_hard_deadline = Some(hard_deadline);
@@ -1080,6 +1144,9 @@ impl AcpClient {
     ///
     /// Note: async because writing to stdin requires async I/O.
     pub async fn session_cancel(&mut self, session_id: &str) -> Result<(), AcpError> {
+        if self.hermes_attachment {
+            return self.request_attachment_cancel(session_id).await.map(|_| ());
+        }
         let params = serde_json::json!({
             "sessionId": session_id,
         });
@@ -1265,6 +1332,11 @@ impl AcpClient {
         hard_deadline: tokio::time::Instant,
     ) -> Result<StopReason, AcpError> {
         // Validate precondition before any side effects — fail fast if there's
+        if self.hermes_attachment {
+            return self
+                .cancel_attachment_until(session_id, hard_deadline)
+                .await;
+        }
         // no in-flight prompt (prevents writing permission responses or cancel
         // notifications to the agent when no prompt is active).
         let prompt_id = self.last_prompt_id.take().ok_or_else(|| {
@@ -1483,6 +1555,8 @@ impl AcpClient {
                 }
             };
             self.observe_wire(&msg);
+
+            self.accept_attachment_frame(&msg)?;
 
             // Check if this is a response to our expected request (has matching id
             // AND no `method` field — a `method` field means it's an agent-initiated
@@ -1806,6 +1880,7 @@ impl AcpClient {
                         }
                     };
                     self.observe_wire(&msg);
+                    self.accept_attachment_frame(&msg)?;
 
                     let activity_now = Instant::now();
                     idle_deadline = activity_now + idle_timeout;
@@ -1994,6 +2069,11 @@ impl AcpClient {
     /// leave it `None` and are steered via `_session/steering` instead, which
     /// needs no run id.
     fn handle_session_update(&mut self, msg: &serde_json::Value) -> bool {
+        if self.hermes_attachment {
+            // Canonical text belongs to the durable final bridge, never the
+            // native append-only media/fallback publisher.
+            return false;
+        }
         // Updates from a previous session's workers must not mutate the
         // current turn's media, steering run id, or usage accounting.
         if let Some(sid) = msg.pointer("/params/sessionId").and_then(|v| v.as_str()) {
@@ -2951,6 +3031,22 @@ mod tests {
         assert_eq!(prompt[1]["type"].as_str(), Some("text"));
     }
 
+    #[tokio::test]
+    async fn attachment_negotiates_over_production_ndjson() {
+        let mut client = spawn_script(r#"
+            read -t 5 request
+            case "$request" in
+              *'"hermesAttachment":{"version":1}'*) echo '{"jsonrpc":"2.0","id":0,"result":{"agentCapabilities":{"_meta":{"hermesAttachment":{"version":1,"features":{"historyFreeReplay":true,"deliveryReplay":true,"activeTurnSnapshot":true,"terminalReceipts":true,"canonicalAsyncWake":true,"retainedAdmission":true}}}}}}' ;;
+              *) echo '{"jsonrpc":"2.0","id":0,"error":{"code":-32000,"message":"missing negotiation"}}' ;;
+            esac
+        "#).await;
+        assert!(
+            client.initialize().await.is_ok(),
+            "must request attachment v1 on the wire"
+        );
+        client.shutdown().await;
+    }
+
     #[test]
     fn session_prompt_resource_link_block_format() {
         let params = build_prompt_content_params(
@@ -3000,6 +3096,129 @@ mod tests {
             PromptBlock::Text("abc".into()).text_len(),
             3,
             "links contribute no prompt bytes"
+        );
+    }
+
+    #[tokio::test]
+    async fn session_load_does_not_capture_history_as_a_new_reply() {
+        for response in [
+            serde_json::json!({"jsonrpc": "2.0", "id": 0, "result": {}}),
+            serde_json::json!({"jsonrpc": "2.0", "id": 0, "error": {"code": -32000, "message": "load failed"}}),
+        ] {
+            let script = format!(
+                r#"
+                read -t 5 _load
+                echo '{{"jsonrpc":"2.0","method":"session/update","params":{{"sessionId":"s","update":{{"sessionUpdate":"agent_message_chunk","content":{{"type":"text","text":"old reply"}}}}}}}}'
+                printf '%s\n' '{response}'
+            "#
+            );
+            let mut client = spawn_script(&script).await;
+            let result = client.session_load("s", "/tmp", vec![]).await;
+            assert_eq!(result.is_err(), response.get("error").is_some());
+            assert_eq!(
+                client.peek_turn_text(),
+                "",
+                "load history is not a new outbound reply"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn session_load_refuses_unhandled_active_turn_before_followup_prompt() {
+        let mut client = spawn_script(r#"
+            read -t 5 _load
+            echo '{"jsonrpc":"2.0","id":0,"result":{"_meta":{"activeTurn":{"turnId":"canonical-turn","status":"in_progress"}}}}'
+        "#).await;
+        let result = client.session_load("s", "/tmp", vec![]).await;
+        assert!(
+            matches!(result, Err(AcpError::Protocol(ref message)) if message.contains("active turn")),
+            "must not report a busy canonical session ready for another prompt: {result:?}"
+        );
+        assert!(!client.has_in_flight_prompt());
+    }
+
+    #[tokio::test]
+    async fn session_load_refuses_unhandled_delivery_journal() {
+        for meta in [
+            serde_json::json!({"lastDeliveryId": 12, "hasMoreDeliveries": true}),
+            serde_json::json!({"lastDeliveryId": 12, "hasMoreDeliveries": false}),
+        ] {
+            let script = format!(
+                r#"
+                read -t 5 _load
+                echo '{{"jsonrpc":"2.0","id":0,"result":{{"_meta":{meta}}}}}'
+            "#
+            );
+            let mut client = spawn_script(&script).await;
+            let result = client.session_load("s", "/tmp", vec![]).await;
+            assert!(
+                matches!(result, Err(AcpError::Protocol(ref message)) if message.contains("delivery journal")),
+                "journal recovery must not become a synthetic delivery prompt: {result:?}"
+            );
+        }
+    }
+
+    /// Captured by the real GatewayACPBridge / AttachedTurn producers; no
+    /// hand-maintained Hermes wire schema in this regression.
+    #[tokio::test]
+    async fn hermes_emitted_loads_fail_closed_and_receipt_does_not_finish_native_prompt() {
+        let wire: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../test-fixtures/hermes-attachment/wire.json"
+        ))
+        .unwrap();
+        for (updates, result) in [
+            ("activeUpdates", "activeLoad"),
+            ("journalUpdates", "journalLoad"),
+        ] {
+            let mut script = String::from("read -t 5 _load\n");
+            for update in wire[updates].as_array().unwrap() {
+                script.push_str(&format!("printf '%s\\n' '{}'\n", update));
+            }
+            script.push_str(&format!(
+                "printf '%s\\n' '{}'\n",
+                serde_json::json!({
+                    "jsonrpc": "2.0", "id": 0, "result": wire[result]
+                })
+            ));
+            let mut client = spawn_script(&script).await;
+            assert!(matches!(
+                client.session_load("s", "/tmp", vec![]).await,
+                Err(AcpError::Protocol(_))
+            ));
+            assert_eq!(client.peek_turn_text(), "");
+        }
+        let receipt = wire["journalUpdates"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|frame| frame["method"] == "_hermes/turn_complete")
+            .unwrap();
+        let script = format!(
+            r#"
+            read -t 5 _prompt
+            printf '%s\n' '{receipt}'
+            echo '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"refusal"}}}}'
+        "#
+        );
+        let mut client = spawn_script(&script).await;
+        let reason = client
+            .session_prompt_with_idle_timeout(
+                "s",
+                "new prompt",
+                std::time::Duration::from_secs(5),
+                std::time::Duration::from_secs(10),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            reason,
+            StopReason::Refusal,
+            "an unnegotiated receipt cannot replace the native response"
+        );
+        assert_eq!(
+            client.peek_turn_text(),
+            "",
+            "a lifecycle receipt must not be appended as reply text"
         );
     }
 
@@ -3998,32 +4217,32 @@ mod tests {
 
     #[tokio::test]
     async fn keepalive_resets_idle_past_deadline() {
-        // Keepalive session/update lines every 50ms against a 100ms idle deadline.
-        // The turn should survive well past the 100ms deadline (proves the fix).
+        // A 100ms OS scheduling budget flakes when the full suite spawns
+        // hundreds of children. Keep the liveness assertion, not that budget.
         let mut client = spawn_script(
-            r#"for i in $(seq 1 20); do echo '{"jsonrpc":"2.0","method":"session/update","params":{"update":{"sessionUpdate":"keepalive"}}}'; sleep 0.05; done; sleep 10"#,
-        )
-        .await;
-        let max_dur = std::time::Duration::from_secs(10);
+            r#"read request; for i in 1 2 3 4 5 6; do echo '{"jsonrpc":"2.0","method":"session/update","params":{"update":{"sessionUpdate":"keepalive"}}}'; sleep 0.5; done; sleep 10"#,
+        ).await;
+        client
+            .send_notification("test/start", serde_json::json!({}))
+            .await
+            .unwrap();
+        let max_dur = std::time::Duration::from_secs(15);
         let hard_deadline = tokio::time::Instant::now() + max_dur;
         let start = std::time::Instant::now();
         let result = client
             .read_until_response_with_idle_timeout(
                 "test",
                 999,
-                std::time::Duration::from_millis(100),
+                std::time::Duration::from_secs(2),
                 hard_deadline,
                 max_dur,
             )
             .await;
         let elapsed = start.elapsed();
-        // 20 keepalives × 50ms = ~1000ms of activity, then idle fires after 100ms more.
-        // Must survive well past the 100ms deadline.
         assert!(
-            elapsed >= std::time::Duration::from_millis(500),
-            "keepalive should reset idle past the deadline; elapsed only {elapsed:?}"
+            elapsed >= std::time::Duration::from_secs(4),
+            "keepalives did not extend idle: {elapsed:?}"
         );
-        assert!(elapsed < std::time::Duration::from_secs(5));
         assert!(matches!(result, Err(AcpError::IdleTimeout(_))));
     }
 

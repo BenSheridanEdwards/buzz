@@ -148,6 +148,12 @@ pub struct TurnMediaCapture {
 }
 
 impl TurnMediaCapture {
+    pub(crate) fn authoritative(text: String) -> Self {
+        Self {
+            text,
+            ..Default::default()
+        }
+    }
     /// Record one content block from an `agent_message_chunk` update.
     pub fn record_chunk(&mut self, content: &serde_json::Value) {
         match content.get("type").and_then(|t| t.as_str()) {
@@ -1495,6 +1501,18 @@ impl MediaPublisher<'_> {
         scratch: &Arc<crate::attachments::PublishScratch>,
         deadline: tokio::time::Instant,
     ) -> Option<PublishReport> {
+        self.publish_turn_media_with_receipt(target, resolution, scratch, deadline, None)
+            .await
+    }
+
+    pub(crate) async fn publish_turn_media_with_receipt(
+        &self,
+        target: &ReplyTarget,
+        resolution: OutboundResolution,
+        scratch: &Arc<crate::attachments::PublishScratch>,
+        deadline: tokio::time::Instant,
+        receipt: Option<&crate::background_routes::attachment::Publication<'_>>,
+    ) -> Option<PublishReport> {
         if resolution.is_empty() {
             return None;
         }
@@ -1579,7 +1597,10 @@ impl MediaPublisher<'_> {
         if report.published.is_empty() {
             return Some(report);
         }
-        match self.publish_message(target, &report.published).await {
+        match self
+            .publish_message(target, &report.published, receipt)
+            .await
+        {
             Ok(event_id) => {
                 tracing::info!(
                     target: "buzz_acp::media",
@@ -1827,6 +1848,7 @@ impl MediaPublisher<'_> {
         &self,
         target: &ReplyTarget,
         items: &[PublishedMedia],
+        receipt: Option<&crate::background_routes::attachment::Publication<'_>>,
     ) -> Result<String, String> {
         let (content, media_tags) = compose_message(
             items,
@@ -1852,6 +1874,14 @@ impl MediaPublisher<'_> {
         let event = builder
             .sign_with_keys(&self.rest.keys)
             .map_err(|e| format!("sign failed: {e}"))?;
+        if let Some(receipt) = receipt {
+            let event = receipt.retain(event).map_err(|e| e.to_string())?;
+            receipt
+                .submit(self.rest, &event)
+                .await
+                .map_err(|e| e.to_string())?;
+            return Ok(event.id.to_hex());
+        }
         let event_id = event.id.to_hex();
         match tokio::time::timeout(PUBLISH_TIMEOUT, self.rest.submit_event(&event)).await {
             Ok(Ok(_)) => Ok(event_id),

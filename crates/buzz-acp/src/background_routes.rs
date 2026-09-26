@@ -3,6 +3,32 @@ use crate::scope::SessionScope;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
+#[path = "attachment_store.rs"]
+pub(crate) mod attachment;
+
+pub(crate) fn atomic_write(dir: &Path, dest: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    std::fs::create_dir_all(dir)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
+    }
+    let tmp = dest.with_extension(format!("{}.tmp", uuid::Uuid::new_v4()));
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(&tmp)?;
+    file.write_all(bytes)?;
+    file.sync_all()?;
+    std::fs::rename(tmp, dest)?;
+    std::fs::File::open(dir)?.sync_all()?;
+    Ok(())
+}
 
 #[derive(Serialize, Deserialize)]
 pub(crate) struct Route {
@@ -57,6 +83,43 @@ pub(crate) fn save(
 pub(crate) fn load(dir: &Path, session: &str) -> Option<Route> {
     let route: Route = serde_json::from_slice(&std::fs::read(path(dir, session)).ok()?).ok()?;
     (route.session_id == session).then_some(route)
+}
+
+pub(crate) fn canonical_routes(dir: &Path) -> Result<Vec<Route>, crate::acp::AcpError> {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(e.into()),
+    };
+    let mut routes = Vec::new();
+    for entry in entries {
+        let path = entry?.path();
+        let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+        if name.len() != 69 || !name.ends_with(".json") {
+            continue;
+        }
+        let route: Route = serde_json::from_slice(&std::fs::read(&path)?)?;
+        if attachment::path(dir, &route.session_id).exists() {
+            routes.push(route);
+        }
+    }
+    Ok(routes)
+}
+
+pub(crate) fn canonical_scope(
+    dir: &Path,
+    scope: &SessionScope,
+) -> Result<Option<Route>, crate::acp::AcpError> {
+    let mut routes = canonical_routes(dir)?
+        .into_iter()
+        .filter(|r| &r.scope == scope);
+    let first = routes.next();
+    if routes.next().is_some() {
+        return Err(attachment::invalid(
+            "multiple canonical sessions for scope; reconcile explicitly",
+        ));
+    }
+    Ok(first)
 }
 
 #[cfg(test)]

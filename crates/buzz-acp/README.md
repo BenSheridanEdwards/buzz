@@ -11,6 +11,11 @@ Buzz Relay ──WS──→ buzz-acp ──stdio──→ Your Agent
 
 Supports any agent that speaks [ACP](https://agentclientprotocol.com/) over stdio: **goose**, **codex** (via [codex-acp](https://github.com/agentclientprotocol/codex-acp)), and **claude code** (via [claude-agent-acp](https://github.com/agentclientprotocol/claude-agent-acp)).
 
+For Hermes `acp --attach`, see [gateway attachment integration status](../../docs/hermes-gateway-attachment.md).
+Negotiated v1 supports durable replay, retained admission and outbound retry on
+Unix. Initialization alone is not a managed-agent cutover signal; deployment
+and live gateway changes require separate operator approval.
+
 ## Prerequisites
 
 - A running Buzz relay (`just relay` starts Docker services automatically, or use a hosted instance)

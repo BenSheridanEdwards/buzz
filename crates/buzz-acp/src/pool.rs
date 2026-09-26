@@ -1545,6 +1545,23 @@ async fn create_session_and_apply_model(
     agent_core: Option<&str>,
     channel: NewSessionChannelContext<'_>,
 ) -> Result<String, AcpError> {
+    if agent.acp.canonical_attachment() {
+        if let (Some(dir), Some(scope)) = (&ctx.background_routes_dir, channel.scope) {
+            if let Some(route) = crate::background_routes::canonical_scope(dir, scope)? {
+                agent
+                    .acp
+                    .session_load(&route.session_id, &ctx.cwd, Vec::new())
+                    .await?;
+                return Ok(route.session_id);
+            }
+        }
+        // Gateway owns tools, model and working directory. Never send local
+        // MCP services or model mutation to an attachment.
+        return agent
+            .acp
+            .session_new(&ctx.cwd, Vec::new(), None, None)
+            .await;
+    }
     // Build base_prompt + system_prompt + agent core + canvas metadata into a
     // single prompt. Standard protocol-v2 agents receive it in `session/new`;
     // Goose receives it through the custom request below. Legacy agents receive
@@ -2534,6 +2551,20 @@ async fn publish_reply_media_now(
     capture: crate::media_publish::TurnMediaCapture,
     turn_id: &str,
 ) -> crate::media_publish::PublishReport {
+    publish_reply_media_now_with_receipt(ctx, target, capture, turn_id, None).await
+}
+
+#[path = "pool_attachment_publish.rs"]
+mod attachment_publish;
+pub(crate) use attachment_publish::publish_canonical_outbox;
+
+async fn publish_reply_media_now_with_receipt(
+    ctx: &PromptContext,
+    target: &crate::media_publish::ReplyTarget,
+    capture: crate::media_publish::TurnMediaCapture,
+    turn_id: &str,
+    receipt: Option<&crate::background_routes::attachment::Publication<'_>>,
+) -> crate::media_publish::PublishReport {
     let failed = |reason: String| crate::media_publish::PublishReport {
         published: Vec::new(),
         failed: vec![reason],
@@ -2616,8 +2647,14 @@ async fn publish_reply_media_now(
         playback_speed: ctx.voice_playback_speed,
     };
     let deadline = tokio::time::Instant::now() + crate::media_publish::OUTBOUND_DEADLINE;
+    if receipt.is_none() {
+        return publisher
+            .publish_turn_media(target, resolution, &scratch, deadline)
+            .await
+            .unwrap_or_default();
+    }
     publisher
-        .publish_turn_media(target, resolution, &scratch, deadline)
+        .publish_turn_media_with_receipt(target, resolution, &scratch, deadline, receipt)
         .await
         .unwrap_or_default()
 }
@@ -3113,7 +3150,7 @@ pub async fn run_prompt_task(
         PromptSource::Heartbeat => agent.state.heartbeat_standing_context_sent,
     };
 
-    if is_new_session {
+    if is_new_session && !agent.acp.canonical_attachment() {
         if let (PromptSource::Channel(scope), Some(ref initial_msg)) =
             (&source, &ctx.initial_message)
         {
@@ -3734,6 +3771,17 @@ pub async fn run_prompt_task(
             }
         }
     };
+
+    if agent.acp.canonical_attachment() {
+        if let Err(error) = publish_canonical_outbox(&ctx, &session_id).await {
+            // Publication retries belong to the durable outbox, not the model queue.
+            agent.acp.observe(
+                "attachment_warning",
+                serde_json::json!({"sessionId":session_id,"error":error.to_string()}),
+            );
+            tracing::warn!(%session_id, %error, "canonical publication pending durable retry");
+        }
+    }
 
     match prompt_result {
         Ok(stop_reason) => {
@@ -6061,7 +6109,10 @@ fn reply_text_needs_own_message(media_message_carries_text: bool, reply_text: &s
 /// thread root as both root and parent, so the reply sits flat at layer 1
 /// whether the trigger was the root or a message inside the thread. The
 /// media reply (`MediaPublisher::publish_message`) anchors the same way.
-fn harness_reply_thread_tags(channel_id: Uuid, trigger: &nostr::Event) -> crate::queue::ThreadTags {
+pub(crate) fn harness_reply_thread_tags(
+    channel_id: Uuid,
+    trigger: &nostr::Event,
+) -> crate::queue::ThreadTags {
     let target = crate::media_publish::ReplyTarget::for_trigger(channel_id, trigger);
     crate::queue::ThreadTags {
         root_event_id: Some(target.root_event_id.to_hex()),
@@ -6224,6 +6275,7 @@ async fn clear_reactions(rest: crate::relay::RestClient, event_ids: Vec<String>)
 #[cfg(test)]
 mod tests {
     use super::*;
+    include!("pool_attachment_tests.rs");
     use nostr::{EventBuilder, Keys, Kind, Tag, Timestamp};
     use serde_json::json;
 
