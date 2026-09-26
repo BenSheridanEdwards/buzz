@@ -121,6 +121,10 @@ impl AcpClient {
             self.send_request("_hermes/turn/admit", params.clone())
                 .await?
         };
+        // A status has no authority until both identities match this request.
+        if receipt["sessionId"] != sid || receipt["admissionId"] != admission {
+            return Err(store::invalid("admission receipt identity mismatch"));
+        }
         if receipt["status"] == "not_found" {
             receipt = self.send_request("_hermes/turn/admit", params).await?;
         }

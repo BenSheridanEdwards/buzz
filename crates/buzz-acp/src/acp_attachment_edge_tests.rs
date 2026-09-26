@@ -130,6 +130,7 @@ for line in sys.stdin:
  if m=='initialize': result={'agentCapabilities':{'_meta':{'hermesAttachment':{'version':1,'features':dict.fromkeys(['historyFreeReplay','deliveryReplay','activeTurnSnapshot','terminalReceipts','canonicalAsyncWake','retainedAdmission'],True)}}}}
  elif m=='session/prompt':
   assert len(r['params']['prompt'])==1 and r['params']['prompt'][0]['text'] in ['/approve','/deny']
+  print(json.dumps(dict(jsonrpc='2.0',method='session/update',params=dict(sessionId='s',update=dict(sessionUpdate='agent_message_chunk',content=dict(type='text',text=r['params']['prompt'][0]['text']))))),flush=True)
   result={'stopReason':'end_turn'}
  else: raise Exception('control must not be admitted')
  print(json.dumps(dict(jsonrpc='2.0',id=r['id'],result=result)),flush=True)
@@ -156,6 +157,25 @@ for line in sys.stdin:
                 .unwrap(),
             StopReason::EndTurn
         );
+        assert_eq!(
+            client.peek_turn_text(),
+            control,
+            "native control response must remain publishable"
+        );
     }
+    // A subsequent canonical admission must not republish the prior control.
+    assert!(client
+        .session_prompt_with_idle_timeout(
+            "s",
+            "model input",
+            std::time::Duration::from_secs(1),
+            std::time::Duration::from_secs(1)
+        )
+        .await
+        .is_err());
+    assert!(
+        client.peek_turn_text().is_empty(),
+        "new canonical turn retained native control text"
+    );
     client.shutdown().await;
 }

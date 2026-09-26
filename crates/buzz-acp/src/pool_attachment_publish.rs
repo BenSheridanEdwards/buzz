@@ -11,14 +11,14 @@ pub(crate) async fn publish_canonical_outbox(
         .as_ref()
         .ok_or_else(|| store::invalid("missing outbox directory"))?;
     let state = store::load(dir, sid)?;
-    let route = crate::background_routes::load(dir, sid)
-        .ok_or_else(|| store::invalid("missing outbox route"))?;
+
     for (key, text) in &state.outbound {
         if state.published.contains(key) {
             continue;
         }
         let capture = crate::media_publish::TurnMediaCapture::authoritative(text.clone());
         if capture.references_media() {
+            let route = store::publication_route(dir, sid, key)?;
             let media_key = format!("media:{key}");
             let receipt = store::Publication {
                 dir,

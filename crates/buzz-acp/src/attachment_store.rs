@@ -26,6 +26,8 @@ pub(crate) struct State {
     #[serde(default)]
     pub outbound: BTreeMap<String, String>,
     #[serde(default)]
+    pub outbound_routes: BTreeMap<String, super::Route>,
+    #[serde(default)]
     pub publications: BTreeMap<String, nostr::Event>,
     #[serde(default)]
     pub published: std::collections::BTreeSet<String>,
@@ -61,10 +63,20 @@ pub(crate) fn save(dir: &Path, sid: &str, state: &State) -> Result<(), AcpError>
         .write(true)
         .open(path(dir, sid).with_extension("lock"))?;
     let _lock = lock_state(lock)?;
-    if load(dir, sid)?.revision != state.revision {
+    let previous = load(dir, sid)?;
+    if previous.revision != state.revision {
         return Err(invalid("stale attachment state; reload before retry"));
     }
     let mut value = serde_json::to_value(state)?;
+    // Bind each new durable record before advancing its cursor. A later
+    // foreground trigger must never retarget an older pending publication.
+    for key in state.outbound.keys() {
+        if !state.outbound_routes.contains_key(key) && !previous.outbound.contains_key(key) {
+            if let Some(route) = super::load(dir, sid) {
+                value["outbound_routes"][key] = serde_json::to_value(route)?;
+            }
+        }
+    }
     value["revision"] = state
         .revision
         .checked_add(1)
@@ -216,7 +228,13 @@ pub(crate) fn prepare_publication(
         .outbound
         .get(key)
         .ok_or_else(|| invalid("missing outbound record"))?;
-    let route = super::load(dir, sid).ok_or_else(|| invalid("missing publication route"))?;
+    let text = crate::media_publish::text_without_media_directives(text);
+    if text.trim().is_empty() {
+        state.published.insert(key.into());
+        save(dir, sid, &state)?;
+        return Ok(None);
+    }
+    let route = publication_route(dir, sid, key)?;
     let tags = crate::pool::harness_reply_thread_tags(route.scope.channel_id(), &route.trigger);
     let thread = tags
         .root_event_id
@@ -231,7 +249,7 @@ pub(crate) fn prepare_publication(
         .transpose()?;
     let event = buzz_sdk::build_message(
         route.scope.channel_id(),
-        text,
+        &text,
         thread.as_ref(),
         &[],
         false,
@@ -244,6 +262,17 @@ pub(crate) fn prepare_publication(
     state.publications.insert(key.into(), event.clone());
     save(dir, sid, &state)?;
     Ok(Some(event))
+}
+
+pub(crate) fn publication_route(
+    dir: &Path,
+    sid: &str,
+    key: &str,
+) -> Result<super::Route, AcpError> {
+    load(dir, sid)?
+        .outbound_routes
+        .remove(key)
+        .ok_or_else(|| invalid("unbound publication route; reconciliation required"))
 }
 
 pub(crate) fn ack_publication(dir: &Path, sid: &str, key: &str) -> Result<(), AcpError> {

@@ -1074,6 +1074,7 @@ impl AcpClient {
             params["prompt"] = serde_json::json!([params["prompt"][0].clone()]);
         }
         if self.hermes_attachment && !attachment::is_native_control(&params["prompt"]) {
+            self.turn_media = crate::media_publish::TurnMediaCapture::default();
             return self
                 .admit_attachment(session_id, params["prompt"].clone(), max_duration)
                 .await;
@@ -2069,9 +2070,15 @@ impl AcpClient {
     /// leave it `None` and are steered via `_session/steering` instead, which
     /// needs no run id.
     fn handle_session_update(&mut self, msg: &serde_json::Value) -> bool {
-        if self.hermes_attachment {
-            // Canonical text belongs to the durable final bridge, never the
-            // native append-only media/fallback publisher.
+        let meta = &msg["params"]["_meta"];
+        if self.hermes_attachment
+            && msg["params"]["update"]["sessionUpdate"] == "agent_message_chunk"
+            && (meta.get("deliveryId").is_some()
+                || meta.get("turnId").is_some()
+                || meta.get("kind").is_some())
+        {
+            // Canonical text belongs to the durable final bridge. Untagged
+            // native control replies and non-text telemetry retain native ownership.
             return false;
         }
         // Updates from a previous session's workers must not mutate the

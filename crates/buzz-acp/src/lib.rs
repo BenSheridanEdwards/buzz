@@ -5682,6 +5682,7 @@ fn dispatch_delivery_turns(
         let recovery_retries = Arc::clone(&pool.recovery_retries);
         let abort_handle = pool.join_set.spawn(async move {
             if agent.acp.canonical_attachment() {
+                agent.acp.set_observer_context(observer::context_for(Some(channel_id), Some(origin.clone()), None));
                 // The gateway owns wakes. Observe its journal, never ask another
                 // model turn to rediscover or deliver completed work.
                 let outcome = match async {

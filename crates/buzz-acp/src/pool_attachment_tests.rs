@@ -43,6 +43,7 @@ async fn canonical_signed_media_and_notice_outbox_survive_retry() {
         let event: nostr::Event = serde_json::from_value(event.clone()).unwrap();
         event.verify().unwrap();
         assert_eq!(event.pubkey, keys.public_key());
+        assert!(!event.content.contains("MEDIA:"), "publication must not expose harness directives or local paths: {}", event.content);
     }
     // Simulate a crash after remote acceptance but before durable local ACK.
     let mut unacked = state;
@@ -167,6 +168,9 @@ for line in sys.stdin:
         "origin",
         "restart must reuse durable scope, not create duplicate session"
     );
+    let observer = crate::observer::ObserverHandle::in_process();
+    agent.acp.set_observer(Some(observer.clone()), 0);
+    agent.acp.set_observer_context(crate::observer::context_for(Some(uuid::Uuid::new_v4()), Some("foreign".into()), None));
     let mut pool = AgentPool::from_slots(vec![Some(agent)]);
     crate::dispatch_delivery_turns(
         &mut pool,
@@ -184,6 +188,9 @@ for line in sys.stdin:
     );
     let state =
         crate::background_routes::attachment::load(&tmp.path().join("routes"), "origin").unwrap();
+    let replay = observer.snapshot().into_iter().find(|event| event.payload["method"] == "session/load").unwrap();
+    assert_eq!(replay.channel_id, Some(scope.channel_id().to_string()), "canonical recovery inherited foreign channel");
+    assert_eq!(replay.session_id.as_deref(), Some("origin"));
     assert!(
         state.published.contains("notice:1"),
         "production background recovery must publish accepted durable rows"

@@ -30,7 +30,7 @@ pub(crate) fn atomic_write(dir: &Path, dest: &Path, bytes: &[u8]) -> std::io::Re
     Ok(())
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub(crate) struct Route {
     pub session_id: String,
     pub scope: SessionScope,
