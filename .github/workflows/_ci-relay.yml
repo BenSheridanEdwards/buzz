@@ -35,7 +35,10 @@ jobs:
   desktop-e2e-relay:
     name: Desktop E2E Relay
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    # A cold build compiles the relay and two distinct test archives. The first
+    # two stages alone take about 24 minutes on a standard hosted runner; allow
+    # the PostgreSQL archive to finish even when trusted caches are unavailable.
+    timeout-minutes: 60
     if: inputs.lane == 'artifacts' && (github.event_name == 'push' || inputs.desktop || inputs.desktop_rust || inputs.rust)
     permissions:
       contents: read
@@ -445,6 +448,8 @@ jobs:
           wait_healthy "Postgres" "buzz-postgres"
           wait_healthy "Redis" "buzz-redis"
           wait_healthy "MinIO" "buzz-minio"
+      - name: MinIO image behavior (both Compose stacks)
+        run: python3 scripts/test-minio-images.py
       - name: Download relay artifacts
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:

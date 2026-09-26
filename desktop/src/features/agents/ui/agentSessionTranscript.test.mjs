@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
+import { scopeByChannel } from "./agentSessionPanelLayout.ts";
 import { buildTranscript } from "./agentSessionTranscript.ts";
 import {
   buildTranscriptDisplayBlocks,
@@ -2123,5 +2124,132 @@ test("buildTranscript session/new bare systemPrompt field takes precedence over 
   assert.ok(
     !bodies.includes("Loser"),
     "_meta.systemPrompt.append must not appear when bare field is present",
+  );
+});
+
+test("background worker stays visible and records failure after its parent turn ends", () => {
+  const start = acpToolUpdate(20, {
+    sessionUpdate: "tool_call",
+    toolCallId: "subagent-child",
+    title: "Worker: verify repair",
+    kind: "execute",
+    status: "in_progress",
+  });
+  const done = {
+    ...acpToolUpdate(21, {
+      sessionUpdate: "tool_call_update",
+      toolCallId: "subagent-child",
+      status: "failed",
+      content: [
+        {
+          type: "content",
+          content: { type: "text", text: "Worker failed: subprocess exited" },
+        },
+      ],
+    }),
+    turnId: null,
+  };
+  const [running] = toolItems([start]);
+  assert.equal(running.status, "executing");
+  const items = toolItems([start, done]);
+  assert.equal(items.length, 1);
+  assert.equal(items[0].status, "failed");
+  assert.match(items[0].result, /subprocess exited/);
+});
+
+test("retired worker process fails only its outstanding tool calls", () => {
+  const start = (seq, id, status, override = {}) => ({
+    ...acpToolUpdate(seq, {
+      sessionUpdate: "tool_call",
+      toolCallId: id,
+      title: `Worker: ${id}`,
+      kind: "execute",
+      status,
+    }),
+    ...override,
+  });
+  const events = [
+    start(1, "running", "in_progress"),
+    start(2, "pending", "pending"),
+    start(3, "completed", "completed"),
+    start(4, "failed", "failed"),
+    start(5, "other-slot", "in_progress", { agentIndex: 1 }),
+    start(6, "other-session", "in_progress", { sessionId: "different" }),
+    {
+      ...baseEvent,
+      seq: 7,
+      kind: "agent_stream_closed",
+      turnId: null,
+      payload: { error: "Agent exited", sessionIds: [baseEvent.sessionId] },
+    },
+    start(8, "new-runtime-call", "in_progress"),
+  ];
+  const items = toolItems(events);
+  const byTitle = new Map(items.map((item) => [item.title, item]));
+  for (const title of ["running", "pending"]) {
+    const item = byTitle.get(`Worker: ${title}`);
+    assert.equal(item.status, "failed");
+    assert.equal(item.isError, true);
+    assert.match(item.result, /Agent process stopped: Agent exited/);
+  }
+  assert.equal(byTitle.get("Worker: completed").status, "completed");
+  assert.equal(byTitle.get("Worker: failed").result, "");
+  for (const title of ["other-slot", "other-session", "new-runtime-call"]) {
+    assert.equal(byTitle.get(`Worker: ${title}`).status, "executing");
+  }
+});
+
+test("global process retirement reaches filtered channels without failing later calls", () => {
+  const start = (seq, id, channelId, agentIndex = 0) => ({
+    ...acpToolUpdate(seq, {
+      sessionUpdate: "tool_call",
+      toolCallId: id,
+      title: id,
+      kind: "execute",
+      status: "pending",
+    }),
+    channelId,
+    agentIndex,
+  });
+  const events = [
+    start(1, "old-a", "channel-a"),
+    start(2, "old-b", "channel-b"),
+    start(3, "other-slot", "channel-a", 1),
+    {
+      ...baseEvent,
+      seq: 4,
+      kind: "agent_stream_closed",
+      channelId: null,
+      sessionId: null,
+      turnId: null,
+      payload: { processClosed: true, error: "Agent exited" },
+    },
+    start(5, "new-runtime", "channel-a"),
+  ];
+  const a = new Map(
+    toolItems(scopeByChannel(events, "channel-a")).map((item) => [
+      item.title,
+      item,
+    ]),
+  );
+  assert.equal(a.get("old-a").status, "failed");
+  assert.equal(a.get("other-slot").status, "pending");
+  assert.equal(a.get("new-runtime").status, "pending");
+  assert.equal(a.has("old-b"), false);
+  const b = toolItems(scopeByChannel(events, "channel-b"));
+  assert.equal(b.length, 1);
+  assert.equal(b[0].status, "failed");
+  const channelClosure = events.map((event) =>
+    event.kind === "agent_stream_closed"
+      ? { ...event, channelId: "channel-a" }
+      : event,
+  );
+  assert.equal(
+    toolItems(scopeByChannel(channelClosure, "channel-a"))[0].status,
+    "failed",
+  );
+  assert.equal(
+    toolItems(scopeByChannel(channelClosure, "channel-b"))[0].status,
+    "pending",
   );
 });

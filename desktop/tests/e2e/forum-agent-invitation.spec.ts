@@ -430,8 +430,18 @@ for (const stage of ["add", "publish"] as const) {
         await expect(
           page.getByRole("button", { name: "Remove attachment" }),
         ).toBeVisible();
-      if (replacement !== null)
-        await page.getByTestId("message-input").fill(replacement);
+      if (replacement !== null) {
+        const input = page.getByTestId("message-input");
+        // Clear through the editor's keyboard transaction, not a raw DOM fill
+        // immediately followed by a programmatic route change.
+        if (replacement === "") {
+          await input.press("ControlOrMeta+A");
+          await input.press("Backspace");
+        } else {
+          await input.fill(replacement);
+        }
+        await expect(input).toHaveText(replacement);
+      }
       await navigate(1);
       await releaseForumGate(page);
       expect(

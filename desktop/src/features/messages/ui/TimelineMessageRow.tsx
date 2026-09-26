@@ -142,6 +142,7 @@ export function MessageRowItem({
         )}
       >
         <MessageRow
+          currentPubkey={currentPubkey}
           channelId={channelId}
           highlighted={false}
           hoverBackground={false}
@@ -201,6 +202,7 @@ export function MessageRowItem({
       )}
     >
       <MessageRow
+        currentPubkey={currentPubkey}
         channelId={channelId}
         highlighted={message.id === highlightedMessageId || isSearchActive}
         huddleMemberPubkeys={huddleMemberPubkeys}
