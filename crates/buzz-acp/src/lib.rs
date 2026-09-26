@@ -1324,6 +1324,12 @@ impl ObserverChunkCoalescer {
 fn observer_chunk_key_and_text(
     event: &observer::ObserverEvent,
 ) -> Option<(ObserverChunkKey, String)> {
+    // Canonical replacement parts and replay rows carry their own identity.
+    // Native append coalescing would merge parts while keeping only one header.
+    let meta = event.payload.pointer("/params/_meta");
+    if meta.is_some_and(|m| m.get("deliveryId").is_some() || m.get("kind").is_some()) {
+        return None;
+    }
     let update = event.payload.get("params")?.get("update")?;
     let update_type = update.get("sessionUpdate")?.as_str()?;
     if !matches!(
@@ -8786,6 +8792,50 @@ mod observer_snapshot_race_tests {
 #[cfg(test)]
 mod observer_publish_queue_tests {
     use super::*;
+
+    #[tokio::test]
+    async fn canonical_producer_frames_survive_encrypted_owner_publication() {
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../test-fixtures/hermes-attachment/canonical-v1.json"
+        ))
+        .unwrap();
+        let expected = fixture["frames"].as_array().unwrap();
+        let mut queue = ObserverPublishQueue::default();
+        for (seq, payload) in expected.iter().enumerate() {
+            let mut frame = event(seq as u64, "acp_read", Some("canonical-channel"));
+            frame.payload = payload.clone();
+            queue.ingest(frame);
+        }
+        let agent = nostr::Keys::generate();
+        let owner = nostr::Keys::generate();
+        let foreign = nostr::Keys::generate();
+        let (publisher, mut rx) = RelayEventPublisher::test_pair();
+        let mut actual = Vec::new();
+        for frame in drain_frames(&mut queue) {
+            publish_relay_observer_event(
+                &publisher,
+                &agent,
+                &agent.public_key().to_hex(),
+                &owner.public_key().to_hex(),
+                &owner.public_key(),
+                frame,
+            )
+            .await;
+            let signed = rx.recv().await.unwrap();
+            signed.verify().unwrap();
+            assert!(decrypt_observer_payload::<serde_json::Value>(&foreign, &signed).is_err());
+            let clear: serde_json::Value = decrypt_observer_payload(&owner, &signed).unwrap();
+            if let Some(events) = clear["payload"]["events"].as_array() {
+                actual.extend(events.iter().map(|e| e["payload"].clone()));
+            } else {
+                actual.push(clear["payload"].clone());
+            }
+        }
+        assert_eq!(
+            &actual, expected,
+            "owner transport must preserve canonical multipart identity and bytes"
+        );
+    }
 
     fn event(seq: u64, kind: &str, channel: Option<&str>) -> observer::ObserverEvent {
         observer::ObserverEvent {
