@@ -537,6 +537,8 @@ test("primary+Shift+M favors the most recently mentioned eligible agent", async 
 test("the mention button opens settings and can undo an address", async ({
   page,
 }) => {
+  const cdp = await page.context().newCDPSession(page);
+  await cdp.send("Emulation.setCPUThrottlingRate", { rate: 6 });
   await installAudienceFixtures(page);
   await openThread(page);
 
@@ -601,15 +603,19 @@ test("the mention button opens settings and can undo an address", async ({
   await expect(
     composer.getByRole("button", { name: "Mention someone" }),
   ).toBeVisible();
-  await input.fill("");
+  await input.press("ControlOrMeta+A");
+  await input.press("Backspace");
+  await expect(input).toHaveText("");
 
   await menu
     .getByRole("button", { name: "Mention Morgarita", exact: true })
     .click();
   await expect(input).toHaveText("@Morgarita ");
+  // Explicitly unpinned agents can still be addressed once. Selecting them
+  // must not silently restore the persistent audience preference.
   await expect(
     composer.getByTestId(`composer-address-lock-${AGENT_A}`),
-  ).toBeVisible();
+  ).toHaveCount(0);
 
   await input.type("later");
   await input.press("Enter");
