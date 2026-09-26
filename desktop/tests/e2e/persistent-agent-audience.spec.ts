@@ -539,6 +539,7 @@ test("the mention button opens settings and can undo an address", async ({
 }) => {
   await installAudienceFixtures(page);
   await openThread(page);
+
   // Stress the interaction, not application boot against its readiness deadline.
   const cdp = await page.context().newCDPSession(page);
   await cdp.send("Emulation.setCPUThrottlingRate", { rate: 6 });
@@ -604,9 +605,15 @@ test("the mention button opens settings and can undo an address", async ({
   await expect(
     composer.getByRole("button", { name: "Mention someone" }),
   ).toBeVisible();
+  // Finish the settings interaction before editing; Backspace can otherwise
+  // dismiss the old tray after the next click has already targeted it.
+  await input.press("Escape");
+  await expect(menu).toHaveCount(0);
   await input.press("ControlOrMeta+A");
   await input.press("Backspace");
   await expect(input).toHaveText("");
+  await composer.getByRole("button", { name: "Mention someone" }).click();
+  await expect(menu).toBeVisible();
 
   await menu
     .getByRole("button", { name: "Mention Morgarita", exact: true })
