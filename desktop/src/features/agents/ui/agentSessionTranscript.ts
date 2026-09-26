@@ -1005,8 +1005,11 @@ export function processTranscriptEvent(
         );
       } else if (updateType === "tool_call_update") {
         const toolId = asString(update.toolCallId) ?? `tool:${event.seq}`;
+        const existing = d.itemsById.get(`tool:${ch}:${toolId}`);
+        // ACP updates are partial: progress/output is not completion evidence.
         const status = normalizeToolStatus(
-          asString(update.status) ?? "completed",
+          asString(update.status) ??
+            (existing?.type === "tool" ? existing.status : "executing"),
         );
         const identity = extractToolIdentity(update);
         upsertTool(
@@ -1018,7 +1021,7 @@ export function processTranscriptEvent(
           status,
           extractToolArgs(update),
           extractToolResult(update),
-          status === "failed",
+          asString(update.status) !== null && status === "failed",
           event.timestamp,
           ctx,
           updateType,
