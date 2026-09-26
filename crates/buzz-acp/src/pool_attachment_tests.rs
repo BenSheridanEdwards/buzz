@@ -65,7 +65,12 @@ async fn canonical_signed_media_and_notice_outbox_survive_retry() {
 #[tokio::test]
 async fn canonical_media_refusal_retains_outbox_for_retry() {
     let tmp = tempfile::tempdir().unwrap();
+    let good = tmp.path().join("good.txt");
+    std::fs::write(&good, b"valid artifact").unwrap();
+    let (base, messages) = media_relay_server(vec![], "unused".into(), None).await;
     let mut ctx = make_prompt_context_no_owner();
+    ctx.rest_client.base_url = base;
+    ctx.cwd = tmp.path().display().to_string();
     ctx.background_routes_dir = Some(tmp.path().join("routes"));
     let keys = nostr::Keys::generate();
     let trigger = nostr::EventBuilder::text_note("work")
@@ -79,9 +84,12 @@ async fn canonical_media_refusal_retains_outbox_for_retry() {
     let mut state = crate::background_routes::attachment::State::default();
     state
         .outbound
-        .insert("turn:t".into(), "MEDIA:/outside/absent.png".into());
+        .insert("turn:t".into(), format!("MEDIA:{}\nMEDIA:/outside/absent.png", good.display()));
     crate::background_routes::attachment::save(dir, "s", &state).unwrap();
-    assert!(publish_canonical_outbox(&ctx, "s").await.is_err());
+    for _ in 0..2 {
+        assert!(publish_canonical_outbox(&ctx, "s").await.is_err(), "partial upload must remain pending on retry");
+    }
+    assert!(kind9_posts(&messages.lock().unwrap()).is_empty(), "canonical publication must not commit a partial media set");
     assert!(!crate::background_routes::attachment::load(dir, "s")
         .unwrap()
         .published

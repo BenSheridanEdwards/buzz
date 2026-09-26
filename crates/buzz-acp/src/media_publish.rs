@@ -1594,7 +1594,9 @@ impl MediaPublisher<'_> {
                 }
             }
         }
-        if report.published.is_empty() {
+        if report.published.is_empty() || (receipt.is_some() && !report.failed.is_empty()) {
+            // Durable canonical delivery cannot acknowledge a partial set:
+            // that would erase failed references on the next outbox retry.
             return Some(report);
         }
         match self
