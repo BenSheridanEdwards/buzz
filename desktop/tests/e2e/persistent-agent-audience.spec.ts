@@ -537,10 +537,11 @@ test("primary+Shift+M favors the most recently mentioned eligible agent", async 
 test("the mention button opens settings and can undo an address", async ({
   page,
 }) => {
-  const cdp = await page.context().newCDPSession(page);
-  await cdp.send("Emulation.setCPUThrottlingRate", { rate: 6 });
   await installAudienceFixtures(page);
   await openThread(page);
+  // Stress the interaction, not application boot against its readiness deadline.
+  const cdp = await page.context().newCDPSession(page);
+  await cdp.send("Emulation.setCPUThrottlingRate", { rate: 6 });
 
   const composer = threadComposer(page);
   await automaticallyMention(composer, "Morgarita");
