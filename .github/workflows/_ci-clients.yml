@@ -27,7 +27,7 @@ jobs:
     name: Web
     runs-on: ubuntu-latest
     timeout-minutes: 15
-    if: inputs.lane == 'required' && (github.event_name == 'push' || inputs.web)
+    if: inputs.lane == 'required' && (github.event_name != 'pull_request' || inputs.web)
     permissions:
       contents: read
     steps:
@@ -61,7 +61,7 @@ jobs:
     name: Mobile
     runs-on: ubuntu-latest
     timeout-minutes: 30
-    if: inputs.lane == 'required' && (github.event_name == 'push' || inputs.mobile)
+    if: inputs.lane == 'required' && (github.event_name != 'pull_request' || inputs.mobile)
     permissions:
       contents: read
     steps:

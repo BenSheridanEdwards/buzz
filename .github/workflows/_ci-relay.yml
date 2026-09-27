@@ -549,7 +549,7 @@ jobs:
     name: Relay E2E
     runs-on: ubuntu-latest
     timeout-minutes: 20
-    if: inputs.lane == 'required' && (github.event_name == 'push' || inputs.rust)
+    if: inputs.lane == 'required' && (github.event_name != 'pull_request' || inputs.rust)
     permissions:
       contents: read
     steps:
