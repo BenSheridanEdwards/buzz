@@ -167,11 +167,18 @@ pub mod relay_members {
         .await
         {
             Ok(MembershipDecision::OpenRelay) => Ok(None),
-            Ok(MembershipDecision::Member) => Ok(direct_member_owner(
+            Ok(MembershipDecision::Member) => direct_member_owner(
+                state,
+                community,
                 pubkey_bytes,
                 auth_tag_header,
                 signed_auth_created_at,
-            )),
+            )
+            .await
+            .map_err(|e| {
+                tracing::error!("relay membership check errored: {e}");
+                super::internal_error(&e)
+            }),
             Ok(MembershipDecision::ViaOwner(owner)) => Ok(Some(owner)),
             Ok(MembershipDecision::Denied) => Err((
                 StatusCode::FORBIDDEN,
@@ -189,12 +196,33 @@ pub mod relay_members {
 
     // Called only after direct membership is confirmed. Invalid/missing proof
     // leaves membership intact but must never establish an owner relationship.
-    fn direct_member_owner(
+    // The owner must itself be a relay member, exactly as for delegated
+    // admission: a closed relay never grants owner authority to an outsider.
+    async fn direct_member_owner(
+        state: &AppState,
+        community: CommunityId,
         pubkey: &[u8],
         tag: Option<&str>,
         signed_at: Option<u64>,
-    ) -> Option<nostr::PublicKey> {
-        extract_nip_oa_owner(pubkey, tag, signed_at)
+    ) -> Result<Option<nostr::PublicKey>, String> {
+        let Some(owner) = extract_nip_oa_owner(pubkey, tag, signed_at) else {
+            return Ok(None);
+        };
+        let owner_hex = owner.to_hex();
+        let owner_is_member = state
+            .db
+            .is_relay_member(community, &owner_hex)
+            .await
+            .map_err(|e| format!("relay membership check (owner) failed: {e}"))?;
+        if !owner_is_member {
+            info!(
+                agent = %hex::encode(pubkey),
+                owner = %owner_hex,
+                "NIP-OA owner of direct member is not a relay member; owner not established"
+            );
+            return Ok(None);
+        }
+        Ok(Some(owner))
     }
 
     /// Extract NIP-OA owner from an auth tag without membership enforcement.
@@ -362,6 +390,26 @@ pub mod relay_members {
             );
             let proof = compute_auth_tag(&owner, &agent, "created_at>100&created_at<300").unwrap();
 
+            // A valid proof from an owner outside the relay must not grant
+            // that outsider owner authority over a direct member.
+            assert_eq!(
+                enforce_relay_membership(
+                    &state,
+                    community,
+                    agent.as_bytes(),
+                    Some(&proof),
+                    Some(200)
+                )
+                .await
+                .unwrap(),
+                None
+            );
+            state
+                .db
+                .add_relay_member(community, &owner.public_key().to_hex(), "member", None)
+                .await
+                .unwrap();
+
             // Drive the actual DB-backed gate, not only the extraction helper.
             let extracted = enforce_relay_membership(
                 &state,
@@ -408,34 +456,6 @@ pub mod relay_members {
                 .is_agent_owner(community, agent.as_bytes(), owner.public_key().as_bytes())
                 .await
                 .unwrap());
-        }
-
-        #[test]
-        fn existing_member_keeps_verified_owner_for_observer_backfill() {
-            let owner = Keys::generate();
-            let agent = Keys::generate().public_key();
-            let proof = compute_auth_tag(&owner, &agent, "created_at>100&created_at<300").unwrap();
-            assert_eq!(
-                direct_member_owner(agent.as_bytes(), Some(&proof), Some(200)),
-                Some(owner.public_key())
-            );
-            assert_eq!(
-                direct_member_owner(agent.as_bytes(), Some(&proof), Some(300)),
-                None
-            );
-            assert_eq!(
-                direct_member_owner(agent.as_bytes(), Some(&proof), None),
-                None
-            );
-            assert_eq!(
-                direct_member_owner(
-                    Keys::generate().public_key().as_bytes(),
-                    Some(&proof),
-                    Some(200)
-                ),
-                None
-            );
-            assert_eq!(direct_member_owner(agent.as_bytes(), None, Some(200)), None);
         }
 
         /// Valid NIP-OA auth tag → returns Some(owner_pubkey).
