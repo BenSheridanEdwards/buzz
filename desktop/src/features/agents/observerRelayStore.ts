@@ -4,6 +4,7 @@ import {
   subscribeToAgentObserverFrames,
   subscribeToObserverConnectionState,
 } from "@/shared/api/observerRelay";
+import type { ConnectionState as RelayConnectionState } from "@/shared/api/relayClientShared";
 import type { RelayEvent, ManagedAgent } from "@/shared/api/types";
 import type { ControlResultFrame } from "@/shared/api/types";
 import { putAgentSessionConfig } from "@/shared/api/tauri";
@@ -208,6 +209,12 @@ let errorMessage: string | null = null;
 let unsubscribeRelay: (() => Promise<void>) | null = null;
 let unsubscribeConnection: (() => void) | null = null;
 let startPromise: Promise<void> | null = null;
+// "open" means the observer stream is actually live: the relay is connected
+// AND this store's observer REQ has been registered. The relay emitter replays
+// its current state synchronously, so relay state alone would claim Live before
+// identity lookup and the REQ, and useAutoRestartPolicy gates on "open".
+let relayConnectionState: RelayConnectionState | null = null;
+let observerSubscriptionEstablished = false;
 let eventProcessingQueue: Promise<void> = Promise.resolve();
 let generation = 0;
 
@@ -597,6 +604,36 @@ async function handleRelayObserverEvent(
   }
 }
 
+/** Derive the store lifecycle from relay state and observer REQ readiness. */
+export function deriveObserverConnectionState(
+  relayState: RelayConnectionState | null,
+  subscriptionEstablished: boolean,
+): ConnectionState {
+  switch (relayState) {
+    case null:
+    case "connecting":
+    case "reconnecting":
+      return "connecting";
+    case "connected":
+      return subscriptionEstablished ? "open" : "connecting";
+    case "stalled":
+    case "disconnected":
+      return "closed";
+    default:
+      return relayState;
+  }
+}
+
+function applyObserverConnectionState() {
+  setConnectionState(
+    deriveObserverConnectionState(
+      relayConnectionState,
+      observerSubscriptionEstablished,
+    ),
+    null,
+  );
+}
+
 export function ensureRelayObserverSubscription() {
   if (unsubscribeRelay) {
     return Promise.resolve();
@@ -606,19 +643,13 @@ export function ensureRelayObserverSubscription() {
   }
 
   const activeGeneration = generation;
+  relayConnectionState = null;
+  observerSubscriptionEstablished = false;
   setConnectionState("connecting", null);
   unsubscribeConnection = subscribeToObserverConnectionState((state) => {
     if (activeGeneration !== generation) return;
-    setConnectionState(
-      state === "connected"
-        ? "open"
-        : state === "reconnecting"
-          ? "connecting"
-          : state === "stalled" || state === "disconnected"
-            ? "closed"
-            : state,
-      null,
-    );
+    relayConnectionState = state;
+    applyObserverConnectionState();
   });
   startPromise = (async () => {
     const identity = await getIdentity();
@@ -646,6 +677,8 @@ export function ensureRelayObserverSubscription() {
       return;
     }
     unsubscribeRelay = unsubscribe;
+    observerSubscriptionEstablished = true;
+    applyObserverConnectionState();
   })()
     .catch((error) => {
       if (activeGeneration === generation) {
@@ -968,6 +1001,8 @@ export function resetAgentObserverStore() {
   projectChannelRequestListeners.clear();
   onSessionConfigCaptured = null;
   connectionState = "idle";
+  relayConnectionState = null;
+  observerSubscriptionEstablished = false;
   errorMessage = null;
   notifyListeners();
   void unsubscribe?.();
