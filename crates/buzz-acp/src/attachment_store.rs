@@ -174,11 +174,20 @@ fn accept_frame(dir: &Path, msg: &Value) -> Result<(), AcpError> {
                     state.groups.remove(key);
                 }
             } else if meta["kind"] != "history" && meta["kind"] != "snapshot" {
-                let text = p
-                    .pointer("/update/content/text")
-                    .and_then(Value::as_str)
-                    .ok_or_else(|| invalid("unsupported durable notice"))?;
-                state.outbound.insert(format!("notice:{id}"), text.into());
+                // Only message text is a reply. Other durable telemetry (tool
+                // calls, plans) is consumed so it can never wedge the cursor.
+                match p.pointer("/update/content/text").and_then(Value::as_str) {
+                    Some(text) => {
+                        state.outbound.insert(format!("notice:{id}"), text.into());
+                    }
+                    None if p["update"]["sessionUpdate"] == "agent_message_chunk" => {
+                        state.outbound.insert(
+                            format!("notice:{id}"),
+                            "The agent sent a message Buzz cannot display.".into(),
+                        );
+                    }
+                    None => tracing::debug!(id, "durable non-message update consumed"),
+                }
             }
         }
         Some("_hermes/turn_complete") => {
@@ -186,25 +195,43 @@ fn accept_frame(dir: &Path, msg: &Value) -> Result<(), AcpError> {
                 .as_str()
                 .ok_or_else(|| invalid("missing terminal identity"))?;
             state.terminals.insert(turn.into(), p.clone());
-            let text = if let Some(error) = p.get("error") {
-                format!("Canonical turn failed: {error}")
-            } else if p["stopReason"] == "cancelled" {
-                "Canonical turn cancelled.".into()
-            } else if p["stopReason"] == "end_turn" {
-                state
-                    .finals
-                    .get(turn)
-                    .cloned()
-                    .ok_or_else(|| invalid("terminal without complete authoritative final"))?
-            } else {
-                return Err(invalid("unsupported terminal outcome"));
-            };
+            // An unfinished final can never complete once its turn is terminal.
+            state.groups.retain(|_, group| group.turn != turn);
+            let text = terminal_text(p, state.finals.get(turn).map(String::as_str));
             state.outbound.entry(format!("turn:{turn}")).or_insert(text);
         }
         _ => return Err(invalid("unexpected durable frame")),
     }
     state.cursor = id;
     save(dir, sid, &state)
+}
+
+/// Every terminal is a user-visible outcome. Unknown or final-less outcomes
+/// get a generic notice rather than an error that would wedge the cursor.
+fn terminal_text(p: &Value, fin: Option<&str>) -> String {
+    if let Some(error) = p.get("error") {
+        return format!("Canonical turn failed: {error}");
+    }
+    let reason = p["stopReason"].as_str().map(str::to_ascii_lowercase);
+    let stop = match reason.as_deref() {
+        Some("end_turn") => {
+            return fin.map_or_else(
+                || "The agent finished this turn without a reply.".into(),
+                str::to_owned,
+            )
+        }
+        Some("cancelled") => return "Canonical turn cancelled.".into(),
+        Some("max_tokens") => "the agent reached its output limit".into(),
+        Some("max_turn_requests") => "the agent reached its per-turn request limit".into(),
+        Some("refusal") => "the agent declined to continue".into(),
+        Some(other) => format!("the turn ended with an unrecognized outcome ({other})"),
+        None => "the gateway reported no outcome".into(),
+    };
+    tracing::warn!(stop, "canonical turn ended without a normal completion");
+    match fin {
+        Some(text) => format!("{text}\n\n(Reply stopped: {stop}.)"),
+        None => format!("Reply stopped: {stop}."),
+    }
 }
 
 pub(crate) fn invalid(message: &str) -> AcpError {

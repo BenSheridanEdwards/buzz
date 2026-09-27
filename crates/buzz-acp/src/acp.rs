@@ -185,6 +185,7 @@ pub struct AcpClient {
     observer_channels: std::collections::HashSet<String>,
     background_routes_dir: Option<std::path::PathBuf>,
     hermes_attachment: bool,
+    attachment_tracking: attachment::Tracking,
     stream_closed_observed: bool,
     /// Most recently observed `_meta.goose.activeRunId` from a
     /// `session/update` notification of kind `session_info_update`.
@@ -600,6 +601,7 @@ impl AcpClient {
             observer_channels: Default::default(),
             background_routes_dir: None,
             hermes_attachment: false,
+            attachment_tracking: Default::default(),
             stream_closed_observed: false,
             active_run_id: None,
             steering_supported: false,
@@ -938,6 +940,7 @@ impl AcpClient {
                     ..Default::default()
                 },
             )?;
+            self.attachment_tracking.attached.insert(session_id.clone());
         }
         Ok(SessionNewResponse {
             session_id,
