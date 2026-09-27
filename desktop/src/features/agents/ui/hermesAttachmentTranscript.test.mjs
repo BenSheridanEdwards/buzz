@@ -452,3 +452,65 @@ test("Hermes terminal receipts are correlated and replay idempotent; partial fin
   assert.match(incomplete[0].text, /incomplete/i);
   assert.equal(incomplete[0].renderClass, "error");
 });
+
+test("Hermes live text after a tool starts a new segment below the tool; final collapses the turn", () => {
+  const toolCall = {
+    ...base,
+    seq: 3,
+    payload: {
+      method: "session/update",
+      params: {
+        sessionId: "session",
+        _meta: {
+          kind: "live",
+          operation: "merge",
+          turnId: "canonical-turn",
+          messageId: "canonical-turn:tool:call",
+        },
+        update: {
+          sessionUpdate: "tool_call",
+          toolCallId: "call",
+          title: "terminal",
+          status: "in_progress",
+          rawInput: { command: "ls" },
+        },
+      },
+    },
+  };
+  const live = [
+    text(1, "Let me "),
+    text(2, "check"),
+    toolCall,
+    text(4, "Found "),
+    text(5, "it"),
+  ];
+  const shape = (items) =>
+    items
+      .filter((x) => x.type === "message" || x.type === "tool")
+      .map((x) => (x.type === "tool" ? "[tool]" : x.text));
+  const items = buildTranscript(live);
+  assert.deepEqual(shape(items), ["Let me check", "[tool]", "Found it"]);
+  assert.deepEqual(
+    shape(buildTranscript([...live, text(6, "!")])),
+    ["Let me check", "[tool]", "Found it!"],
+    "later deltas append to the open post-tool segment",
+  );
+  const final = text(7, "Let me check. Found it.", {
+    kind: "final",
+    operation: "replace",
+    part: 0,
+    parts: 1,
+    deliveryId: 30,
+  });
+  const finalized = buildTranscript([
+    ...live,
+    text(6, "!"),
+    final,
+    text(8, " late"),
+  ]);
+  assert.deepEqual(
+    shape(finalized),
+    ["Let me check. Found it.", "[tool]"],
+    "authoritative final replaces every live segment at the stable identity",
+  );
+});

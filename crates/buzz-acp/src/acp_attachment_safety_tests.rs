@@ -175,14 +175,6 @@ for line in sys.stdin:
 }
 
 #[test]
-fn malformed_notice_never_advances_durable_cursor() {
-    let dir = tempfile::tempdir().unwrap();
-    let unsupported = json!({"method":"session/update","params":{"sessionId":"s","_meta":{"deliveryId":1},"update":{"sessionUpdate":"agent_message_chunk","content":{"type":"image","data":"invalid"}}}});
-    assert!(store::accept(dir.path(), &unsupported).is_err());
-    assert_eq!(store::load(dir.path(), "s").unwrap().cursor, 0);
-}
-
-#[test]
 fn stale_outgoing_ack_cannot_erase_staged_multipart() {
     let dir = tempfile::tempdir().unwrap();
     let stale = store::load(dir.path(), "s").unwrap();

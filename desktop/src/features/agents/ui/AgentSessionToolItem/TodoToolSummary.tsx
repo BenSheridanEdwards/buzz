@@ -13,6 +13,7 @@ import {
   ActivityRowContent,
   ActivityRowLabel,
 } from "../activityRenderClasses/ActivityRow";
+import { ToolStatusBadge } from "./ToolStatusBadge";
 
 type TodoDisplayItem = {
   checked: boolean;
@@ -44,6 +45,7 @@ export function TodoToolSummary({
         title={actionLabel.object}
         verb={actionLabel.verb}
       />
+      <ToolStatusBadge item={item} />
       {duration ? (
         <span className="shrink-0 text-xs text-muted-foreground/60 group-open:text-foreground">
           {duration}

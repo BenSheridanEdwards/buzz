@@ -613,6 +613,10 @@ function mergeToolStatus(existing: ToolStatus, next: ToolStatus): ToolStatus {
   return next;
 }
 
+function isRetiredTool(item: Extract<TranscriptItem, { type: "tool" }>) {
+  return item.status === "failed" && item.acpSource === "agent_stream_closed";
+}
+
 function upsertTool(
   d: TranscriptDraft,
   id: string,
@@ -631,6 +635,10 @@ function upsertTool(
   const canonicalBuzzToolName =
     buzzToolName ?? findBuzzToolName(toolName, true);
   if (existing?.type === "tool") {
+    // A call retired by its process exit is final: a late terminal frame from
+    // the dead process must not flip it to completed while isError and the
+    // "Agent process stopped" result remain.
+    if (isRetiredTool(existing)) return;
     const updatedTitle = !isGenericToolTitle(title) ? title : existing.title;
     let updatedToolName = existing.toolName;
     let updatedBuzzToolName = existing.buzzToolName;

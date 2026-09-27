@@ -39,7 +39,7 @@ jobs:
     # two stages alone take about 24 minutes on a standard hosted runner; allow
     # the PostgreSQL archive to finish even when trusted caches are unavailable.
     timeout-minutes: 60
-    if: inputs.lane == 'artifacts' && (github.event_name == 'push' || inputs.desktop || inputs.desktop_rust || inputs.rust)
+    if: inputs.lane == 'artifacts' && (github.event_name != 'pull_request' || inputs.desktop || inputs.desktop_rust || inputs.rust)
     permissions:
       contents: read
     env:
@@ -138,7 +138,7 @@ jobs:
     name: PostgreSQL Tests
     runs-on: ubuntu-latest
     timeout-minutes: 10
-    if: inputs.lane == 'postgres' && (github.event_name == 'push' || inputs.rust)
+    if: inputs.lane == 'postgres' && (github.event_name != 'pull_request' || inputs.rust)
     permissions:
       contents: read
     services:
@@ -213,7 +213,7 @@ jobs:
     name: Desktop E2E Integration (${{ matrix.shard }}/2)
     runs-on: ubuntu-latest
     timeout-minutes: 20
-    if: inputs.lane == 'required' && (github.event_name == 'push' || inputs.desktop || inputs.desktop_rust || inputs.rust)
+    if: inputs.lane == 'required' && (github.event_name != 'pull_request' || inputs.desktop || inputs.desktop_rust || inputs.rust)
     strategy:
       fail-fast: false
       matrix:
@@ -390,7 +390,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     needs: [desktop-e2e-integration-shard]
-    if: always() && inputs.lane == 'required' && (github.event_name == 'push' || inputs.desktop || inputs.desktop_rust || inputs.rust)
+    if: always() && inputs.lane == 'required' && (github.event_name != 'pull_request' || inputs.desktop || inputs.desktop_rust || inputs.rust)
     permissions:
       contents: read
     steps:
@@ -406,7 +406,7 @@ jobs:
     name: Backend Integration (relay e2e)
     runs-on: ubuntu-latest
     timeout-minutes: 20
-    if: inputs.lane == 'required' && (github.event_name == 'push' || inputs.rust)
+    if: inputs.lane == 'required' && (github.event_name != 'pull_request' || inputs.rust)
     permissions:
       contents: read
     steps:
@@ -549,7 +549,7 @@ jobs:
     name: Relay E2E
     runs-on: ubuntu-latest
     timeout-minutes: 20
-    if: inputs.lane == 'required' && (github.event_name == 'push' || inputs.rust)
+    if: inputs.lane == 'required' && (github.event_name != 'pull_request' || inputs.rust)
     permissions:
       contents: read
     steps:
