@@ -22,6 +22,7 @@ import {
 import { getSentMessageLink } from "./messageLinks";
 import { isTodoSummary, TodoToolSummary } from "./TodoToolSummary";
 import { ToolDetailBlocks } from "./ToolDetailBlocks";
+import { ToolStatusBadge } from "./ToolStatusBadge";
 
 export function ToolItem({
   agentAvatarUrl,
@@ -78,6 +79,7 @@ export function ToolItem({
           preview={compactSummary.preview}
           pubkey={agentPubkey}
           result={item.result}
+          statusBadge={<ToolStatusBadge item={item} />}
           timestamp={item.timestamp}
         />
       </div>
@@ -117,18 +119,7 @@ export function ToolItem({
             compactSummaryTone(),
           )}
         >
-          {item.isError || item.status === "failed" ? (
-            <span className="shrink-0 text-xs text-destructive" role="status">
-              Failed
-            </span>
-          ) : item.status === "executing" || item.status === "pending" ? (
-            <span
-              className="shrink-0 text-xs text-muted-foreground"
-              role="status"
-            >
-              {item.status === "pending" ? "Pending" : "Running"}
-            </span>
-          ) : null}
+          <ToolStatusBadge item={item} />
           <CompactToolSummaryRow
             action={compactSummary.action}
             duration={duration}

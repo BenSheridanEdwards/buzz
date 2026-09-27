@@ -29,6 +29,7 @@ export function CompactMessageSummary({
   preview,
   pubkey,
   result,
+  statusBadge,
   timestamp,
 }: {
   args: Record<string, unknown>;
@@ -44,6 +45,8 @@ export function CompactMessageSummary({
   preview: string | null;
   pubkey: string;
   result: string;
+  /** Pending/Running/Failed label; plain text, not a live region. */
+  statusBadge?: React.ReactNode;
   timestamp: string;
 }) {
   const [detailsOpen, setDetailsOpen] = React.useState(false);
@@ -180,6 +183,7 @@ export function CompactMessageSummary({
             {canOpenMessage ? <MessageLinkHoverCue /> : null}
           </div>
           <div className="inline-flex max-w-full items-center gap-1.5 px-1">
+            {statusBadge}
             <TranscriptTimestamp
               messageLink={messageLink}
               timestamp={timestamp}
