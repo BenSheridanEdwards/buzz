@@ -36,7 +36,7 @@ async fn canonical_signed_media_and_notice_outbox_survive_retry() {
     let state = crate::background_routes::attachment::load(dir, "s").unwrap();
     assert!(state.published.contains("turn:t"));
     assert!(state.published.contains("notice:2"));
-    assert!(state.published.contains("media:turn:t"));
+    assert!(state.outbound.is_empty() && state.publications.is_empty(), "acked records compact");
     let before = kind9_posts(&messages.lock().unwrap()).len();
     assert_eq!(before, 3);
     for event in kind9_posts(&messages.lock().unwrap()).iter() {
@@ -45,10 +45,22 @@ async fn canonical_signed_media_and_notice_outbox_survive_retry() {
         assert_eq!(event.pubkey, keys.public_key());
         assert!(!event.content.contains("MEDIA:"), "publication must not expose harness directives or local paths: {}", event.content);
     }
-    // Simulate a crash after remote acceptance but before durable local ACK.
+    // Simulate a crash after remote acceptance but before durable local ACK:
+    // the record and both signed events retained, neither acknowledged.
     let mut unacked = state;
-    unacked.published.remove("media:turn:t");
     unacked.published.remove("turn:t");
+    unacked
+        .outbound
+        .insert("turn:t".into(), format!("Answer.\nMEDIA:{}", wav.display()));
+    for event in kind9_posts(&messages.lock().unwrap()) {
+        let event: nostr::Event = serde_json::from_value(event).unwrap();
+        let key = match event.content.as_str() {
+            "Background notice" => continue,
+            "Answer." => "turn:t",
+            _ => "media:turn:t",
+        };
+        unacked.publications.insert(key.into(), event);
+    }
     crate::background_routes::attachment::save(dir, "s", &unacked).unwrap();
     publish_canonical_outbox(&ctx, "s").await.unwrap();
     let sent = kind9_posts(&messages.lock().unwrap());
@@ -63,7 +75,7 @@ async fn canonical_signed_media_and_notice_outbox_survive_retry() {
 }
 
 #[tokio::test]
-async fn canonical_media_refusal_retains_outbox_for_retry() {
+async fn canonical_media_refusal_retries_then_posts_text_without_blocking_others() {
     let tmp = tempfile::tempdir().unwrap();
     let good = tmp.path().join("good.txt");
     std::fs::write(&good, b"valid artifact").unwrap();
@@ -84,16 +96,55 @@ async fn canonical_media_refusal_retains_outbox_for_retry() {
     let mut state = crate::background_routes::attachment::State::default();
     state
         .outbound
-        .insert("turn:t".into(), format!("MEDIA:{}\nMEDIA:/outside/absent.png", good.display()));
+        .insert("turn:t".into(), format!("Here it is.\nMEDIA:{}\nMEDIA:/outside/absent.png", good.display()));
     crate::background_routes::attachment::save(dir, "s", &state).unwrap();
-    for _ in 0..2 {
+    crate::background_routes::attachment::accept(dir, &serde_json::json!({"method":"session/update","params":{"sessionId":"s","_meta":{"deliveryId":3},"update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"later reply"}}}})).unwrap();
+    for _ in 1..attachment_publish::MAX_MEDIA_ATTEMPTS {
         assert!(publish_canonical_outbox(&ctx, "s").await.is_err(), "partial upload must remain pending on retry");
     }
-    assert!(kind9_posts(&messages.lock().unwrap()).is_empty(), "canonical publication must not commit a partial media set");
-    assert!(!crate::background_routes::attachment::load(dir, "s")
-        .unwrap()
-        .published
-        .contains("turn:t"));
+    let contents = |m: &[SeenRequest]| -> Vec<String> {
+        kind9_posts(m).iter().map(|e| e["content"].as_str().unwrap().to_owned()).collect()
+    };
+    assert_eq!(contents(&messages.lock().unwrap()), ["later reply"], "a retrying record must not block later replies or commit a partial media set");
+    // The final attempt gives up on the media and still delivers the reply.
+    publish_canonical_outbox(&ctx, "s").await.unwrap();
+    let posted = contents(&messages.lock().unwrap());
+    assert_eq!(posted.len(), 2, "{posted:?}");
+    assert!(posted[1].starts_with("Here it is.") && posted[1].contains("Could not attach"), "{}", posted[1]);
+    assert!(!posted[1].contains("MEDIA:"));
+    assert!(crate::background_routes::attachment::load(dir, "s").unwrap().outbound.is_empty());
+}
+
+#[tokio::test]
+async fn canonical_unbound_record_is_dropped_and_replies_publish_in_delivery_order() {
+    let tmp = tempfile::tempdir().unwrap();
+    let keys = nostr::Keys::generate();
+    let (base, messages) = media_relay_server(vec![], "unused".into(), None).await;
+    let mut ctx = make_prompt_context_no_owner();
+    ctx.rest_client.keys = keys.clone();
+    ctx.rest_client.base_url = base;
+    ctx.background_routes_dir = Some(tmp.path().join("routes"));
+    let dir = ctx.background_routes_dir.as_ref().unwrap();
+    // Committed before any return address existed: it can never bind.
+    let mut orphan = crate::background_routes::attachment::State::default();
+    orphan.outbound.insert("notice:1".into(), "orphan".into());
+    crate::background_routes::attachment::save(dir, "s", &orphan).unwrap();
+    let trigger = nostr::EventBuilder::new(nostr::Kind::Custom(9), "question")
+        .sign_with_keys(&keys)
+        .unwrap();
+    crate::background_routes::save(dir, "s", &SessionScope::Conversation { channel_id: Uuid::new_v4() }, &trigger).unwrap();
+    for id in [9, 10] {
+        crate::background_routes::attachment::accept(dir, &serde_json::json!({"method":"session/update","params":{"sessionId":"s","_meta":{"deliveryId":id},"update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":format!("n{id}")}}}})).unwrap();
+    }
+    let error = publish_canonical_outbox(&ctx, "s").await.unwrap_err();
+    assert!(error.to_string().contains("unbound"), "{error}");
+    let posted: Vec<String> = kind9_posts(&messages.lock().unwrap())
+        .iter()
+        .map(|e| e["content"].as_str().unwrap().to_owned())
+        .collect();
+    assert_eq!(posted, ["n9", "n10"]);
+    publish_canonical_outbox(&ctx, "s").await.unwrap();
+    assert!(crate::background_routes::attachment::load(dir, "s").unwrap().outbound.is_empty());
 }
 
 #[tokio::test]
