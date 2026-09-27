@@ -5616,17 +5616,31 @@ fn dispatch_delivery_turns(
         .iter()
         .flatten()
         .any(|a| a.acp.canonical_attachment());
+    // Settled canonical sessions (nothing outstanding locally) are still
+    // observed so a gateway wake after restart is published, but slowly.
+    let mut settled = HashSet::new();
     if canonical {
         if let Some(dir) = &ctx.background_routes_dir {
-            // Only sessions with an active turn or unpublished output: settled
-            // routes are never deleted and must not be reloaded every tick.
-            pending.extend(background_routes::canonical_recovery_origins(dir));
+            let origins =
+                background_routes::canonical_recovery_origins(dir, std::time::SystemTime::now());
+            pending.extend(origins.unfinished);
+            settled.extend(origins.settled.into_iter().filter(|o| !pending.contains(o)));
+            pending.extend(settled.iter().cloned());
         }
     }
     if let Ok(mut retries) = pool.recovery_retries.lock() {
         retries.retain_pending(&pending);
+        retries.retain_settled(&settled);
     }
     for origin in pending {
+        if settled.contains(&origin)
+            && !pool
+                .recovery_retries
+                .lock()
+                .is_ok_and(|r| r.settled_due(&origin, &tokio::time::Instant::now()))
+        {
+            continue;
+        }
         let live = pool.find_scope_for_session(&origin);
         let recovering = live.is_none();
         // Canonical observation reloads the session even when it is live, so
@@ -5691,6 +5705,11 @@ fn dispatch_delivery_turns(
         let ctx_clone = Arc::clone(ctx);
         let agent_index = agent.index;
         pool.record_scope_owner(scope.clone(), agent_index);
+        if settled.contains(&origin) {
+            if let Ok(mut retries) = pool.recovery_retries.lock() {
+                retries.mark_settled_polled(&origin, tokio::time::Instant::now());
+            }
+        }
         let turn_id = Uuid::new_v4().to_string();
         let task_turn_id = turn_id.clone();
         let delivery_scope = scope.clone();

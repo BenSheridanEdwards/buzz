@@ -104,8 +104,11 @@ async fn canonical_recovery_failure_backs_off_instead_of_reloading_every_tick() 
     assert_eq!(load_count(&log), 1);
 }
 
+/// A settled route (nothing active or unpublished) is still observed after
+/// restart, so a gateway wake finishing then is published unattended, but at
+/// most once per `SETTLED_POLL_INTERVAL` rather than on every tick.
 #[tokio::test]
-async fn canonical_recovery_skips_settled_routes() {
+async fn settled_canonical_route_is_polled_slowly_not_every_tick() {
     let tmp = tempfile::tempdir().unwrap();
     let dir = tmp.path().join("routes");
     let mut state = crate::background_routes::attachment::State::default();
@@ -114,19 +117,42 @@ async fn canonical_recovery_skips_settled_routes() {
     let scope = canonical_route(&dir, "settled", state);
     let mut ctx = make_prompt_context_no_owner();
     ctx.background_routes_dir = Some(dir);
+    let ctx = Arc::new(ctx);
+    let config = crate::error_outcome_emission_tests::test_config();
+    let subscribed = HashSet::from([scope.channel_id()]);
     let (agent, log) = fresh_canonical_agent(0, false).await;
     let mut pool = AgentPool::from_slots(vec![Some(agent)]);
-    crate::dispatch_delivery_turns(
-        &mut pool,
-        &Arc::new(ctx),
-        &crate::error_outcome_emission_tests::test_config(),
-        &HashSet::from([scope.channel_id()]),
-    );
-    assert!(
-        pool.join_set.is_empty(),
-        "a route with nothing unpublished and no active turn must not be reloaded"
-    );
-    assert_eq!(load_count(&log), 0);
+
+    async fn tick_and_settle(
+        pool: &mut AgentPool,
+        ctx: &Arc<PromptContext>,
+        config: &crate::config::Config,
+        subscribed: &HashSet<Uuid>,
+    ) {
+        crate::dispatch_delivery_turns(pool, ctx, config, subscribed);
+        if pool.join_set.is_empty() {
+            return;
+        }
+        let result = tokio::time::timeout(Duration::from_secs(5), pool.result_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(result.outcome, PromptOutcome::Ok(_)));
+        pool.join_set.join_next().await.unwrap().unwrap();
+        pool.task_map.clear();
+        pool.return_agent(result.agent);
+    }
+
+    tick_and_settle(&mut pool, &ctx, &config, &subscribed).await;
+    assert_eq!(load_count(&log), 1, "settled route must still be observed after restart");
+    tick_and_settle(&mut pool, &ctx, &config, &subscribed).await;
+    assert_eq!(load_count(&log), 1, "settled route must not be reloaded on the next tick");
+    pool.recovery_retries
+        .lock()
+        .unwrap()
+        .age_settled_polls(crate::background_recovery::SETTLED_POLL_INTERVAL);
+    tick_and_settle(&mut pool, &ctx, &config, &subscribed).await;
+    assert_eq!(load_count(&log), 2, "settled route must be re-polled after the interval");
 }
 
 #[tokio::test]
