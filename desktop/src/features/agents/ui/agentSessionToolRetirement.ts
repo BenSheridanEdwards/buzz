@@ -1,6 +1,29 @@
-import type { ObserverEvent, TranscriptItem } from "./agentSessionTypes";
+import type {
+  ObserverEvent,
+  ToolStatus,
+  TranscriptItem,
+} from "./agentSessionTypes";
 import { classifyTool } from "./agentSessionToolClassifier";
 import { asRecord, asString } from "./agentSessionUtils";
+
+export function isTerminalToolStatus(status: ToolStatus) {
+  return status === "completed" || status === "failed";
+}
+
+/** Late progress never reopens a completed or failed tool call. */
+export function mergeToolStatus(
+  existing: ToolStatus,
+  next: ToolStatus,
+): ToolStatus {
+  return isTerminalToolStatus(existing) && !isTerminalToolStatus(next)
+    ? existing
+    : next;
+}
+
+/** A tool call failed by its own process exit; no later frame may reopen it. */
+export function isRetiredTool(item: Extract<TranscriptItem, { type: "tool" }>) {
+  return item.status === "failed" && item.acpSource === "agent_stream_closed";
+}
 
 /** Retire only calls belonging to the closed process and original session. */
 export function retiredToolUpdates(
