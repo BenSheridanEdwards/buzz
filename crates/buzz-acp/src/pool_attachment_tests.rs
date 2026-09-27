@@ -148,16 +148,38 @@ for line in sys.stdin:
     )
     .await
     .unwrap();
-    agent
-        .acp
-        .set_background_routes_dir(ctx.background_routes_dir.clone());
+    // A freshly (re)spawned worker has never run a user turn, so nothing but
+    // the production recovery path may give it the durable routes directory.
     agent.acp.initialize().await.unwrap();
     crate::background_routes::attachment::save(
         ctx.background_routes_dir.as_ref().unwrap(),
         "origin",
-        &Default::default(),
+        &crate::background_routes::attachment::State {
+            active_turn: Some("wake".into()),
+            ..Default::default()
+        },
     )
     .unwrap();
+    let observer = crate::observer::ObserverHandle::in_process();
+    agent.acp.set_observer(Some(observer.clone()), 0);
+    agent.acp.set_observer_context(crate::observer::context_for(Some(uuid::Uuid::new_v4()), Some("foreign".into()), None));
+    let mut pool = AgentPool::from_slots(vec![Some(agent)]);
+    let ctx = Arc::new(ctx);
+    crate::dispatch_delivery_turns(
+        &mut pool,
+        &ctx,
+        &config,
+        &HashSet::from([scope.channel_id()]),
+    );
+    let result = tokio::time::timeout(Duration::from_secs(3), pool.result_rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        matches!(result.outcome, PromptOutcome::Ok(_)),
+        "observation must not dispatch DELIVERY_PROMPT"
+    );
+    let mut agent = result.agent;
     let restored = create_session_and_apply_model(
         &mut agent,
         &ctx,
@@ -175,24 +197,6 @@ for line in sys.stdin:
         restored.unwrap(),
         "origin",
         "restart must reuse durable scope, not create duplicate session"
-    );
-    let observer = crate::observer::ObserverHandle::in_process();
-    agent.acp.set_observer(Some(observer.clone()), 0);
-    agent.acp.set_observer_context(crate::observer::context_for(Some(uuid::Uuid::new_v4()), Some("foreign".into()), None));
-    let mut pool = AgentPool::from_slots(vec![Some(agent)]);
-    crate::dispatch_delivery_turns(
-        &mut pool,
-        &Arc::new(ctx),
-        &config,
-        &HashSet::from([scope.channel_id()]),
-    );
-    let result = tokio::time::timeout(Duration::from_secs(3), pool.result_rx.recv())
-        .await
-        .unwrap()
-        .unwrap();
-    assert!(
-        matches!(result.outcome, PromptOutcome::Ok(_)),
-        "observation must not dispatch DELIVERY_PROMPT"
     );
     let state =
         crate::background_routes::attachment::load(&tmp.path().join("routes"), "origin").unwrap();

@@ -2974,8 +2974,7 @@ async fn tokio_main() -> Result<()> {
     let (media_feedback_tx, mut media_feedback_rx) =
         mpsc::unbounded_channel::<pool::MediaFeedback>();
     let ctx = Arc::new(PromptContext {
-        background_routes_dir: agent_hermes_home(&config)
-            .map(|home| background_routes::directory(&home, &config.relay_url, &pubkey_hex)),
+        background_routes_dir: background_routes_dir(&config),
         media_feedback_tx: Some(media_feedback_tx),
         transcribe_endpoint: config.transcribe_endpoint.clone(),
         transcribe_profile: config.transcribe_profile.clone(),
@@ -3315,9 +3314,12 @@ async fn tokio_main() -> Result<()> {
                 let env = config.persona_env_vars.clone();
                 let has_codex = config.has_generated_codex_config;
                 let observer = observer.clone();
+                let routes_dir = background_routes_dir(&config);
                 let guard = RespawnGuard::new(idx, respawn_tx.clone());
                 respawn_tasks.spawn(async move {
-                    let result = spawn_and_init(&cmd, &args, &env, has_codex, idx, observer).await;
+                    let result =
+                        spawn_and_init(&cmd, &args, &env, has_codex, idx, observer, routes_dir)
+                            .await;
                     guard.send(result);
                 });
             }
@@ -5505,12 +5507,13 @@ fn recover_panicked_agent(
     let args = config.agent_args.clone();
     let env = config.persona_env_vars.clone();
     let has_codex = config.has_generated_codex_config;
+    let routes_dir = background_routes_dir(config);
     let guard = RespawnGuard::new(i, respawn_tx.clone());
     respawn_tasks.spawn(async move {
         if !delay.is_zero() {
             tokio::time::sleep(delay).await;
         }
-        let result = spawn_and_init(&cmd, &args, &env, has_codex, i, observer).await;
+        let result = spawn_and_init(&cmd, &args, &env, has_codex, i, observer, routes_dir).await;
         guard.send(result);
     });
 }
@@ -5608,17 +5611,16 @@ fn dispatch_delivery_turns(
     subscribed: &HashSet<Uuid>,
 ) {
     let mut pending: HashSet<String> = pending_delivery_origins(config).into_iter().collect();
-    if pool
+    let canonical = pool
         .agents_mut()
         .iter()
         .flatten()
-        .any(|a| a.acp.canonical_attachment())
-    {
+        .any(|a| a.acp.canonical_attachment());
+    if canonical {
         if let Some(dir) = &ctx.background_routes_dir {
-            match background_routes::canonical_routes(dir) {
-                Ok(routes) => pending.extend(routes.into_iter().map(|r| r.session_id)),
-                Err(error) => tracing::error!(%error, "canonical routes require reconciliation"),
-            }
+            // Only sessions with an active turn or unpublished output: settled
+            // routes are never deleted and must not be reloaded every tick.
+            pending.extend(background_routes::canonical_recovery_origins(dir));
         }
     }
     if let Ok(mut retries) = pool.recovery_retries.lock() {
@@ -5627,7 +5629,9 @@ fn dispatch_delivery_turns(
     for origin in pending {
         let live = pool.find_scope_for_session(&origin);
         let recovering = live.is_none();
-        if recovering
+        // Canonical observation reloads the session even when it is live, so
+        // it shares the bounded recovery backoff.
+        if (recovering || canonical)
             && !pool
                 .recovery_retries
                 .lock()
@@ -5660,6 +5664,11 @@ fn dispatch_delivery_turns(
         let Some(mut agent) = claimed else {
             continue;
         };
+        // A restarted or respawned worker may never have run a user turn;
+        // recovery needs the durable routes before it can load a session.
+        agent
+            .acp
+            .set_background_routes_dir(ctx.background_routes_dir.clone());
         let channel_id = scope.channel_id();
         let batch = FlushBatch {
             channel_id,
@@ -5695,8 +5704,18 @@ fn dispatch_delivery_turns(
                     agent.acp.session_load(&origin, &ctx_clone.cwd, Vec::new()).await?;
                     pool::publish_canonical_outbox(&ctx_clone, &origin).await
                 }.await {
-                    Ok(()) => pool::PromptOutcome::Ok(acp::StopReason::EndTurn),
-                    Err(error) => pool::PromptOutcome::Error(error),
+                    Ok(()) => {
+                        if let Ok(mut retries) = recovery_retries.lock() {
+                            retries.clear(&origin);
+                        }
+                        pool::PromptOutcome::Ok(acp::StopReason::EndTurn)
+                    }
+                    Err(error) => {
+                        let notice = recovery_retries.lock().map(|mut retries| retries.fail(&origin, tokio::time::Instant::now()))
+                            .unwrap_or_else(|_| "Recovery retry state unavailable; result remains pending.".into());
+                        tracing::error!(%error, %origin, %notice, "canonical session recovery failed");
+                        pool::PromptOutcome::Error(error)
+                    }
                 };
                 let _ = result_tx.send(PromptResult {
                     agent, source: PromptSource::Channel(delivery_scope),
@@ -6076,6 +6095,7 @@ fn spawn_respawn_task(
     let args = config.agent_args.clone();
     let env = config.persona_env_vars.clone();
     let has_codex = config.has_generated_codex_config;
+    let routes_dir = background_routes_dir(config);
     let guard = RespawnGuard::new(index, respawn_tx.clone());
     respawn_tasks.spawn(async move {
         // Shutdown old agent (reap child, prevent zombie).
@@ -6087,7 +6107,8 @@ fn spawn_respawn_task(
             tokio::time::sleep(delay).await;
         }
 
-        let result = spawn_and_init(&cmd, &args, &env, has_codex, index, observer).await;
+        let result =
+            spawn_and_init(&cmd, &args, &env, has_codex, index, observer, routes_dir).await;
         guard.send(result);
     });
 
@@ -6125,6 +6146,13 @@ async fn shutdown_agent_pool(pool: &mut AgentPool) {
     }
 }
 
+/// This agent's private durable return-route directory, when Hermes is used.
+fn background_routes_dir(config: &Config) -> Option<std::path::PathBuf> {
+    let pubkey = config.keys.public_key().to_hex();
+    agent_hermes_home(config)
+        .map(|home| background_routes::directory(&home, &config.relay_url, &pubkey))
+}
+
 struct PoolStartup {
     agents: u32,
     command: String,
@@ -6134,6 +6162,7 @@ struct PoolStartup {
     model: Option<String>,
     effort_level: Option<String>,
     observer: Option<observer::ObserverHandle>,
+    background_routes_dir: Option<std::path::PathBuf>,
 }
 
 impl PoolStartup {
@@ -6147,6 +6176,7 @@ impl PoolStartup {
             model: config.model.clone(),
             effort_level: config.effort_level.clone(),
             observer,
+            background_routes_dir: background_routes_dir(config),
         }
     }
 }
@@ -6169,6 +6199,7 @@ async fn initialize_agent_pool(
         match spawn_result {
             Ok(mut acp) => {
                 acp.set_observer(startup.observer.clone(), i);
+                acp.set_background_routes_dir(startup.background_routes_dir.clone());
                 let initialize = tokio::time::timeout(Duration::from_secs(60), acp.initialize());
                 let initialize_result = match shutdown.as_mut() {
                     Some(shutdown) => tokio::select! {
@@ -6269,11 +6300,15 @@ async fn spawn_and_init(
     has_generated_codex_config: bool,
     agent_index: usize,
     observer: Option<observer::ObserverHandle>,
+    background_routes_dir: Option<std::path::PathBuf>,
 ) -> Result<(AcpClient, u32, String)> {
     let mut acp = AcpClient::spawn(command, args, extra_env, has_generated_codex_config)
         .await
         .map_err(|e| anyhow::anyhow!("failed to spawn agent: {e}"))?;
     acp.set_observer(observer, agent_index);
+    // An idle respawned worker must be able to load canonical sessions and
+    // accept durable frames before any user turn runs on it.
+    acp.set_background_routes_dir(background_routes_dir);
 
     match acp.initialize().await {
         Ok(init_result) => {

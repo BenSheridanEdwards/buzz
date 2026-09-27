@@ -51,9 +51,12 @@ impl RecoveryRetries {
         self.failures.remove(origin);
     }
 
-    /// Keep retry state only for the durable pending origins advertised now.
+    /// Keep retry state for the durable pending origins advertised now. A
+    /// paused origin keeps its terminal state even when the best-effort
+    /// marker briefly omits it; only a harness restart re-opens it.
     pub(crate) fn retain_pending(&mut self, pending: &HashSet<String>) {
-        self.failures.retain(|origin, _| pending.contains(origin));
+        self.failures
+            .retain(|origin, failure| failure.attempts >= 3 || pending.contains(origin));
     }
 }
 
@@ -95,5 +98,18 @@ mod tests {
         assert!(!retries.ready("pending", &now));
         assert!(retries.ready("completed", &now));
         assert!(RecoveryRetries::default().ready("pending", &now));
+    }
+
+    #[test]
+    fn paused_origin_stays_paused_when_marker_briefly_omits_it() {
+        let mut retries = RecoveryRetries::default();
+        let now = Instant::now();
+        for _ in 0..3 {
+            retries.fail("paused", now);
+        }
+        // Hermes' marker is best-effort: a tick that omits the origin must not
+        // reset the terminal state and buy three more full reload attempts.
+        retries.retain_pending(&HashSet::new());
+        assert!(!retries.ready("paused", &(now + Duration::from_secs(86400))));
     }
 }
