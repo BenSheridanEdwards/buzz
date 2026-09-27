@@ -1020,20 +1020,32 @@ impl AgentPool {
     /// fork onto another idle worker, the pre-thread-sessions behavior. Only
     /// `Thread` scopes hold, so a momentarily busy owner does not cause a
     /// duplicate provider session for the same thread.
+    ///
+    /// Canonical attachment agents never fork, for any scope variant and after
+    /// any wait: a fork would either open a second gateway session for the
+    /// scope (irreconcilable canonical routes) or load the owner's session on
+    /// a second connection while its turn is live. They queue behind the owner.
     pub fn hold_decision(
         &mut self,
         scope: &SessionScope,
         now: std::time::Instant,
         timeout: Duration,
     ) -> HoldDecision {
-        if !scope.is_thread() || !self.should_hold_for_busy_owner(scope) {
+        let busy_owner = self.should_hold_for_busy_owner(scope);
+        let canonical = busy_owner
+            && self
+                .agents
+                .iter()
+                .flatten()
+                .any(|agent| agent.acp.canonical_attachment());
+        if !busy_owner || !(scope.is_thread() || canonical) {
             self.held_since.remove(scope);
             return HoldDecision::Dispatch;
         }
         let owner_index = self.session_owners.get(scope).copied().unwrap_or_default();
         let first = *self.held_since.entry(scope.clone()).or_insert(now);
         let held_for = now.saturating_duration_since(first);
-        if held_for >= timeout {
+        if held_for >= timeout && !canonical {
             self.held_since.remove(scope);
             HoldDecision::ForkAfterHold {
                 held_for,
@@ -6276,6 +6288,7 @@ async fn clear_reactions(rest: crate::relay::RestClient, event_ids: Vec<String>)
 mod tests {
     use super::*;
     include!("pool_attachment_tests.rs");
+    include!("pool_canonical_recovery_tests.rs");
     use nostr::{EventBuilder, Keys, Kind, Tag, Timestamp};
     use serde_json::json;
 
