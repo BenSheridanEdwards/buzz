@@ -867,17 +867,17 @@ test("background worker updates after parent completion remain visible", async (
   };
   await seedObserverEvents(page, OBSERVER_AGENT_PUBKEY, [pending]);
   await expect(
-    panel.getByRole("status").filter({ hasText: "Pending" }),
+    panel.getByTestId("transcript-tool-status").filter({ hasText: "Pending" }),
   ).toBeVisible();
   await expect(
-    panel.getByRole("status").filter({ hasText: "Running" }),
+    panel.getByTestId("transcript-tool-status").filter({ hasText: "Running" }),
   ).toHaveCount(0);
   await seedObserverEvents(page, OBSERVER_AGENT_PUBKEY, [start, parentDone]);
   await expect(
     panel.getByText("Worker: verify background repair", { exact: true }),
   ).toBeVisible();
   await expect(
-    panel.getByRole("status").filter({ hasText: "Running" }),
+    panel.getByTestId("transcript-tool-status").filter({ hasText: "Running" }),
   ).toBeVisible();
   await panel.screenshot({ path: `${SHOTS}/background-worker-running.png` });
   const failure = {
@@ -966,15 +966,15 @@ test("background worker updates after parent completion remain visible", async (
     panel
       .getByTestId("transcript-tool-item")
       .filter({ hasText: `Worker: ${title}` });
-  await expect(toolRow("interrupted-by-exit").getByRole("status")).toHaveText(
-    "Failed",
-  );
-  await expect(toolRow("finished-before-exit")).toBeVisible();
-  await expect(toolRow("finished-before-exit").getByRole("status")).toHaveCount(
-    0,
-  );
   await expect(
-    toolRow("different-runtime-session").getByRole("status"),
+    toolRow("interrupted-by-exit").getByTestId("transcript-tool-status"),
+  ).toHaveText("Failed");
+  await expect(toolRow("finished-before-exit")).toBeVisible();
+  await expect(
+    toolRow("finished-before-exit").getByTestId("transcript-tool-status"),
+  ).toHaveCount(0);
+  await expect(
+    toolRow("different-runtime-session").getByTestId("transcript-tool-status"),
   ).toHaveText("Running");
   await expect(
     toolRow("interrupted-by-exit").getByText("Running", { exact: true }),
@@ -992,12 +992,12 @@ test("background worker updates after parent completion remain visible", async (
     },
     tool(11, "replacement-runtime", "in_progress", "newer-session"),
   ]);
-  await expect(toolRow("older-evicted-session").getByRole("status")).toHaveText(
-    "Failed",
-  );
-  await expect(toolRow("replacement-runtime").getByRole("status")).toHaveText(
-    "Running",
-  );
+  await expect(
+    toolRow("older-evicted-session").getByTestId("transcript-tool-status"),
+  ).toHaveText("Failed");
+  await expect(
+    toolRow("replacement-runtime").getByTestId("transcript-tool-status"),
+  ).toHaveText("Running");
   await seedObserverEvents(page, OBSERVER_AGENT_PUBKEY, [
     tool(12, "archived-channel-worker", "in_progress", "evicted-session"),
     {
@@ -1011,10 +1011,10 @@ test("background worker updates after parent completion remain visible", async (
     tool(14, "latest-runtime", "in_progress", "latest-session"),
   ]);
   await expect(
-    toolRow("archived-channel-worker").getByRole("status"),
+    toolRow("archived-channel-worker").getByTestId("transcript-tool-status"),
   ).toHaveText("Failed");
-  await expect(toolRow("latest-runtime").getByRole("status")).toHaveText(
-    "Running",
-  );
+  await expect(
+    toolRow("latest-runtime").getByTestId("transcript-tool-status"),
+  ).toHaveText("Running");
   expect(pageErrors).toEqual([]);
 });
