@@ -1320,22 +1320,22 @@ async fn mid_turn_usage_includes_earlier_turns() {
 /// Setup: round 1 is a tool call WITH usage (tokens are captured). After the
 /// tool_call_update notification (proving round 1 is fully processed), we gate
 /// the round-2 LLM response behind a `oneshot` barrier that only releases after
-/// cancel is sent. This guarantees the turn exits with `stopReason: "cancelled"`
-/// deterministically, even on a slow CI worker.
+/// the cancelled prompt has completed. Cancel must interrupt the outstanding
+/// HTTP request; merely writing cancel to stdin does not synchronize the agent's
+/// request reader with the fake HTTP server.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cancelled_turn_with_usage_emits_notification_before_response() {
     use tokio::sync::oneshot;
 
-    // Gate: the second LLM request (round 2) is held until we explicitly release it.
+    // Keep round 2 pending until the cancelled prompt has completed.
     let (gate_tx, gate_rx) = oneshot::channel::<()>();
+    let (round_two_started_tx, round_two_started_rx) = oneshot::channel::<()>();
     let gate_rx = Arc::new(tokio::sync::Mutex::new(Some(gate_rx)));
 
     // Round 1: tool call with usage — sets turn_input/output_tokens.
-    // Round 2: gated — blocked until cancel fires, then released so the
-    // in-flight TCP request can resolve. The queue is empty for round 2, so the
-    // agent receives the fallback "no canned response" body which it treats as
-    // an LLM error; the cancel check at the round boundary fires first because
-    // the gate is only released after cancel is enqueued.
+    // Round 2 never responds before cancellation completes. Releasing it as
+    // soon as cancel was written raced the agent's stdin reader: the fallback
+    // error could win before the cancel flag was set, producing an RPC error.
     let responses = vec![openai_tool_call_with_usage(
         "call_cancel_test",
         "fake__noop",
@@ -1349,6 +1349,7 @@ async fn cancelled_turn_with_usage_emits_notification_before_response() {
     let gate_rx_clone = gate_rx.clone();
     tokio::spawn(async move {
         let mut request_num = 0usize;
+        let mut round_two_started_tx = Some(round_two_started_tx);
         loop {
             let (mut sock, _) = match listener.accept().await {
                 Ok(p) => p,
@@ -1358,6 +1359,11 @@ async fn cancelled_turn_with_usage_emits_notification_before_response() {
             let gate = gate_rx_clone.clone();
             request_num += 1;
             let req_num = request_num;
+            let started = if req_num == 2 {
+                round_two_started_tx.take()
+            } else {
+                None
+            };
             tokio::spawn(async move {
                 let mut buf = Vec::new();
                 let mut tmp = [0u8; 4096];
@@ -1370,9 +1376,11 @@ async fn cancelled_turn_with_usage_emits_notification_before_response() {
                         return;
                     }
                 }
-                // For request 2+ (round 2), wait for the gate to open before
-                // responding. This ensures cancel is sent before round 2 resolves,
-                // making stopReason: cancelled deterministic.
+                if let Some(started) = started {
+                    let _ = started.send(());
+                }
+                // The test must observe cancellation while this response is
+                // still blocked, independent of subprocess scheduling.
                 if req_num >= 2 {
                     let rx = gate.lock().await.take();
                     if let Some(rx) = rx {
@@ -1415,10 +1423,13 @@ async fn cancelled_turn_with_usage_emits_notification_before_response() {
     })
     .await;
 
-    // Now send cancel and release the round-2 gate. Cancel is enqueued before
-    // round 2 can respond, so the turn exits with stopReason: cancelled.
+    // Prove the second HTTP request is in flight before cancelling. Keep its
+    // response gated until all cancellation/usage assertions have completed.
+    tokio::time::timeout(Duration::from_secs(5), round_two_started_rx)
+        .await
+        .expect("round 2 did not reach the fake provider")
+        .expect("fake provider stopped before round 2");
     let c_id = h.send("session/cancel", json!({"sessionId": sid})).await;
-    let _ = gate_tx.send(()); // unblock round 2
 
     let mut saw_usage_before_prompt_response = false;
     let mut saw_usage = false;
@@ -1438,7 +1449,7 @@ async fn cancelled_turn_with_usage_emits_notification_before_response() {
             // The gate guarantees stopReason: cancelled — not a race-driven error.
             assert_eq!(
                 v["result"]["stopReason"], "cancelled",
-                "turn must end with stopReason: cancelled"
+                "turn must end with stopReason: cancelled; response={v}"
             );
         }
         if saw_usage && saw_prompt_response && saw_cancel_ok {
@@ -1446,6 +1457,10 @@ async fn cancelled_turn_with_usage_emits_notification_before_response() {
         }
     }
     assert!(saw_cancel_ok, "session/cancel was not acknowledged");
+    assert!(
+        saw_prompt_response,
+        "cancelled prompt did not finish while HTTP response was gated"
+    );
     assert!(
         saw_usage,
         "expected usage_update notification for cancelled turn with observed tokens"
@@ -1455,6 +1470,7 @@ async fn cancelled_turn_with_usage_emits_notification_before_response() {
         "usage_update must arrive before the session/prompt response"
     );
 
+    let _ = gate_tx.send(());
     h.shutdown().await;
 }
 

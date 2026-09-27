@@ -6,14 +6,13 @@
 use buzz_core::{
     kind::{
         KIND_AGENT_OBSERVER_FRAME, KIND_APPROVAL_DENY, KIND_APPROVAL_GRANT, KIND_DELETION,
-        KIND_VOICE_NOTE_TRANSCRIPT,
         KIND_DM_ADD_MEMBER, KIND_DM_OPEN, KIND_EMOJI_SET, KIND_GIT_ISSUE, KIND_GIT_PATCH,
         KIND_GIT_PR_UPDATE, KIND_GIT_PULL_REQUEST, KIND_GIT_REPO_ANNOUNCEMENT,
         KIND_GIT_STATUS_CLOSED, KIND_GIT_STATUS_DRAFT, KIND_GIT_STATUS_MERGED,
         KIND_GIT_STATUS_OPEN, KIND_IA_ARCHIVE_REQUEST, KIND_IA_UNARCHIVE_REQUEST,
         KIND_MODERATION_BAN, KIND_MODERATION_RESOLVE_REPORT, KIND_MODERATION_TIMEOUT,
         KIND_MODERATION_UNBAN, KIND_MODERATION_UNTIMEOUT, KIND_PRESENCE_UPDATE, KIND_PROJECT,
-        KIND_USER_STATUS, KIND_WORKFLOW_DEF, KIND_WORKFLOW_TRIGGER,
+        KIND_USER_STATUS, KIND_VOICE_NOTE_TRANSCRIPT, KIND_WORKFLOW_DEF, KIND_WORKFLOW_TRIGGER,
     },
     observer::{
         content_looks_like_nip44, OBSERVER_AGENT_TAG, OBSERVER_FRAME_CONTROL, OBSERVER_FRAME_TAG,
@@ -485,11 +484,7 @@ pub fn build_voice_note_transcript(
         tag(&["h", &channel_id.to_string()])?,
         tag(&["e", &target_event_id.to_hex()])?,
     ];
-    Ok(EventBuilder::new(
-        Kind::Custom(KIND_VOICE_NOTE_TRANSCRIPT as u16),
-        transcript,
-    )
-    .tags(tags))
+    Ok(EventBuilder::new(Kind::Custom(KIND_VOICE_NOTE_TRANSCRIPT as u16), transcript).tags(tags))
 }
 
 /// Build a NIP-09 deletion event (kind 5). The `h` tag is non-standard for

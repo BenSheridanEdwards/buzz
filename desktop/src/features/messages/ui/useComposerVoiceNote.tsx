@@ -43,9 +43,9 @@ type Hold = {
 /**
  * Why a hold ended. A `release` is the user letting go (pointer up, Space
  * up) and may be a tap; an `interruption` (window blur, page hidden) is not a
- * gesture, so it never locks.
+ * gesture, so it never locks. A system-cancelled pointer discards its hold.
  */
-type HoldEnd = "release" | "interruption";
+type HoldEnd = "release" | "interruption" | "cancel";
 
 type Outcome = "discarded" | "finished";
 
@@ -340,6 +340,10 @@ export function useComposerVoiceNote({
       const hold = releaseHold();
       if (!hold) return;
       if (lockedRef.current) return;
+      if (end === "cancel") {
+        discard();
+        return;
+      }
       const status = statusRef.current;
       const isTap =
         end === "release" &&
@@ -355,14 +359,14 @@ export function useComposerVoiceNote({
       if (isTap) lock();
       else void sendRef.current();
     },
-    [lock, recorder.cancel, releaseHold],
+    [discard, lock, recorder.cancel, releaseHold],
   );
   const endHoldRef = React.useRef(endHold);
   endHoldRef.current = endHold;
   const endPointerHold = React.useCallback(() => endHold("release"), [endHold]);
   /** The mic's own `pointercancel`, which fires before the window's. */
   const cancelPointerHold = React.useCallback(
-    () => endHold("interruption"),
+    () => endHold("cancel"),
     [endHold],
   );
 
@@ -372,6 +376,7 @@ export function useComposerVoiceNote({
       if (!acceptsStart()) return;
       const onRelease = () => endHoldRef.current("release");
       const onInterruption = () => endHoldRef.current("interruption");
+      const onCancel = () => endHoldRef.current("cancel");
       const onKeyUp = (event: KeyboardEvent) => {
         if (isSpaceKey(event)) endHoldRef.current("release");
       };
@@ -383,8 +388,8 @@ export function useComposerVoiceNote({
       if (source === "pointer") {
         window.addEventListener("pointerup", onRelease);
         // A cancelled press is the system taking the pointer away, not the
-        // user letting go: it must never read as a tap and lock hands free.
-        window.addEventListener("pointercancel", onInterruption);
+        // user letting go: it must neither lock hands free nor send the note.
+        window.addEventListener("pointercancel", onCancel);
       } else {
         window.addEventListener("keyup", onKeyUp);
       }
@@ -393,7 +398,7 @@ export function useComposerVoiceNote({
           window.removeEventListener("blur", onInterruption);
           document.removeEventListener("visibilitychange", onVisibilityChange);
           window.removeEventListener("pointerup", onRelease);
-          window.removeEventListener("pointercancel", onInterruption);
+          window.removeEventListener("pointercancel", onCancel);
           window.removeEventListener("keyup", onKeyUp);
         },
         source,

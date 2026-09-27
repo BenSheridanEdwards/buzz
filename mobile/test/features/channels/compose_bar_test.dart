@@ -5054,10 +5054,7 @@ void main() {
 
         await _tapMic(tester);
         // Start is deferred behind the keyboard: the recorder is not up yet.
-        expect(
-          find.byKey(const ValueKey('voice-note-recorder')),
-          findsNothing,
-        );
+        expect(find.byKey(const ValueKey('voice-note-recorder')), findsNothing);
 
         // Keyboard finishes hiding: the recorder mounts and capture begins.
         tester.view.viewInsets = FakeViewPadding.zero;

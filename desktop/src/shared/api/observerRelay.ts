@@ -2,6 +2,14 @@ import { buildObserverControlEvent } from "@/shared/api/tauriObserver";
 import type { RelayEvent } from "@/shared/api/types";
 import { KIND_AGENT_OBSERVER_FRAME } from "@/shared/constants/kinds";
 import { relayClient } from "./relayClient";
+import type { ConnectionState } from "./relayClientShared";
+
+/** Observe the authenticated relay lifecycle, including reconnect and teardown. */
+export function subscribeToObserverConnectionState(
+  listener: (state: ConnectionState) => void,
+) {
+  return relayClient.subscribeToConnectionState(listener);
+}
 
 // How far back (in seconds) the live subscription looks on connect/reconnect.
 // session/prompt is the first frame emitted at turn start, so it can arrive

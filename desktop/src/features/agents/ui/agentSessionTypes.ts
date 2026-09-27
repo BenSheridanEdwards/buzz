@@ -131,6 +131,8 @@ export type TranscriptItem =
       toolName: string;
       buzzToolName: string | null;
       status: ToolStatus;
+      /** Runtime pool slot that emitted this call; used to fence process-exit updates. */
+      agentIndex?: number | null;
       args: Record<string, unknown>;
       result: string;
       isError: boolean;

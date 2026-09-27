@@ -147,8 +147,9 @@ pub mod relay_members {
     /// immediately — no membership check is performed. Callers that need NIP-OA
     /// owner extraction on open relays should call [`extract_nip_oa_owner`] directly.
     ///
-    /// Returns `Ok(None)` when the caller is a direct member (closed relay) or when
-    /// no NIP-OA tag is present/applicable (open relay without auth tag).
+    /// Direct members also return a cryptographically verified owner when an
+    /// attestation is present. Membership admission and owner materialization
+    /// are separate: already being a member must not suppress observer ownership.
     pub async fn enforce_relay_membership(
         state: &AppState,
         community: CommunityId,
@@ -165,7 +166,12 @@ pub mod relay_members {
         )
         .await
         {
-            Ok(MembershipDecision::OpenRelay) | Ok(MembershipDecision::Member) => Ok(None),
+            Ok(MembershipDecision::OpenRelay) => Ok(None),
+            Ok(MembershipDecision::Member) => Ok(direct_member_owner(
+                pubkey_bytes,
+                auth_tag_header,
+                signed_auth_created_at,
+            )),
             Ok(MembershipDecision::ViaOwner(owner)) => Ok(Some(owner)),
             Ok(MembershipDecision::Denied) => Err((
                 StatusCode::FORBIDDEN,
@@ -179,6 +185,16 @@ pub mod relay_members {
                 Err(super::internal_error(&e))
             }
         }
+    }
+
+    // Called only after direct membership is confirmed. Invalid/missing proof
+    // leaves membership intact but must never establish an owner relationship.
+    fn direct_member_owner(
+        pubkey: &[u8],
+        tag: Option<&str>,
+        signed_at: Option<u64>,
+    ) -> Option<nostr::PublicKey> {
+        extract_nip_oa_owner(pubkey, tag, signed_at)
     }
 
     /// Extract NIP-OA owner from an auth tag without membership enforcement.
@@ -295,6 +311,131 @@ pub mod relay_members {
 
             headers.append("x-auth-tag", HeaderValue::from_static("credential-two"));
             assert_eq!(extract_auth_tag_header(&headers), None);
+        }
+
+        #[tokio::test]
+        async fn direct_member_owner_reaches_authorization_materialization() {
+            use std::sync::Arc;
+            let mut config = crate::config::Config::from_env().unwrap();
+            config.database_url = crate::test_support::database_url();
+            config.require_relay_membership = true;
+            // Owner extraction must work independently of delegated admission.
+            config.allow_nip_oa_auth = false;
+            config.redis_url = "redis://127.0.0.1:1".into();
+            let pool = sqlx::PgPool::connect(&config.database_url).await.unwrap();
+            let db = buzz_db::Db::from_pool(pool.clone());
+            let host = format!("owner-regression-{}.test", uuid::Uuid::new_v4());
+            let community = db.ensure_configured_community(&host).await.unwrap().id;
+            let tenant = TenantContext::resolved(community, host);
+            let owner = Keys::generate();
+            let agent = Keys::generate().public_key();
+            db.add_relay_member(community, &agent.to_hex(), "member", None)
+                .await
+                .unwrap();
+            let redis = deadpool_redis::Config::from_url(&config.redis_url)
+                .create_pool(Some(deadpool_redis::Runtime::Tokio1))
+                .unwrap();
+            let pubsub = Arc::new(
+                buzz_pubsub::PubSubManager::new(&config.redis_url, redis.clone())
+                    .await
+                    .unwrap(),
+            );
+            let audit = buzz_audit::AuditService::new(pool.clone());
+            let auth = buzz_auth::AuthService::new(config.auth.clone());
+            let search = buzz_search::SearchService::new(pool.clone());
+            let workflow = Arc::new(buzz_workflow::WorkflowEngine::new(
+                db.clone(),
+                buzz_workflow::WorkflowConfig::default(),
+            ));
+            let media = buzz_media::MediaStorage::new(&config.media).unwrap();
+            let (state, _shutdown) = AppState::new(
+                config,
+                db,
+                redis,
+                audit,
+                pubsub,
+                auth,
+                search,
+                workflow,
+                Keys::generate(),
+                media,
+            );
+            let proof = compute_auth_tag(&owner, &agent, "created_at>100&created_at<300").unwrap();
+
+            // Drive the actual DB-backed gate, not only the extraction helper.
+            let extracted = enforce_relay_membership(
+                &state,
+                community,
+                agent.as_bytes(),
+                Some(&proof),
+                Some(200),
+            )
+            .await
+            .unwrap();
+            assert_eq!(extracted, Some(owner.public_key()));
+            assert!(materialize_nip_oa_owner(&state, &tenant, &agent, &extracted.unwrap()).await);
+            assert!(state
+                .db
+                .is_agent_owner(community, agent.as_bytes(), owner.public_key().as_bytes())
+                .await
+                .unwrap());
+            // Invalid proof must neither remove membership nor install an owner.
+            assert_eq!(
+                enforce_relay_membership(
+                    &state,
+                    community,
+                    agent.as_bytes(),
+                    Some(&proof),
+                    Some(300)
+                )
+                .await
+                .unwrap(),
+                None
+            );
+            assert_eq!(
+                enforce_relay_membership(&state, community, agent.as_bytes(), None, Some(200))
+                    .await
+                    .unwrap(),
+                None
+            );
+            // A different valid owner cannot overwrite the established mapping.
+            assert!(
+                !materialize_nip_oa_owner(&state, &tenant, &agent, &Keys::generate().public_key())
+                    .await
+            );
+            assert!(state
+                .db
+                .is_agent_owner(community, agent.as_bytes(), owner.public_key().as_bytes())
+                .await
+                .unwrap());
+        }
+
+        #[test]
+        fn existing_member_keeps_verified_owner_for_observer_backfill() {
+            let owner = Keys::generate();
+            let agent = Keys::generate().public_key();
+            let proof = compute_auth_tag(&owner, &agent, "created_at>100&created_at<300").unwrap();
+            assert_eq!(
+                direct_member_owner(agent.as_bytes(), Some(&proof), Some(200)),
+                Some(owner.public_key())
+            );
+            assert_eq!(
+                direct_member_owner(agent.as_bytes(), Some(&proof), Some(300)),
+                None
+            );
+            assert_eq!(
+                direct_member_owner(agent.as_bytes(), Some(&proof), None),
+                None
+            );
+            assert_eq!(
+                direct_member_owner(
+                    Keys::generate().public_key().as_bytes(),
+                    Some(&proof),
+                    Some(200)
+                ),
+                None
+            );
+            assert_eq!(direct_member_owner(agent.as_bytes(), None, Some(200)), None);
         }
 
         /// Valid NIP-OA auth tag → returns Some(owner_pubkey).

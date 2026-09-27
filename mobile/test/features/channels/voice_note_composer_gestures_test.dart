@@ -575,6 +575,13 @@ void main() {
     expect(recorderFinder, findsNothing);
     expect(micFinder, findsOneWidget);
     expect(phase(tester).phase, VoiceNoteRecorderPhase.idle);
+
+    // A late keyboard-hide callback must not start the abandoned capture.
+    tester.view.viewInsets = FakeViewPadding.zero;
+    await tester.pumpAndSettle();
+    expect(recorder.started, isFalse);
+    expect(recorderFinder, findsNothing);
+    expect(phase(tester).phase, VoiceNoteRecorderPhase.idle);
   });
 
   testWidgets('status is a live region and the timer is announced on tens', (

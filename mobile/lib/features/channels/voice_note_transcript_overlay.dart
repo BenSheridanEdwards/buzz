@@ -25,7 +25,9 @@ const int maxTranscriptChars = 1000;
 
 /// C0 and C1 controls, plus the bidirectional marks and overrides that can
 /// visually reverse a sentence even in a plain text widget.
-final RegExp _controlOrBidi = RegExp(r'[\u0000-\u001f\u007f-\u009f\u200e\u200f\u202a-\u202e\u2066-\u2069]');
+final RegExp _controlOrBidi = RegExp(
+  r'[\u0000-\u001f\u007f-\u009f\u200e\u200f\u202a-\u202e\u2066-\u2069]',
+);
 
 /// Make a third-party transcript safe to show on the author's card.
 ///

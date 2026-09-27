@@ -1,0 +1,129 @@
+{
+  "initialize": {
+    "protocolVersion": 1,
+    "agentInfo": {
+      "name": "hermes-gateway",
+      "version": "1"
+    },
+    "agentCapabilities": {
+      "loadSession": true,
+      "promptCapabilities": {},
+      "mcpCapabilities": {}
+    },
+    "authMethods": []
+  },
+  "history": [
+    {
+      "jsonrpc": "2.0",
+      "method": "session/update",
+      "params": {
+        "sessionId": "s",
+        "update": {
+          "sessionUpdate": "agent_message_chunk",
+          "content": {
+            "type": "text",
+            "text": "old reply"
+          }
+        }
+      }
+    }
+  ],
+  "idleLoad": {},
+  "activeLoad": {
+    "_meta": {
+      "activeTurn": {
+        "turnId": "2e1b1b1a933e4bdbb716deb12f1a86b9",
+        "status": "in_progress"
+      }
+    }
+  },
+  "activeUpdates": [
+    {
+      "jsonrpc": "2.0",
+      "method": "session/update",
+      "params": {
+        "sessionId": "s",
+        "update": {
+          "sessionUpdate": "agent_message_chunk",
+          "content": {
+            "type": "text",
+            "text": "old reply"
+          }
+        }
+      }
+    },
+    {
+      "jsonrpc": "2.0",
+      "method": "session/update",
+      "params": {
+        "sessionId": "s",
+        "update": {
+          "sessionUpdate": "agent_message_chunk",
+          "content": {
+            "type": "text",
+            "text": "live reply"
+          }
+        }
+      }
+    },
+    {
+      "jsonrpc": "2.0",
+      "method": "session/update",
+      "params": {
+        "sessionId": "s",
+        "update": {
+          "sessionUpdate": "tool_call",
+          "toolCallId": "call-1",
+          "title": "terminal",
+          "kind": "other",
+          "status": "in_progress",
+          "rawInput": {
+            "command": "printf test"
+          }
+        }
+      }
+    }
+  ],
+  "promptResult": {
+    "stopReason": "end_turn",
+    "_meta": {
+      "turnId": "2e1b1b1a933e4bdbb716deb12f1a86b9",
+      "finalResponse": "live reply"
+    }
+  },
+  "journalLoad": {
+    "_meta": {
+      "lastDeliveryId": 1,
+      "hasMoreDeliveries": false
+    }
+  },
+  "journalUpdates": [
+    {
+      "jsonrpc": "2.0",
+      "method": "session/update",
+      "params": {
+        "sessionId": "s",
+        "update": {
+          "sessionUpdate": "agent_message_chunk",
+          "content": {
+            "type": "text",
+            "text": "old reply"
+          }
+        }
+      }
+    },
+    {
+      "jsonrpc": "2.0",
+      "method": "_hermes/turn_complete",
+      "params": {
+        "sessionId": "s",
+        "turnId": "2e1b1b1a933e4bdbb716deb12f1a86b9",
+        "stopReason": "end_turn",
+        "finalResponse": "live reply",
+        "_meta": {
+          "deliveryId": 1
+        }
+      }
+    }
+  ]
+}

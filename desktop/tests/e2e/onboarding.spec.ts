@@ -2386,17 +2386,24 @@ test("name-only community profile save preserves an existing avatar", async ({
 
   await expect
     .poll(() =>
-      page.evaluate(() =>
-        (window.__BUZZ_E2E_COMMAND_PAYLOADS__ ?? [])
-          .filter(
-            ({ command }) =>
-              command === "update_profile" ||
-              command === "update_profile_at_relay",
-          )
-          .map(({ payload }) => (payload as { avatarUrl?: string }).avatarUrl),
+      page.evaluate(
+        (existingAvatarUrl) =>
+          (window.__BUZZ_E2E_COMMAND_PAYLOADS__ ?? [])
+            .filter(
+              ({ command }) =>
+                command === "update_profile" ||
+                command === "update_profile_at_relay",
+            )
+            .map(({ payload }) => {
+              const avatarUrl = (payload as { avatarUrl?: string }).avatarUrl;
+              // Initial profile hydration can finish before or after the seed.
+              // Either omission or the unchanged URL preserves the saved avatar.
+              return avatarUrl === undefined || avatarUrl === existingAvatarUrl;
+            }),
+        existingAvatarUrl,
       ),
     )
-    .toEqual([undefined]);
+    .toEqual([true]);
   const profile = await invokeMockCommand<{ avatar_url: string | null }>(
     page,
     "get_profile",

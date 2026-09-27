@@ -117,6 +117,18 @@ export function ToolItem({
             compactSummaryTone(),
           )}
         >
+          {item.isError || item.status === "failed" ? (
+            <span className="shrink-0 text-xs text-destructive" role="status">
+              Failed
+            </span>
+          ) : item.status === "executing" || item.status === "pending" ? (
+            <span
+              className="shrink-0 text-xs text-muted-foreground"
+              role="status"
+            >
+              {item.status === "pending" ? "Pending" : "Running"}
+            </span>
+          ) : null}
           <CompactToolSummaryRow
             action={compactSummary.action}
             duration={duration}

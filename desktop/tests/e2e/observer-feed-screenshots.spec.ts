@@ -815,3 +815,206 @@ test.describe("observer feed screenshots", () => {
     });
   });
 });
+
+test("background worker updates after parent completion remain visible", async ({
+  page,
+}) => {
+  const pageErrors: string[] = [];
+  page.on("pageerror", (error) => pageErrors.push(error.message));
+  await installMockBridge(page, { managedAgents: MANAGED_AGENTS });
+  const panel = await openObserverFeedPanel(page, OBSERVER_AGENT_PUBKEY);
+  const envelope = {
+    timestamp: NOW,
+    kind: "acp_read",
+    agentIndex: 0,
+    channelId: CHANNEL_ID,
+    sessionId: "background-session",
+    turnId: "parent-turn",
+  };
+  const start = {
+    ...envelope,
+    seq: 2,
+    payload: {
+      jsonrpc: "2.0",
+      method: "session/update",
+      params: {
+        sessionId: "background-session",
+        update: {
+          sessionUpdate: "tool_call",
+          toolCallId: "subagent-background",
+          title: "Worker: verify background repair",
+          kind: "execute",
+          status: "in_progress",
+        },
+      },
+    },
+  };
+  const parentDone = {
+    ...envelope,
+    seq: 3,
+    payload: { jsonrpc: "2.0", id: 1, result: { stopReason: "end_turn" } },
+  };
+  const pending = {
+    ...start,
+    seq: 1,
+    payload: {
+      ...start.payload,
+      params: {
+        ...start.payload.params,
+        update: { ...start.payload.params.update, status: "pending" },
+      },
+    },
+  };
+  await seedObserverEvents(page, OBSERVER_AGENT_PUBKEY, [pending]);
+  await expect(
+    panel.getByRole("status").filter({ hasText: "Pending" }),
+  ).toBeVisible();
+  await expect(
+    panel.getByRole("status").filter({ hasText: "Running" }),
+  ).toHaveCount(0);
+  await seedObserverEvents(page, OBSERVER_AGENT_PUBKEY, [start, parentDone]);
+  await expect(
+    panel.getByText("Worker: verify background repair", { exact: true }),
+  ).toBeVisible();
+  await expect(
+    panel.getByRole("status").filter({ hasText: "Running" }),
+  ).toBeVisible();
+  await panel.screenshot({ path: `${SHOTS}/background-worker-running.png` });
+  const failure = {
+    ...envelope,
+    seq: 4,
+    turnId: null,
+    payload: {
+      jsonrpc: "2.0",
+      method: "session/update",
+      params: {
+        sessionId: "background-session",
+        update: {
+          sessionUpdate: "tool_call_update",
+          toolCallId: "subagent-background",
+          status: "failed",
+          content: [
+            {
+              type: "content",
+              content: {
+                type: "text",
+                text: "Worker failed: subprocess exited",
+              },
+            },
+          ],
+        },
+      },
+    },
+  };
+  await seedObserverEvents(page, OBSERVER_AGENT_PUBKEY, [
+    start,
+    parentDone,
+    failure,
+  ]);
+  await expect(
+    panel.getByText("Worker: verify background repair", { exact: true }),
+  ).toHaveCount(1);
+  await expect(panel.getByText("Failed", { exact: true })).toBeVisible();
+  await panel
+    .getByText("Worker: verify background repair", { exact: true })
+    .click();
+  await expect(
+    panel.getByText("Worker failed: subprocess exited", { exact: true }),
+  ).toBeVisible();
+  await panel.screenshot({ path: `${SHOTS}/background-worker-failed.png` });
+  const tool = (
+    seq: number,
+    id: string,
+    status: string,
+    sessionId: string,
+  ) => ({
+    ...envelope,
+    seq,
+    sessionId,
+    turnId: null,
+    payload: {
+      jsonrpc: "2.0",
+      method: "session/update",
+      params: {
+        sessionId,
+        update: {
+          sessionUpdate: "tool_call",
+          toolCallId: id,
+          title: `Worker: ${id}`,
+          kind: "execute",
+          status,
+        },
+      },
+    },
+  });
+  await seedObserverEvents(page, OBSERVER_AGENT_PUBKEY, [
+    start,
+    parentDone,
+    failure,
+    tool(5, "finished-before-exit", "completed", "background-session"),
+    tool(6, "interrupted-by-exit", "in_progress", "background-session"),
+    tool(7, "different-runtime-session", "in_progress", "other-session"),
+    {
+      ...envelope,
+      seq: 8,
+      turnId: null,
+      kind: "agent_stream_closed",
+      payload: { error: "Agent exited", sessionIds: ["background-session"] },
+    },
+  ]);
+  const toolRow = (title: string) =>
+    panel
+      .getByTestId("transcript-tool-item")
+      .filter({ hasText: `Worker: ${title}` });
+  await expect(toolRow("interrupted-by-exit").getByRole("status")).toHaveText(
+    "Failed",
+  );
+  await expect(toolRow("finished-before-exit")).toBeVisible();
+  await expect(toolRow("finished-before-exit").getByRole("status")).toHaveCount(
+    0,
+  );
+  await expect(
+    toolRow("different-runtime-session").getByRole("status"),
+  ).toHaveText("Running");
+  await expect(
+    toolRow("interrupted-by-exit").getByText("Running", { exact: true }),
+  ).toHaveCount(0);
+  await seedObserverEvents(page, OBSERVER_AGENT_PUBKEY, [
+    tool(9, "older-evicted-session", "in_progress", "older-session"),
+    {
+      ...envelope,
+      seq: 10,
+      turnId: null,
+      channelId: null,
+      sessionId: null,
+      kind: "agent_stream_closed",
+      payload: { processClosed: true, error: "Agent exited" },
+    },
+    tool(11, "replacement-runtime", "in_progress", "newer-session"),
+  ]);
+  await expect(toolRow("older-evicted-session").getByRole("status")).toHaveText(
+    "Failed",
+  );
+  await expect(toolRow("replacement-runtime").getByRole("status")).toHaveText(
+    "Running",
+  );
+  await seedObserverEvents(page, OBSERVER_AGENT_PUBKEY, [
+    tool(12, "archived-channel-worker", "in_progress", "evicted-session"),
+    {
+      ...envelope,
+      seq: 13,
+      turnId: null,
+      sessionId: null,
+      kind: "agent_stream_closed",
+      payload: { processClosed: true, error: "Agent exited" },
+    },
+    tool(14, "latest-runtime", "in_progress", "latest-session"),
+  ]);
+  await expect(
+    toolRow("archived-channel-worker").getByRole("status"),
+  ).toHaveText("Failed");
+  await expect(toolRow("latest-runtime").getByRole("status")).toHaveText(
+    "Running",
+  );
+  expect(pageErrors).toEqual([]);
+});

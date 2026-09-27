@@ -16,6 +16,22 @@ just test               # unit + integration (starts Docker if needed)
 cargo test -p buzz-test-client -- --ignored
 ```
 
+### MinIO image regression
+
+MinIO server and client are built locally from checksum-verified, immutable
+upstream source commits, not pulled from the unavailable official image repos.
+The first Compose startup needs network access and time for Go compilation.
+See [source pins, licenses, and update procedure](docker/minio/README.md).
+
+```bash
+python3 scripts/test-minio-images.py
+```
+
+This Docker/Compose v2 behavioral test exercises both real Compose definitions
+in isolated projects without publishing ports or reusing dev volumes: health,
+bucket initialization twice, S3 put/get/delete, and anonymous-access denial.
+It is also run in Backend Integration; the existing integration gates remain.
+
 ### Review-Proven Test Standards
 
 Mined from the last 25 PRs' review threads (see Review-Proven Rules in

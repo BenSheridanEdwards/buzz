@@ -1,6 +1,9 @@
 import * as React from "react";
 
-import { subscribeToAgentObserverFrames } from "@/shared/api/observerRelay";
+import {
+  subscribeToAgentObserverFrames,
+  subscribeToObserverConnectionState,
+} from "@/shared/api/observerRelay";
 import type { RelayEvent, ManagedAgent } from "@/shared/api/types";
 import type { ControlResultFrame } from "@/shared/api/types";
 import { putAgentSessionConfig } from "@/shared/api/tauri";
@@ -185,9 +188,10 @@ function registerKnownAgents(
   recomputeKnownAgentPubkeys();
   if (knownAgentPubkeys.size > 0 && pendingUnknownAgentFrames.length > 0) {
     const pending = pendingUnknownAgentFrames.splice(0);
+    const activeGeneration = generation;
     for (const event of pending) {
       eventProcessingQueue = eventProcessingQueue.then(() =>
-        handleRelayObserverEvent(event, generation),
+        handleRelayObserverEvent(event, activeGeneration),
       );
     }
   }
@@ -202,6 +206,7 @@ function unregisterKnownAgents(subscriptionId: string) {
 let connectionState: ConnectionState = "idle";
 let errorMessage: string | null = null;
 let unsubscribeRelay: (() => Promise<void>) | null = null;
+let unsubscribeConnection: (() => void) | null = null;
 let startPromise: Promise<void> | null = null;
 let eventProcessingQueue: Promise<void> = Promise.resolve();
 let generation = 0;
@@ -546,6 +551,8 @@ async function handleRelayObserverEvent(
   event: RelayEvent,
   activeGeneration: number,
 ) {
+  // Retired callbacks must not populate the next community's trust buffer.
+  if (activeGeneration !== generation) return;
   const agentPubkey = observerTag(event, "agent");
   const frame = observerTag(event, "frame");
   if (!agentPubkey || frame !== "telemetry") {
@@ -600,8 +607,22 @@ export function ensureRelayObserverSubscription() {
 
   const activeGeneration = generation;
   setConnectionState("connecting", null);
+  unsubscribeConnection = subscribeToObserverConnectionState((state) => {
+    if (activeGeneration !== generation) return;
+    setConnectionState(
+      state === "connected"
+        ? "open"
+        : state === "reconnecting"
+          ? "connecting"
+          : state === "stalled" || state === "disconnected"
+            ? "closed"
+            : state,
+      null,
+    );
+  });
   startPromise = (async () => {
     const identity = await getIdentity();
+    if (activeGeneration !== generation) return;
     const unsubscribe = await subscribeToAgentObserverFrames(
       identity.pubkey,
       (event) => {
@@ -625,10 +646,11 @@ export function ensureRelayObserverSubscription() {
       return;
     }
     unsubscribeRelay = unsubscribe;
-    setConnectionState("open", null);
   })()
     .catch((error) => {
       if (activeGeneration === generation) {
+        unsubscribeConnection?.();
+        unsubscribeConnection = null;
         setConnectionState(
           "error",
           error instanceof Error
@@ -927,6 +949,8 @@ export function syncAgentObserverEvents(
 
 export function resetAgentObserverStore() {
   generation += 1;
+  unsubscribeConnection?.();
+  unsubscribeConnection = null;
   const unsubscribe = unsubscribeRelay;
   unsubscribeRelay = null;
   startPromise = null;

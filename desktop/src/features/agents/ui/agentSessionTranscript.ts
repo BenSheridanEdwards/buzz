@@ -27,11 +27,18 @@ import {
   parsePromptBlocks,
   parseSystemPromptSections,
 } from "./agentSessionTranscriptHelpers";
+import { retiredToolUpdates } from "./agentSessionToolRetirement";
 import { friendlyTurnErrorCopy } from "../lib/friendlyAgentLastError";
+import {
+  processHermesTranscriptEvent,
+  hermesToolPrefix,
+  type HermesReplacement,
+} from "./hermesAttachmentTranscript";
 
 export { describeRawEvent } from "./agentSessionTranscriptHelpers";
 
 export type TranscriptState = {
+  hermesParts: Map<string, HermesReplacement>;
   items: TranscriptItem[];
   itemsById: Map<string, TranscriptItem>;
   activeMessageKey: Map<string, string>;
@@ -53,6 +60,7 @@ export type TranscriptState = {
 
 export function createEmptyTranscriptState(): TranscriptState {
   return {
+    hermesParts: new Map(),
     items: [],
     itemsById: new Map(),
     activeMessageKey: new Map(),
@@ -278,6 +286,7 @@ function rawPayloadTitle(payload: unknown) {
 }
 
 type TranscriptItemContext = {
+  agentIndex?: number | null;
   channelId: string | null;
   turnId: string | null;
   sessionId: string | null;
@@ -651,6 +660,7 @@ function upsertTool(
       toolName: updatedToolName,
       buzzToolName: updatedBuzzToolName,
       status: mergedStatus,
+      agentIndex: ctx.agentIndex ?? existing.agentIndex,
       args: updatedArgs,
       result: updatedResult,
       isError: updatedIsError,
@@ -684,6 +694,7 @@ function upsertTool(
     toolName: resolvedToolName,
     buzzToolName: canonicalBuzzToolName,
     status,
+    agentIndex: ctx.agentIndex,
     args,
     result,
     isError,
@@ -701,6 +712,8 @@ export function processTranscriptEvent(
   state: TranscriptState,
   event: ObserverEvent,
 ): TranscriptState {
+  const attachment = processHermesTranscriptEvent(state, event);
+  if (attachment) return attachment;
   const d = draftFrom(state);
 
   if (event.sessionId && event.sessionId !== d.latestSessionId) {
@@ -710,12 +723,17 @@ export function processTranscriptEvent(
   const channelId = event.channelId ?? null;
   const ch = channelId ?? "global";
   const ctx: TranscriptItemContext = {
+    agentIndex: event.agentIndex,
     channelId,
     turnId: event.turnId,
     sessionId: event.sessionId ?? d.latestSessionId,
   };
 
-  if (event.kind === "raw_json_rpc") {
+  if (event.kind === "agent_stream_closed") {
+    for (const item of retiredToolUpdates(d.items, event)) {
+      replaceItem(d, item.id, item);
+    }
+  } else if (event.kind === "raw_json_rpc") {
     upsertMetadata(
       d,
       `raw-json-rpc:${ch}:${event.seq}`,
@@ -933,6 +951,7 @@ export function processTranscriptEvent(
       const updateType = asString(update.sessionUpdate) ?? "unknown";
       const turnKey = event.turnId ?? event.sessionId ?? "unknown";
       const messageId = asString(update.messageId);
+      const toolPrefix = hermesToolPrefix(event, params, ch, ctx);
 
       if (updateType === "agent_message_chunk") {
         upsertMessage(
@@ -982,7 +1001,7 @@ export function processTranscriptEvent(
         const identity = extractToolIdentity(update);
         upsertTool(
           d,
-          `tool:${ch}:${toolId}`,
+          `${toolPrefix}${toolId}`,
           identity.title,
           identity.toolName,
           identity.buzzToolName,
@@ -996,20 +1015,23 @@ export function processTranscriptEvent(
         );
       } else if (updateType === "tool_call_update") {
         const toolId = asString(update.toolCallId) ?? `tool:${event.seq}`;
+        const existing = d.itemsById.get(`${toolPrefix}${toolId}`);
+        // ACP updates are partial: progress/output is not completion evidence.
         const status = normalizeToolStatus(
-          asString(update.status) ?? "completed",
+          asString(update.status) ??
+            (existing?.type === "tool" ? existing.status : "executing"),
         );
         const identity = extractToolIdentity(update);
         upsertTool(
           d,
-          `tool:${ch}:${toolId}`,
+          `${toolPrefix}${toolId}`,
           identity.title,
           identity.toolName,
           identity.buzzToolName,
           status,
           extractToolArgs(update),
           extractToolResult(update),
-          status === "failed",
+          asString(update.status) !== null && status === "failed",
           event.timestamp,
           ctx,
           updateType,
@@ -1146,6 +1168,7 @@ export function processTranscriptEvent(
 
   return {
     items: d.items,
+    hermesParts: state.hermesParts,
     itemsById: d.itemsById,
     activeMessageKey: d.activeMessageKey,
     sealedKeys: d.sealedKeys,
