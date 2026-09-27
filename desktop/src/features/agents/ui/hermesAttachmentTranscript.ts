@@ -56,6 +56,48 @@ function withItem(
   };
 }
 
+const MAX_LIVE_SEGMENTS = 256;
+
+function segmentId(id: string, segment: number) {
+  return segment === 0 ? id : `${id}:segment:${segment}`;
+}
+
+/** Newest live segment of a Hermes message (segment 0 is the stable identity). */
+function currentSegment(state: TranscriptState, id: string) {
+  let segment = 0;
+  while (
+    segment < MAX_LIVE_SEGMENTS &&
+    state.itemsById.has(segmentId(id, segment + 1))
+  )
+    segment += 1;
+  return segment;
+}
+
+/**
+ * A tool rendered after a live segment seals it, mirroring the native path's
+ * sealOpenMessages: post-tool text must start a new segment below the tool.
+ */
+function sealedByTool(state: TranscriptState, itemId: string) {
+  const index = state.items.findIndex((item) => item.id === itemId);
+  return (
+    index >= 0 && state.items.slice(index + 1).some((i) => i.type === "tool")
+  );
+}
+
+/** Authoritative replacements collapse the turn's live segments into one item. */
+function withoutSegments(state: TranscriptState, id: string): TranscriptState {
+  const prefix = `${id}:segment:`;
+  if (!state.items.some((item) => item.id.startsWith(prefix))) return state;
+  const itemsById = new Map(state.itemsById);
+  for (const key of itemsById.keys())
+    if (key.startsWith(prefix)) itemsById.delete(key);
+  return {
+    ...state,
+    items: state.items.filter((item) => !item.id.startsWith(prefix)),
+    itemsById,
+  };
+}
+
 function terminal(
   state: TranscriptState,
   event: ObserverEvent,
@@ -239,6 +281,7 @@ export function processHermesTranscriptEvent(
   const id = identity(event, session, message);
   let text = content.text;
   let parts = state.hermesParts;
+  let liveId = id;
   const existing = state.itemsById.get(id);
   if (existing?.acpSource === "hermes:final" && kind !== "final") return state;
   if (meta.operation === "replace") {
@@ -272,13 +315,24 @@ export function processHermesTranscriptEvent(
     ).join("");
     parts.delete(groupKey);
   } else if (meta.operation === "append" && kind === "live") {
-    text = (existing?.type === "message" ? existing.text : "") + text;
+    const segment = existing ? currentSegment(state, id) : 0;
+    const openId = segmentId(id, segment);
+    const open = state.itemsById.get(openId);
+    if (open && sealedByTool(state, openId)) {
+      if (segment + 1 >= MAX_LIVE_SEGMENTS) return state;
+      liveId = segmentId(id, segment + 1);
+    } else {
+      liveId = openId;
+      text = (open?.type === "message" ? open.text : "") + text;
+    }
   } else {
     return state;
   }
+  // Replacements carry the whole message text; drop superseded live segments.
+  const next = liveId === id ? withoutSegments(state, id) : state;
   if (kind === "history") {
     return withItem(
-      { ...state, hermesParts: parts },
+      { ...next, hermesParts: parts },
       {
         id,
         type: "metadata",
@@ -302,13 +356,13 @@ export function processHermesTranscriptEvent(
     );
   }
   const item: TranscriptItem = {
-    id,
+    id: liveId,
     type: "message",
     renderClass: "message",
     role: "assistant",
     title: "Assistant",
     text,
-    timestamp: existing?.timestamp ?? event.timestamp,
+    timestamp: state.itemsById.get(liveId)?.timestamp ?? event.timestamp,
     channelId: event.channelId,
     sessionId: session,
     turnId: asString(meta.turnId),
@@ -316,5 +370,5 @@ export function processHermesTranscriptEvent(
     authorPubkey: null,
     acpSource: `hermes:${kind}`,
   };
-  return withItem({ ...state, hermesParts: parts }, item);
+  return withItem({ ...next, hermesParts: parts }, item);
 }
