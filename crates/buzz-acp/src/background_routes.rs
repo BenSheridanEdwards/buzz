@@ -113,21 +113,43 @@ pub(crate) fn canonical_routes(dir: &Path) -> Result<Vec<Route>, crate::acp::Acp
     Ok(routes)
 }
 
-/// Canonical sessions that still need observation: an active gateway turn or
-/// an outbound record not yet published. Settled sessions are not reloaded on
-/// every maintenance tick. Unreadable attachment state is included so its
-/// failure surfaces through the bounded recovery retries instead of silently.
-pub(crate) fn canonical_recovery_origins(dir: &Path) -> Vec<String> {
+/// How long a settled canonical session stays eligible for slow re-polling
+/// after its last parent turn or durable frame.
+pub(crate) const SETTLED_POLL_HORIZON: std::time::Duration =
+    std::time::Duration::from_secs(7 * 24 * 3600);
+
+/// Canonical sessions to observe during recovery.
+#[derive(Default)]
+pub(crate) struct RecoveryOrigins {
+    /// An active gateway turn or an outbound record not yet published.
+    /// Unreadable attachment state is included so its failure surfaces
+    /// through the bounded recovery retries instead of silently.
+    pub(crate) unfinished: Vec<String>,
+    /// Nothing outstanding locally, but the gateway may still wake them
+    /// (for example a multi-day task finishing after a harness restart).
+    /// Bounded to sessions touched within [`SETTLED_POLL_HORIZON`] of `now`.
+    pub(crate) settled: Vec<String>,
+}
+
+fn modified(path: &Path) -> Option<std::time::SystemTime> {
+    std::fs::metadata(path).ok()?.modified().ok()
+}
+
+pub(crate) fn canonical_recovery_origins(
+    dir: &Path,
+    now: std::time::SystemTime,
+) -> RecoveryOrigins {
     let routes = match canonical_routes(dir) {
         Ok(routes) => routes,
         Err(error) => {
             tracing::error!(%error, "canonical routes require reconciliation");
-            return Vec::new();
+            return RecoveryOrigins::default();
         }
     };
-    routes
-        .into_iter()
-        .filter(|route| match attachment::load(dir, &route.session_id) {
+    let mut origins = RecoveryOrigins::default();
+    for route in routes {
+        let sid = route.session_id;
+        let unfinished = match attachment::load(dir, &sid) {
             Ok(state) => {
                 state.active_turn.is_some()
                     || state
@@ -136,9 +158,24 @@ pub(crate) fn canonical_recovery_origins(dir: &Path) -> Vec<String> {
                         .any(|key| !state.published.contains(key))
             }
             Err(_) => true,
-        })
-        .map(|route| route.session_id)
-        .collect()
+        };
+        if unfinished {
+            origins.unfinished.push(sid);
+            continue;
+        }
+        let touched = [path(dir, &sid), attachment::path(dir, &sid)]
+            .iter()
+            .filter_map(|p| modified(p))
+            .max();
+        let recent = touched.is_some_and(|touched| {
+            now.duration_since(touched)
+                .map_or(true, |age| age <= SETTLED_POLL_HORIZON)
+        });
+        if recent {
+            origins.settled.push(sid);
+        }
+    }
+    origins
 }
 
 pub(crate) fn canonical_scope(
@@ -263,9 +300,27 @@ mod tests {
         }
         // A route with no attachment state is not canonical at all.
         save(&dir, "native", &scope, &event()).unwrap();
-        let mut origins = canonical_recovery_origins(&dir);
-        origins.sort();
-        assert_eq!(origins, ["active", "active-unpublished", "unpublished"]);
+        // A settled session untouched beyond the horizon is no longer polled.
+        save(&dir, "aged", &scope, &event()).unwrap();
+        attachment::save(&dir, "aged", &Default::default()).unwrap();
+        let now = std::time::SystemTime::now();
+        let old = now - SETTLED_POLL_HORIZON - std::time::Duration::from_secs(60);
+        for file in [path(&dir, "aged"), attachment::path(&dir, "aged")] {
+            std::fs::File::options()
+                .write(true)
+                .open(file)
+                .unwrap()
+                .set_times(std::fs::FileTimes::new().set_modified(old))
+                .unwrap();
+        }
+        let mut origins = canonical_recovery_origins(&dir, now);
+        origins.unfinished.sort();
+        origins.settled.sort();
+        assert_eq!(
+            origins.unfinished,
+            ["active", "active-unpublished", "unpublished"]
+        );
+        assert_eq!(origins.settled, ["idle", "settled"]);
     }
 
     #[test]

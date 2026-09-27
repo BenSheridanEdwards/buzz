@@ -10,7 +10,12 @@ use tokio::time::Instant;
 #[derive(Default)]
 pub(crate) struct RecoveryRetries {
     failures: HashMap<String, Failure>,
+    /// Last observation of each settled canonical session this run.
+    settled_polls: HashMap<String, Instant>,
 }
+
+/// Minimum interval between observations of one settled canonical session.
+pub(crate) const SETTLED_POLL_INTERVAL: Duration = Duration::from_secs(10 * 60);
 
 struct Failure {
     attempts: u8,
@@ -44,6 +49,31 @@ impl RecoveryRetries {
             None => format!(
                 "Background result recovery paused after 3 failed attempts for session {origin}. The result remains pending; repair the session and restart the agent to retry."
             ),
+        }
+    }
+
+    /// Whether a settled canonical session is due for another slow poll.
+    pub(crate) fn settled_due(&self, origin: &str, now: &Instant) -> bool {
+        self.settled_polls
+            .get(origin)
+            .is_none_or(|last| now.saturating_duration_since(*last) >= SETTLED_POLL_INTERVAL)
+    }
+
+    pub(crate) fn mark_settled_polled(&mut self, origin: &str, now: Instant) {
+        self.settled_polls.insert(origin.to_owned(), now);
+    }
+
+    /// Keep poll times only for the settled sessions still returned.
+    pub(crate) fn retain_settled(&mut self, settled: &HashSet<String>) {
+        self.settled_polls
+            .retain(|origin, _| settled.contains(origin));
+    }
+
+    /// Test clock: pretend every settled poll happened `by` earlier.
+    #[cfg(test)]
+    pub(crate) fn age_settled_polls(&mut self, by: Duration) {
+        for last in self.settled_polls.values_mut() {
+            *last = last.checked_sub(by).expect("instant before clock origin");
         }
     }
 
