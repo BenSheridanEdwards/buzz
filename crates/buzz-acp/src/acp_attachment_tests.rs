@@ -1,6 +1,8 @@
 use super::*;
 #[path = "acp_attachment_edge_tests.rs"]
 mod edges;
+#[path = "acp_attachment_recovery_tests.rs"]
+mod recovery;
 #[path = "acp_attachment_safety_tests.rs"]
 mod safety;
 use serde_json::json;

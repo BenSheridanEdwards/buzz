@@ -39,6 +39,31 @@ pub(super) fn negotiate(result: &Value) -> Result<bool, AcpError> {
     Ok(true)
 }
 
+/// Map a durable terminal to the ACP stop reason; failures stay scoped to this turn.
+fn terminal_outcome(terminal: &Value) -> Result<super::StopReason, AcpError> {
+    if terminal.get("error").is_some() {
+        return Err(store::invalid(&format!("turn failed: {terminal}")));
+    }
+    terminal["stopReason"]
+        .as_str()
+        .and_then(super::StopReason::from_str)
+        .ok_or_else(|| store::invalid(&format!("turn ended with unsupported outcome: {terminal}")))
+}
+
+/// Frames one replay page may buffer before the session is failed.
+const MAX_REPLAY_BUFFER: usize = 8192;
+
+/// Per-connection canonical delivery ownership.
+#[derive(Default)]
+pub(super) struct Tracking {
+    /// Sessions whose replay completed (or were created) on this connection.
+    pub(super) attached: std::collections::HashSet<String>,
+    /// The session whose replay page is in flight, with its buffered frames.
+    loading: Option<(String, Vec<Value>)>,
+    /// First rejected frame per session, reported by that session's next load.
+    faults: std::collections::HashMap<String, String>,
+}
+
 impl AcpClient {
     pub(super) async fn request_attachment_cancel(
         &mut self,
@@ -69,15 +94,7 @@ impl AcpClient {
         loop {
             self.load_attachment(sid, "/").await?;
             if let Some(terminal) = store::load(&dir, sid)?.terminals.get(&turn) {
-                if terminal["stopReason"] == "cancelled" {
-                    return Ok(super::StopReason::Cancelled);
-                }
-                if terminal["stopReason"] == "end_turn" {
-                    return Ok(super::StopReason::EndTurn);
-                }
-                return Err(store::invalid(&format!(
-                    "cancelled turn failed: {terminal}"
-                )));
+                return terminal_outcome(terminal);
             }
             if tokio::time::Instant::now() >= deadline {
                 return Err(store::invalid(
@@ -144,18 +161,8 @@ impl AcpClient {
             let state = store::load(&dir, sid)?;
             if let Some(turn) = receipt["turnId"].as_str() {
                 if let Some(terminal) = state.terminals.get(turn) {
-                    if terminal.get("error").is_some() {
-                        return Err(store::invalid(&format!("turn failed: {terminal}")));
-                    }
-                    if terminal["stopReason"] == "cancelled" {
-                        return Ok(super::StopReason::Cancelled);
-                    }
-                    if terminal["stopReason"] == "end_turn" && state.finals.contains_key(turn) {
-                        return Ok(super::StopReason::EndTurn);
-                    }
-                    return Err(store::invalid(
-                        "terminal without complete authoritative final",
-                    ));
+                    // The durable outbox already holds this turn's visible outcome.
+                    return terminal_outcome(terminal);
                 }
             }
             if tokio::time::Instant::now() >= deadline {
@@ -174,28 +181,89 @@ impl AcpClient {
         self.hermes_attachment
     }
 
+    /// Consume a durable frame without ever failing the in-flight request.
+    ///
+    /// Frames for the session being loaded are buffered and applied against
+    /// the replay fence. Live frames are applied only for sessions whose
+    /// replay completed on this connection; otherwise replay will deliver
+    /// them in order. A rejected frame detaches only its own session: the
+    /// cursor stays put, and that session's next load replays and reports it.
     pub(super) fn accept_attachment_frame(&mut self, msg: &Value) -> Result<(), AcpError> {
-        if !self.hermes_attachment {
+        if !self.hermes_attachment || msg.pointer("/params/_meta/deliveryId").is_none() {
             return Ok(());
         }
-        if msg.pointer("/params/_meta/deliveryId").is_some() {
-            let dir = self
-                .background_routes_dir
-                .as_ref()
-                .ok_or_else(|| store::invalid("durable return routes required"))?;
-            store::accept(dir, msg)?;
+        let Some(sid) = msg.pointer("/params/sessionId").and_then(Value::as_str) else {
+            self.attachment_fault("", "durable delivery without session identity".into());
+            return Ok(());
+        };
+        let tracking = &mut self.attachment_tracking;
+        if let Some((loading, buffer)) = &mut tracking.loading {
+            if loading == sid {
+                if buffer.len() < MAX_REPLAY_BUFFER {
+                    buffer.push(msg.clone());
+                } else {
+                    let sid = sid.to_owned();
+                    self.attachment_fault(&sid, "replay page exceeded buffer".into());
+                }
+                return Ok(());
+            }
+        }
+        if !tracking.attached.contains(sid) {
+            tracing::debug!(sid, "live canonical delivery deferred to replay");
+            return Ok(());
+        }
+        let accepted = match &self.background_routes_dir {
+            Some(dir) => store::accept(dir, msg),
+            None => Err(store::invalid("durable return routes required")),
+        };
+        if let Err(error) = accepted {
+            let sid = sid.to_owned();
+            self.attachment_fault(&sid, error.to_string());
         }
         Ok(())
     }
 
+    fn attachment_fault(&mut self, sid: &str, error: String) {
+        tracing::error!(sid, %error, "canonical delivery rejected; session detached until replay");
+        self.observe("attachment_warning", json!({"sessionId":sid,"error":error}));
+        self.attachment_tracking.attached.remove(sid);
+        self.attachment_tracking
+            .faults
+            .entry(sid.to_owned())
+            .or_insert(error);
+    }
+
     pub(super) async fn load_attachment(&mut self, sid: &str, cwd: &str) -> Result<(), AcpError> {
+        self.attachment_tracking.faults.remove(sid);
+        let result = self.load_attachment_pages(sid, cwd).await;
+        self.attachment_tracking.loading = None;
+        if result.is_ok() {
+            self.attachment_tracking.attached.insert(sid.to_owned());
+        } else {
+            self.attachment_tracking.attached.remove(sid);
+        }
+        result
+    }
+
+    async fn load_attachment_pages(&mut self, sid: &str, cwd: &str) -> Result<(), AcpError> {
         let dir = self
             .background_routes_dir
             .clone()
             .ok_or_else(|| store::invalid("durable return routes required"))?;
         let mut cursor = store::load(&dir, sid)?.cursor;
         for _ in 0..128 {
-            let result = self.send_request("session/load", json!({"sessionId":sid,"cwd":cwd,"mcpServers":[],"_meta":{"history":false,"afterDeliveryId":cursor}})).await?;
+            self.attachment_tracking.loading = Some((sid.to_owned(), Vec::new()));
+            let result = self.send_request("session/load", json!({"sessionId":sid,"cwd":cwd,"mcpServers":[],"_meta":{"history":false,"afterDeliveryId":cursor}})).await;
+            let frames = self
+                .attachment_tracking
+                .loading
+                .take()
+                .map(|(_, frames)| frames)
+                .unwrap_or_default();
+            let result = result?;
+            if let Some(fault) = self.attachment_tracking.faults.remove(sid) {
+                return Err(store::invalid(&fault));
+            }
             let meta = &result["_meta"];
             let next = meta["lastDeliveryId"]
                 .as_i64()
@@ -210,11 +278,19 @@ impl AcpClient {
             {
                 return Err(store::invalid("invalid replay fence"));
             }
-            let mut state = store::load(&dir, sid)?;
-            if state.cursor > next {
-                return Err(store::invalid("live delivery overtook replay fence"));
+            for frame in &frames {
+                let id = frame
+                    .pointer("/params/_meta/deliveryId")
+                    .and_then(Value::as_i64);
+                // Beyond an incomplete page, the next page replays it in order.
+                if more && id.is_some_and(|id| id > next) {
+                    continue;
+                }
+                store::accept(&dir, frame)?;
             }
-            state.cursor = next;
+            let mut state = store::load(&dir, sid)?;
+            // A live frame past a complete replay may precede the response.
+            state.cursor = state.cursor.max(next);
             if !more {
                 state.active_turn = meta
                     .pointer("/activeTurn/turnId")
