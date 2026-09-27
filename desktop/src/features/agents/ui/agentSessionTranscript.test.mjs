@@ -2199,6 +2199,45 @@ test("retired worker process fails only its outstanding tool calls", () => {
   }
 });
 
+test("late terminal frame after process retirement keeps a consistent failed row", () => {
+  const update = (seq, status, extra = {}) =>
+    acpToolUpdate(seq, {
+      sessionUpdate: seq === 1 ? "tool_call" : "tool_call_update",
+      toolCallId: "late",
+      title: "Worker: late",
+      kind: "execute",
+      status,
+      ...extra,
+    });
+  const retire = {
+    ...baseEvent,
+    seq: 2,
+    kind: "agent_stream_closed",
+    turnId: null,
+    payload: { error: "Agent exited", sessionIds: [baseEvent.sessionId] },
+  };
+  for (const late of [
+    update(3, "completed"),
+    update(3, "completed", {
+      content: [{ type: "content", content: { type: "text", text: "ok" } }],
+    }),
+  ]) {
+    const [item] = toolItems([update(1, "in_progress"), retire, late]);
+    const failed = item.status === "failed";
+    assert.equal(
+      item.isError,
+      failed,
+      `status ${item.status} must agree with isError ${item.isError}`,
+    );
+    assert.equal(
+      /Agent process stopped/.test(item.result),
+      failed,
+      `status ${item.status} must agree with result ${JSON.stringify(item.result)}`,
+    );
+    assert.equal(item.descriptor.renderClass, item.renderClass);
+  }
+});
+
 test("global process retirement reaches filtered channels without failing later calls", () => {
   const start = (seq, id, channelId, agentIndex = 0) => ({
     ...acpToolUpdate(seq, {
