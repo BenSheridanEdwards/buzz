@@ -27,7 +27,12 @@ import {
   parsePromptBlocks,
   parseSystemPromptSections,
 } from "./agentSessionTranscriptHelpers";
-import { retiredToolUpdates } from "./agentSessionToolRetirement";
+import {
+  isRetiredTool,
+  isTerminalToolStatus,
+  mergeToolStatus,
+  retiredToolUpdates,
+} from "./agentSessionToolRetirement";
 import { friendlyTurnErrorCopy } from "../lib/friendlyAgentLastError";
 import {
   processHermesTranscriptEvent,
@@ -601,22 +606,6 @@ function upsertMetadata(
   });
 }
 
-function isTerminalToolStatus(status: ToolStatus) {
-  return status === "completed" || status === "failed";
-}
-
-function mergeToolStatus(existing: ToolStatus, next: ToolStatus): ToolStatus {
-  if (isTerminalToolStatus(existing) && !isTerminalToolStatus(next)) {
-    return existing;
-  }
-
-  return next;
-}
-
-function isRetiredTool(item: Extract<TranscriptItem, { type: "tool" }>) {
-  return item.status === "failed" && item.acpSource === "agent_stream_closed";
-}
-
 function upsertTool(
   d: TranscriptDraft,
   id: string,
@@ -635,9 +624,8 @@ function upsertTool(
   const canonicalBuzzToolName =
     buzzToolName ?? findBuzzToolName(toolName, true);
   if (existing?.type === "tool") {
-    // A call retired by its process exit is final: a late terminal frame from
-    // the dead process must not flip it to completed while isError and the
-    // "Agent process stopped" result remain.
+    // Retirement by process exit is final; a late frame from the dead process
+    // must not flip it to completed while its failure result remains.
     if (isRetiredTool(existing)) return;
     const updatedTitle = !isGenericToolTitle(title) ? title : existing.title;
     let updatedToolName = existing.toolName;
