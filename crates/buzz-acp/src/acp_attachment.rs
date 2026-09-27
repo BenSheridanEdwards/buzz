@@ -120,9 +120,13 @@ impl AcpClient {
         let admission = route.trigger.id.to_hex();
         let mut state = store::load(&dir, sid)?;
         let existing = state.admissions.get(&admission).cloned();
-        let params = existing
+        let mut params = existing
             .clone()
             .unwrap_or_else(|| json!({"sessionId":sid,"admissionId":admission,"prompt":prompt}));
+        // The turn binding is local bookkeeping, never part of the admission.
+        if let Some(fields) = params.as_object_mut() {
+            fields.remove("turnId");
+        }
         if existing.is_none() {
             if state.admissions.len() >= 4096 {
                 return Err(store::invalid("admission capacity"));
@@ -158,8 +162,20 @@ impl AcpClient {
                 _ => return Err(store::invalid("invalid admission status")),
             }
             self.load_attachment(sid, "/").await?;
-            let state = store::load(&dir, sid)?;
+            let mut state = store::load(&dir, sid)?;
             if let Some(turn) = receipt["turnId"].as_str() {
+                // Bind the admission to its turn so publication can release it.
+                let record = state
+                    .admissions
+                    .get_mut(&admission)
+                    .and_then(Value::as_object_mut);
+                if let Some(record) = record.filter(|r| r.get("turnId") != Some(&json!(turn))) {
+                    record.insert("turnId".into(), turn.into());
+                    if state.published.contains(&format!("turn:{turn}")) {
+                        state.admissions.remove(&admission);
+                    }
+                    store::save(&dir, sid, &state)?;
+                }
                 if let Some(terminal) = state.terminals.get(turn) {
                     // The durable outbox already holds this turn's visible outcome.
                     return terminal_outcome(terminal);
