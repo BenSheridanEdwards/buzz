@@ -41,8 +41,19 @@ export function reconcileChannelWindowMessages(
     return [...merged].sort((left, right) => compareRelayOrder(right, left));
   }
   const authoritativeIds = new Set(windowEvents.map((event) => event.id));
+  // A send acknowledgement is merged into the window already carrying its
+  // optimistic row's render key. That pending row is settled: it must not stay
+  // claimable, or an older identical message in the window would take over the
+  // same render key and the timeline would show two rows under one key.
+  const acknowledgedLocalKeys = new Set(
+    windowEvents.flatMap((event) =>
+      event.localKey && !event.pending ? [event.localKey] : [],
+    ),
+  );
   const retained = retainRefetchReconciliationEvents(messages).filter(
-    (event) => !authoritativeIds.has(event.id),
+    (event) =>
+      !authoritativeIds.has(event.id) &&
+      !(event.pending && acknowledgedLocalKeys.has(event.localKey ?? event.id)),
   );
 
   // Reconcile acknowledgements against cache-only rows without changing the
