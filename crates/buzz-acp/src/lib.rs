@@ -539,6 +539,17 @@ mod inbound_author_gate {
             channel_info: &pool::ChannelInfoResolver,
             rest_client: &relay::RestClient,
         ) -> Option<AuthorizedListenerEvent> {
+            // Ephemeral kinds (typing, presence, observer frames) are signalling,
+            // never a request: an owner's typing indicator must not start a turn.
+            let kind = u32::from(buzz_event.event.kind.as_u16());
+            if buzz_core::kind::is_ephemeral(kind) {
+                tracing::debug!(
+                    channel_id = %buzz_event.channel_id,
+                    kind,
+                    "inbound ephemeral event — not a prompt"
+                );
+                return None;
+            }
             let decision = self
                 .evaluate_listener_event(
                     &buzz_event,
@@ -7663,6 +7674,87 @@ mod author_gate_tests {
             match self {
                 Self::Normal => "normal",
                 Self::Setup => "setup",
+            }
+        }
+    }
+
+    /// Signalling events (typing, presence, observer frames) are ephemeral
+    /// kinds, never prompts. In a DM the owner's own typing indicator passed
+    /// the author gate and started an empty turn per keystroke burst; a
+    /// canonical gateway cannot steer, so each became a separate reply.
+    #[tokio::test]
+    async fn production_listener_boundaries_never_prompt_on_ephemeral_events() {
+        for listener in [ListenerBoundary::Normal, ListenerBoundary::Setup] {
+            for (kind, content, expected) in [
+                (buzz_core::kind::KIND_TYPING_INDICATOR, "", false),
+                (buzz_core::kind::KIND_PRESENCE_UPDATE, "online", false),
+                (buzz_core::kind::KIND_STREAM_MESSAGE, "hi", true),
+            ] {
+                let relay_hex = nostr::Keys::generate().public_key().to_hex();
+                let owner = nostr::Keys::generate();
+                let agent = nostr::Keys::generate().public_key().to_hex();
+                let (rest_client, server) =
+                    nip11_scripted_server(std::collections::VecDeque::from([Ok(
+                        serde_json::json!({ "self": relay_hex }),
+                    )]))
+                    .await;
+                let mut gate =
+                    InboundAuthorGate::connect(&rest_client, &agent, "listener startup").await;
+                let owner_cache = OwnerCache::new(Some(owner.public_key().to_hex()));
+                let channel_id = Uuid::new_v4();
+                let channel_info = pool::ChannelInfoResolver::new(
+                    HashMap::from([(
+                        channel_id,
+                        relay::ChannelInfo {
+                            name: "DM".into(),
+                            channel_type: "dm".into(),
+                            description: None,
+                        },
+                    )]),
+                    rest_client.clone(),
+                );
+                let event = relay::BuzzEvent {
+                    connection_generation: 0,
+                    channel_id,
+                    event: nostr::EventBuilder::new(nostr::Kind::Custom(kind as u16), content)
+                        .tags([nostr::Tag::parse(["h", &channel_id.to_string()]).expect("h tag")])
+                        .sign_with_keys(&owner)
+                        .expect("signed event"),
+                };
+                let (respond_to, allowlist) = (RespondTo::OwnerOnly, HashSet::new());
+                let authorized = match listener {
+                    ListenerBoundary::Normal => {
+                        authorize_normal_listener_event(
+                            &mut gate,
+                            event,
+                            &respond_to,
+                            &allowlist,
+                            &owner_cache,
+                            &channel_info,
+                            &rest_client,
+                        )
+                        .await
+                    }
+                    ListenerBoundary::Setup => {
+                        setup_mode::authorize_setup_listener_event(
+                            &mut gate,
+                            event,
+                            &respond_to,
+                            &allowlist,
+                            &owner_cache,
+                            &channel_info,
+                            &rest_client,
+                        )
+                        .await
+                    }
+                };
+                server.abort();
+                assert_eq!(
+                    authorized.is_some(),
+                    expected,
+                    "{} listener, kind {kind}",
+                    listener.name()
+                );
             }
         }
     }
