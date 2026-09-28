@@ -22,8 +22,14 @@ pub(crate) async fn publish_canonical_outbox(
         .ok_or_else(|| store::invalid("missing outbox directory"))?;
     let mut errors = Vec::new();
     for key in store::load(dir, sid)?.pending_in_delivery_order() {
-        if let Err(error) = publish_record(ctx, dir, sid, &key).await {
-            errors.push(format!("{key}: {error}"));
+        match publish_record(ctx, dir, sid, &key).await {
+            Ok(()) => {}
+            Err(error) if error.to_string().contains(store::PERMANENTLY_REJECTED) => {
+                store::abandon(dir, sid, &key)?;
+                tracing::error!(%sid, %key, %error, "canonical record rejected by relay; dropped");
+                errors.push(format!("{key}: rejected by relay; record dropped"));
+            }
+            Err(error) => errors.push(format!("{key}: {error}")),
         }
     }
     if errors.is_empty() {

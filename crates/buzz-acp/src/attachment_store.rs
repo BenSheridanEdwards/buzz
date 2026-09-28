@@ -2,7 +2,7 @@
 use crate::acp::AcpError;
 #[path = "attachment_publication.rs"]
 mod publication;
-pub(crate) use publication::Publication;
+pub(crate) use publication::{Publication, PERMANENTLY_REJECTED};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
