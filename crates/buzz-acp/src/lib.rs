@@ -2247,6 +2247,57 @@ fn inactivity_expired(
 /// while it has background work outstanding — delegated workers running, or
 /// finished results awaiting delivery. Lives beside the engine's durable ledger
 /// under the agent's `HERMES_HOME`.
+#[cfg(test)]
+mod canonical_wake_tests {
+    use super::*;
+
+    // After a harness restart the lazy pool is asleep and no connection has
+    // negotiated attachment yet, so only this check can wake it to collect a
+    // turn the gateway finished while the harness was down (observed: a
+    // finished report never delivered).
+    fn config_with_home(home: &std::path::Path) -> config::Config {
+        let mut config = crate::error_outcome_emission_tests::test_config();
+        config.persona_env_vars.push((
+            crate::config::HERMES_HOME_ENV.into(),
+            home.to_string_lossy().into_owned(),
+        ));
+        config
+    }
+
+    #[test]
+    fn no_canonical_work_leaves_the_pool_asleep() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(!background_work_pending(&config_with_home(tmp.path())));
+    }
+
+    #[test]
+    fn unfinished_canonical_turn_wakes_the_idle_pool() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = config_with_home(tmp.path());
+        let dir = background_routes_dir(&config).unwrap();
+        let trigger = nostr::EventBuilder::text_note("long task")
+            .sign_with_keys(&nostr::Keys::generate())
+            .unwrap();
+        let scope = crate::scope::SessionScope::Conversation {
+            channel_id: uuid::Uuid::new_v4(),
+        };
+        background_routes::save(&dir, "origin", &scope, &trigger).unwrap();
+        background_routes::attachment::save(
+            &dir,
+            "origin",
+            &background_routes::attachment::State {
+                active_turn: Some("turn".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(
+            background_work_pending(&config),
+            "unfinished canonical turn must wake the pool"
+        );
+    }
+}
+
 const BACKGROUND_WORK_MARKER: &str = ".buzz-background-work";
 
 /// A marker older than this is treated as a leftover from a crashed engine
@@ -2279,7 +2330,36 @@ fn background_work_pending(config: &config::Config) -> bool {
     marker_is_live(
         &home.join(BACKGROUND_WORK_MARKER),
         std::time::SystemTime::now(),
-    )
+    ) || canonical_work_unfinished(config)
+}
+
+/// A canonical gateway keeps working while the harness is down and writes no
+/// Hermes marker, so an unfinished durable turn or undelivered output must wake
+/// the idle pool; recovery can only run once a connection negotiates attachment.
+/// Cached briefly: the idle loop asks on every iteration and each answer scans
+/// the routes directory.
+fn canonical_work_unfinished(config: &config::Config) -> bool {
+    const TTL: Duration = Duration::from_secs(5);
+    static LAST: std::sync::Mutex<Option<(std::time::Instant, std::path::PathBuf, bool)>> =
+        std::sync::Mutex::new(None);
+    let Some(dir) = background_routes_dir(config) else {
+        return false;
+    };
+    let now = std::time::Instant::now();
+    if let Ok(last) = LAST.lock() {
+        if let Some((at, cached_dir, value)) = last.as_ref() {
+            if *cached_dir == dir && now.duration_since(*at) < TTL {
+                return *value;
+            }
+        }
+    }
+    let value = !background_routes::canonical_recovery_origins(&dir, std::time::SystemTime::now())
+        .unfinished
+        .is_empty();
+    if let Ok(mut last) = LAST.lock() {
+        *last = Some((now, dir, value));
+    }
+    value
 }
 
 /// Pure check behind [`background_work_pending`]: the marker exists and is not
