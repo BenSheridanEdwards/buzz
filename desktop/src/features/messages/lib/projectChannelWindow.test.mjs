@@ -2,7 +2,10 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { QueryClient, QueryObserver } from "@tanstack/react-query";
 
-import { reconcileFetchedChannelWindow } from "../hooks.ts";
+import {
+  createOptimisticMessage,
+  reconcileFetchedChannelWindow,
+} from "../hooks.ts";
 import { channelMessagesKey, channelWindowKey } from "./messageQueryKeys.ts";
 import {
   appendOlderChannelWindow,
@@ -262,6 +265,60 @@ test("test_reconciliation_acknowledges_only_one_identical_pending_send", () => {
     [event("initial", 100), accepted, second].map((item) => item.id),
   );
   assert.equal(projected[1]?.localKey, first.id);
+});
+
+test("test_acknowledged_send_keeps_its_render_key_from_older_identical_message", () => {
+  // Resending text identical to an older message (a common manual retry after
+  // a reconnect) must not let that older row claim the optimistic render key
+  // after the send's own acknowledgement already carries it. Two timeline rows
+  // sharing one key make the list render the message twice.
+  const harness = createHarness();
+  const older = { ...event("older", 100), content: "same text" };
+  harness.client.setQueryData(
+    harness.windowKey,
+    replaceNewestChannelWindow(emptyChannelWindowStore(), newestPage([older])),
+  );
+  projectChannelWindowMessages(harness.client, harness.channelId);
+
+  // useSendMessageMutation.onMutate: optimistic row enters the live overlay.
+  const optimistic = createOptimisticMessage(
+    harness.channelId,
+    "same text",
+    { pubkey: older.pubkey },
+    harness.client.getQueryData(harness.messagesKey),
+  );
+  appendLiveEvent(harness, optimistic);
+
+  // useSendMessageMutation.onSuccess: drop the optimistic row, merge the
+  // acknowledged event under the optimistic render key, and re-project.
+  const accepted = {
+    ...event("accepted", optimistic.created_at),
+    content: "same text",
+    tags: optimistic.tags,
+  };
+  const current = harness.client.getQueryData(harness.windowKey);
+  harness.client.setQueryData(
+    harness.windowKey,
+    mergeLiveChannelWindowEvent(
+      {
+        ...current,
+        liveOverlay: current.liveOverlay.filter(
+          (item) => item.id !== optimistic.id,
+        ),
+      },
+      { ...accepted, localKey: optimistic.localKey },
+    ),
+  );
+  projectChannelWindowMessages(harness.client, harness.channelId);
+
+  const projected = harness.client.getQueryData(harness.messagesKey);
+  assert.deepEqual(
+    projected.map((item) => item.id),
+    [older.id, accepted.id],
+  );
+  const renderKeys = projected.map((item) => item.localKey ?? item.id);
+  assert.equal(new Set(renderKeys).size, renderKeys.length);
+  assert.deepEqual(renderKeys, [older.id, optimistic.localKey]);
 });
 
 test("test_live_projection_retains_pending_send_and_non_broadcast_thread_reply", () => {
