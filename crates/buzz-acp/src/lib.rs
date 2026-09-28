@@ -2099,8 +2099,14 @@ mod spawn_failure_backoff_tests {
     #[test]
     fn repeated_spawn_failures_back_off_to_the_cooldown_and_success_resets() {
         let mut slot = fresh();
+        // Measured against a moving clock: capped waits differ only by elapsed time.
         let waits: Vec<Duration> = (0..6).map(|_| wait_after_failure(&mut slot)).collect();
-        assert!(waits.windows(2).all(|w| w[1] >= w[0]), "{waits:?}");
+        assert!(
+            waits
+                .windows(2)
+                .all(|w| w[1] + Duration::from_secs(1) >= w[0]),
+            "{waits:?}"
+        );
         assert!(waits[5] <= CIRCUIT_BREAKER_COOLDOWN);
         assert!(waits[5] > CIRCUIT_BREAKER_COOLDOWN - Duration::from_secs(1));
         slot.mark_spawn_succeeded();
