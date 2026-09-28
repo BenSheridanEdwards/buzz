@@ -2,6 +2,9 @@ use super::{ack_publication, invalid, load, save};
 use crate::acp::AcpError;
 use std::path::Path;
 
+/// Marker for a publication the relay will never accept; its record is dropped.
+pub(crate) const PERMANENTLY_REJECTED: &str = "relay permanently rejected the event";
+
 pub(crate) struct Publication<'a> {
     pub dir: &'a Path,
     pub sid: &'a str,
@@ -27,7 +30,17 @@ impl Publication<'_> {
             tokio::time::timeout(std::time::Duration::from_secs(20), rest.submit_event(event))
                 .await
                 .map_err(|_| invalid("publication timed out; event retained"))?
-                .map_err(|e| invalid(&format!("publication failed: {e}")))?;
+                .map_err(|e| {
+                    let message = e.to_string();
+                    // The bridge answers an ingest rejection (bad reply parent,
+                    // missing reaction target, invalid tags) with 400; resubmitting
+                    // the identical signed event can never succeed.
+                    if message.contains("returned HTTP 400") {
+                        invalid(&format!("{PERMANENTLY_REJECTED}: {message}"))
+                    } else {
+                        invalid(&format!("publication failed: {message}"))
+                    }
+                })?;
         if response["accepted"] != true {
             return Err(invalid(
                 "relay did not acknowledge acceptance; event retained",

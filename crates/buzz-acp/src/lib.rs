@@ -5796,22 +5796,30 @@ fn dispatch_delivery_turns(
                 agent.acp.set_observer_context(observer::context_for(Some(channel_id), Some(origin.clone()), None));
                 // The gateway owns wakes. Observe its journal, never ask another
                 // model turn to rediscover or deliver completed work.
-                let outcome = match async {
-                    agent.acp.session_load(&origin, &ctx_clone.cwd, Vec::new()).await?;
-                    pool::publish_canonical_outbox(&ctx_clone, &origin).await
-                }.await {
-                    Ok(()) => {
-                        if let Ok(mut retries) = recovery_retries.lock() {
-                            retries.clear(&origin);
-                        }
-                        pool::PromptOutcome::Ok(acp::StopReason::EndTurn)
-                    }
-                    Err(error) => {
-                        let notice = recovery_retries.lock().map(|mut retries| retries.fail(&origin, tokio::time::Instant::now()))
-                            .unwrap_or_else(|_| "Recovery retry state unavailable; result remains pending.".into());
-                        tracing::error!(%error, %origin, %notice, "canonical session recovery failed");
-                        pool::PromptOutcome::Error(error)
-                    }
+                // Only a failed load says the agent connection is unhealthy. A
+                // publication failure is an outbox problem: back off and retry,
+                // but never report it as a transport error, which respawns the
+                // worker and, once its circuit opens, exits the whole harness.
+                let loaded = agent.acp.session_load(&origin, &ctx_clone.cwd, Vec::new()).await;
+                let published = match loaded {
+                    Ok(_) => Some(pool::publish_canonical_outbox(&ctx_clone, &origin).await),
+                    Err(_) => None,
+                };
+                let failure = match (&loaded, &published) {
+                    (Err(error), _) => Some(error.to_string()),
+                    (Ok(_), Some(Err(error))) => Some(error.to_string()),
+                    _ => None,
+                };
+                if let Some(error) = &failure {
+                    let notice = recovery_retries.lock().map(|mut retries| retries.fail(&origin, tokio::time::Instant::now()))
+                        .unwrap_or_else(|_| "Recovery retry state unavailable; result remains pending.".into());
+                    tracing::error!(%error, %origin, %notice, "canonical session recovery failed");
+                } else if let Ok(mut retries) = recovery_retries.lock() {
+                    retries.clear(&origin);
+                }
+                let outcome = match loaded {
+                    Err(error) => pool::PromptOutcome::Error(error),
+                    Ok(_) => pool::PromptOutcome::Ok(acp::StopReason::EndTurn),
                 };
                 let _ = result_tx.send(PromptResult {
                     agent, source: PromptSource::Channel(delivery_scope),

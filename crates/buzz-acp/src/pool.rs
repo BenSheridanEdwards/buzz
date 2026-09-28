@@ -6288,6 +6288,7 @@ async fn clear_reactions(rest: crate::relay::RestClient, event_ids: Vec<String>)
 mod tests {
     use super::*;
     include!("pool_attachment_tests.rs");
+    include!("pool_attachment_rejection_tests.rs");
     include!("pool_canonical_recovery_tests.rs");
     use nostr::{EventBuilder, Keys, Kind, Tag, Timestamp};
     use serde_json::json;
