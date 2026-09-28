@@ -1945,6 +1945,9 @@ const CIRCUIT_BREAKER_COOLDOWN: Duration = Duration::from_secs(300); // 5 minute
 const RESPAWN_BASE_DELAY: Duration = Duration::from_secs(1);
 /// Maximum respawn backoff delay.
 const RESPAWN_MAX_DELAY: Duration = Duration::from_secs(30);
+/// First retry delay after a failed respawn (one maintenance tick); doubles per
+/// consecutive failure up to `CIRCUIT_BREAKER_COOLDOWN`.
+const SPAWN_FAILURE_BASE_DELAY: Duration = Duration::from_secs(30);
 
 /// Per-slot circuit breaker state.
 ///
@@ -1962,6 +1965,8 @@ struct SlotCircuit {
     /// Prevents duplicate spawns from maintenance ticks that fire before the
     /// previous spawn_and_init completes.
     respawn_in_flight: bool,
+    /// Consecutive failed spawns since the last successful one.
+    spawn_failures: u32,
 }
 
 /// Result of [`SlotCircuit::record_crash`].
@@ -2026,11 +2031,22 @@ impl SlotCircuit {
         CrashVerdict::Respawn(capped.mul_f64(factor))
     }
 
-    /// Mark a spawn failure — opens the circuit so the slot isn't retried
-    /// on every heartbeat tick. Uses fresh `Instant::now()` so spawn latency
-    /// doesn't shorten the effective cooldown.
+    /// Mark a spawn failure — defers the next refill so the slot isn't retried
+    /// on every heartbeat tick. A briefly unavailable agent (e.g. a canonical
+    /// gateway restarting its attach socket) is retried on the next maintenance
+    /// tick; consecutive failures double the delay up to the full cooldown.
+    /// Uses fresh `Instant::now()` so spawn latency doesn't shorten the delay.
     fn mark_spawn_failed(&mut self) {
-        self.open_until = Some(std::time::Instant::now() + CIRCUIT_BREAKER_COOLDOWN);
+        let delay = SPAWN_FAILURE_BASE_DELAY
+            .saturating_mul(1u32 << self.spawn_failures.min(5))
+            .min(CIRCUIT_BREAKER_COOLDOWN);
+        self.spawn_failures = self.spawn_failures.saturating_add(1);
+        self.open_until = Some(std::time::Instant::now() + delay);
+    }
+
+    /// A spawn succeeded: the next failure starts from the base delay again.
+    fn mark_spawn_succeeded(&mut self) {
+        self.spawn_failures = 0;
     }
 
     /// Check if an empty slot can be refilled. Unlike `record_crash`, this
@@ -2059,6 +2075,53 @@ impl SlotCircuit {
             }
             None => true, // no circuit open — normal refill, preserve crash history
         }
+    }
+}
+
+#[cfg(test)]
+mod spawn_failure_backoff_tests {
+    use super::*;
+
+    fn fresh() -> SlotCircuit {
+        SlotCircuit {
+            crash_times: Vec::new(),
+            open_until: None,
+            respawn_in_flight: false,
+            spawn_failures: 0,
+        }
+    }
+
+    fn wait_after_failure(slot: &mut SlotCircuit) -> Duration {
+        slot.mark_spawn_failed();
+        slot.open_until
+            .expect("a failed spawn must defer the next refill")
+            .saturating_duration_since(std::time::Instant::now())
+    }
+
+    // A canonical gateway restart removes its attach socket for ~15s. The first
+    // respawn fails; the slot must be retried on the next maintenance tick, not
+    // after the full crash-loop cooldown (observed: 5m23s offline).
+    #[test]
+    fn a_failed_respawn_retries_on_the_next_maintenance_tick() {
+        let wait = wait_after_failure(&mut fresh());
+        assert!(wait <= SPAWN_FAILURE_BASE_DELAY, "waited {wait:?}");
+    }
+
+    #[test]
+    fn repeated_spawn_failures_back_off_to_the_cooldown_and_success_resets() {
+        let mut slot = fresh();
+        // Measured against a moving clock: capped waits differ only by elapsed time.
+        let waits: Vec<Duration> = (0..6).map(|_| wait_after_failure(&mut slot)).collect();
+        assert!(
+            waits
+                .windows(2)
+                .all(|w| w[1] + Duration::from_secs(1) >= w[0]),
+            "{waits:?}"
+        );
+        assert!(waits[5] <= CIRCUIT_BREAKER_COOLDOWN);
+        assert!(waits[5] > CIRCUIT_BREAKER_COOLDOWN - Duration::from_secs(1));
+        slot.mark_spawn_succeeded();
+        assert!(wait_after_failure(&mut slot) <= SPAWN_FAILURE_BASE_DELAY);
     }
 }
 
@@ -2466,6 +2529,7 @@ mod idle_pool_sleep_tests {
             crash_times: Vec::new(),
             open_until: None,
             respawn_in_flight,
+            spawn_failures: 0,
         }
     }
 
@@ -3246,6 +3310,7 @@ async fn tokio_main() -> Result<()> {
             crash_times: Vec::new(),
             open_until: None,
             respawn_in_flight: false,
+            spawn_failures: 0,
         })
         .collect();
 
@@ -3373,6 +3438,7 @@ async fn tokio_main() -> Result<()> {
                         protocol_version,
                     };
                     pool.return_agent(agent);
+                    crash_history[rr.index].mark_spawn_succeeded();
                     tracing::info!(agent = rr.index, "respawn complete");
                     respawn_collected = true;
                 }
@@ -10324,6 +10390,7 @@ mod error_outcome_emission_tests {
             crash_times: Vec::new(),
             open_until: None,
             respawn_in_flight: false,
+            spawn_failures: 0,
         }];
         let (respawn_tx, _respawn_rx) = mpsc::channel(8);
         let mut respawn_tasks = tokio::task::JoinSet::new();
@@ -10399,6 +10466,7 @@ mod error_outcome_emission_tests {
             crash_times: Vec::new(),
             open_until: None,
             respawn_in_flight: false,
+            spawn_failures: 0,
         }];
         let (respawn_tx, _respawn_rx) = mpsc::channel(8);
         let mut respawn_tasks = tokio::task::JoinSet::new();
@@ -10520,6 +10588,7 @@ mod error_outcome_emission_tests {
             crash_times: Vec::new(),
             open_until: None,
             respawn_in_flight: false,
+            spawn_failures: 0,
         }];
         let (respawn_tx, _respawn_rx) = mpsc::channel(8);
         let mut respawn_tasks = tokio::task::JoinSet::new();
@@ -10585,6 +10654,7 @@ mod error_outcome_emission_tests {
             crash_times: Vec::new(),
             open_until: None,
             respawn_in_flight: false,
+            spawn_failures: 0,
         }];
         let (respawn_tx, _respawn_rx) = mpsc::channel(8);
         let mut respawn_tasks = tokio::task::JoinSet::new();
@@ -10669,6 +10739,7 @@ mod error_outcome_emission_tests {
             crash_times: Vec::new(),
             open_until: None,
             respawn_in_flight: false,
+            spawn_failures: 0,
         }];
         let (respawn_tx, _respawn_rx) = mpsc::channel(8);
         let mut respawn_tasks = tokio::task::JoinSet::new();
@@ -10762,6 +10833,7 @@ mod error_outcome_emission_tests {
             crash_times: Vec::new(),
             open_until: Some(std::time::Instant::now() + Duration::from_secs(3600)),
             respawn_in_flight: false,
+            spawn_failures: 0,
         }];
         let (respawn_tx, _respawn_rx) = mpsc::channel(8);
         let mut respawn_tasks = tokio::task::JoinSet::new();
@@ -10855,6 +10927,7 @@ mod error_outcome_emission_tests {
                 crash_times: Vec::new(),
                 open_until: None,
                 respawn_in_flight: false,
+                spawn_failures: 0,
             }];
             let (respawn_tx, _respawn_rx) = mpsc::channel(8);
             let mut respawn_tasks = tokio::task::JoinSet::new();
@@ -10952,6 +11025,7 @@ mod error_outcome_emission_tests {
                 crash_times: Vec::new(),
                 open_until: None,
                 respawn_in_flight: false,
+                spawn_failures: 0,
             }];
             let (respawn_tx, _respawn_rx) = mpsc::channel(8);
             let mut respawn_tasks = tokio::task::JoinSet::new();
@@ -11060,6 +11134,7 @@ mod error_outcome_emission_tests {
                 crash_times: Vec::new(),
                 open_until: None,
                 respawn_in_flight: false,
+                spawn_failures: 0,
             }];
             let (respawn_tx, _respawn_rx) = mpsc::channel(8);
             let mut respawn_tasks = tokio::task::JoinSet::new();
@@ -11138,6 +11213,7 @@ mod error_outcome_emission_tests {
             crash_times: Vec::new(),
             open_until: None,
             respawn_in_flight: false,
+            spawn_failures: 0,
         }];
         let (respawn_tx, _respawn_rx) = mpsc::channel(8);
         let mut respawn_tasks = tokio::task::JoinSet::new();
@@ -11234,6 +11310,7 @@ mod error_outcome_emission_tests {
             crash_times: Vec::new(),
             open_until: None,
             respawn_in_flight: false,
+            spawn_failures: 0,
         }];
         let (respawn_tx, _respawn_rx) = mpsc::channel(8);
         let mut respawn_tasks = tokio::task::JoinSet::new();
@@ -11366,6 +11443,7 @@ mod error_outcome_emission_tests {
             crash_times: Vec::new(),
             open_until: None,
             respawn_in_flight: false,
+            spawn_failures: 0,
         }];
         let (respawn_tx, _respawn_rx) = mpsc::channel(8);
         let mut respawn_tasks = tokio::task::JoinSet::new();
@@ -11497,6 +11575,7 @@ mod error_outcome_emission_tests {
             crash_times: Vec::new(),
             open_until: None,
             respawn_in_flight: false,
+            spawn_failures: 0,
         }];
         let (respawn_tx, _respawn_rx) = mpsc::channel(8);
         let mut respawn_tasks = tokio::task::JoinSet::new();
@@ -11630,6 +11709,7 @@ mod error_outcome_emission_tests {
             crash_times: Vec::new(),
             open_until: None,
             respawn_in_flight: false,
+            spawn_failures: 0,
         }];
         let (respawn_tx, _respawn_rx) = mpsc::channel(8);
         let mut respawn_tasks = tokio::task::JoinSet::new();
@@ -11785,6 +11865,7 @@ mod error_outcome_emission_tests {
             crash_times: Vec::new(),
             open_until: None,
             respawn_in_flight: false,
+            spawn_failures: 0,
         }];
         let (respawn_tx, _respawn_rx) = mpsc::channel(8);
         let mut respawn_tasks = tokio::task::JoinSet::new();
@@ -11873,6 +11954,7 @@ mod error_outcome_emission_tests {
             crash_times: Vec::new(),
             open_until: None,
             respawn_in_flight: false,
+            spawn_failures: 0,
         }];
         let (respawn_tx, _respawn_rx) = mpsc::channel(8);
         let mut respawn_tasks = tokio::task::JoinSet::new();
