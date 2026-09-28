@@ -2,6 +2,8 @@ import 'dart:convert';
 
 import 'observer_models.dart';
 
+part 'hermes_attachment_transcript.dart';
+
 const _buzzReadTools = <String>{
   'get_messages',
   'get_channel_history',
@@ -398,9 +400,26 @@ String _safeJsonEncode(dynamic value) {
   }
 }
 
+bool _isTerminalToolStatus(ToolStatus status) =>
+    status == ToolStatus.completed || status == ToolStatus.failed;
+
+/// Late progress must not reopen a call that already reached a terminal state.
+ToolStatus _mergeToolStatus(ToolStatus existing, ToolStatus next) =>
+    _isTerminalToolStatus(existing) && !_isTerminalToolStatus(next)
+    ? existing
+    : next;
+
+String _joinLifecycleText(String existing, String next) {
+  if (existing.isEmpty) return next;
+  if (next.isEmpty) return existing;
+  return '$existing\n$next';
+}
+
 List<TranscriptItem> buildTranscript(List<ObserverFrame> events) {
-  final items = <TranscriptItem>[];
-  final itemsById = <String, TranscriptItem>{};
+  final buf = _TranscriptBuffer();
+  final hermes = _HermesState();
+  final items = buf.items;
+  final itemsById = buf.itemsById;
 
   // Maps a logical message ID to the actual key currently being appended to.
   final activeMessageKey = <String, String>{};
@@ -458,7 +477,7 @@ List<TranscriptItem> buildTranscript(List<ObserverFrame> events) {
         return;
       }
       if (type == 'lifecycle' && existing is LifecycleItem) {
-        existing.text += text;
+        existing.text = _joinLifecycleText(existing.text, text);
         return;
       }
     }
@@ -477,6 +496,9 @@ List<TranscriptItem> buildTranscript(List<ObserverFrame> events) {
         title: title,
         text: text,
         timestamp: timestamp,
+        tone: title.toLowerCase().contains('error')
+            ? LifecycleTone.error
+            : LifecycleTone.status,
       );
     }
     items.add(item);
@@ -515,11 +537,17 @@ List<TranscriptItem> buildTranscript(List<ObserverFrame> events) {
     String result,
     bool isError,
     String timestamp,
+    ObserverFrame event,
+    String? sessionId,
+    String? turnId,
   ) {
     final existing = itemsById[id];
     final canonicalBuzzToolName =
         buzzToolName ?? _findBuzzToolName(toolName, true);
     if (existing is ToolItem) {
+      // A call retired by its process exit is final: a late terminal frame
+      // from the dead process must not flip it back to completed.
+      if (existing.retired) return;
       if (!_isGenericToolTitle(title)) {
         existing.title = title;
       }
@@ -530,10 +558,14 @@ List<TranscriptItem> buildTranscript(List<ObserverFrame> events) {
           !_isGenericToolTitle(toolName)) {
         existing.toolName = toolName;
       }
-      existing.status = status;
+      existing.status = _mergeToolStatus(existing.status, status);
       existing.args = args.isNotEmpty ? args : existing.args;
       if (result.isNotEmpty) existing.result = result;
       existing.isError = isError || existing.isError;
+      existing.agentIndex = event.agentIndex ?? existing.agentIndex;
+      existing.channelId = event.channelId;
+      existing.sessionId = sessionId ?? existing.sessionId;
+      existing.turnId = turnId ?? existing.turnId;
       return;
     }
     sealOpenMessages();
@@ -547,12 +579,39 @@ List<TranscriptItem> buildTranscript(List<ObserverFrame> events) {
       result: result,
       isError: isError,
       timestamp: timestamp,
+      agentIndex: event.agentIndex,
+      channelId: event.channelId,
+      sessionId: sessionId,
+      turnId: turnId,
     );
     items.add(item);
     itemsById[id] = item;
   }
 
   for (final event in events) {
+    if (_processHermesFrame(buf, hermes, event)) continue;
+
+    if (event.sessionId != null) buf.latestSessionId = event.sessionId;
+
+    if (event.kind == 'agent_stream_closed') {
+      _retireTools(buf, event);
+      continue;
+    }
+
+    if (event.kind == 'turn_error' || event.kind == 'agent_panic') {
+      final payload = _asRecord(event.payload);
+      final outcome = _asString(payload['outcome']) ?? 'error';
+      final error = _asString(payload['error']) ?? 'Unknown error';
+      upsertTextItem(
+        '${event.kind}:${event.turnId ?? '${event.seq}'}',
+        'lifecycle',
+        event.kind == 'agent_panic' ? 'Agent error (crash)' : 'Turn error',
+        '$outcome: $error',
+        event.timestamp,
+      );
+      continue;
+    }
+
     if (event.kind == 'turn_started') {
       upsertTextItem(
         'turn:${event.turnId ?? '${event.seq}'}',
@@ -627,6 +686,9 @@ List<TranscriptItem> buildTranscript(List<ObserverFrame> events) {
     final updateType = _asString(update['sessionUpdate']) ?? 'unknown';
     final turnKey = event.turnId ?? event.sessionId ?? 'unknown';
     final messageId = _asString(update['messageId']);
+    final hermesTool = _hermesToolPrefix(event, params);
+    final toolSession = hermesTool.sessionId ?? buf.latestSessionId;
+    final toolTurn = hermesTool.turnId ?? event.turnId;
 
     if (updateType == 'agent_message_chunk') {
       upsertMessage(
@@ -665,7 +727,7 @@ List<TranscriptItem> buildTranscript(List<ObserverFrame> events) {
       final toolId = _asString(update['toolCallId']) ?? 'tool:${event.seq}';
       final identity = _extractToolIdentity(update);
       upsertTool(
-        'tool:$toolId',
+        '${hermesTool.prefix}$toolId',
         identity.title,
         identity.toolName,
         identity.buzzToolName,
@@ -674,26 +736,38 @@ List<TranscriptItem> buildTranscript(List<ObserverFrame> events) {
         _extractToolResult(update),
         false,
         event.timestamp,
+        event,
+        toolSession,
+        toolTurn,
       );
       continue;
     }
 
     if (updateType == 'tool_call_update') {
       final toolId = _asString(update['toolCallId']) ?? 'tool:${event.seq}';
-      final status = _normalizeToolStatus(
-        _asString(update['status']) ?? 'completed',
-      );
+      final existing = itemsById['${hermesTool.prefix}$toolId'];
+      final explicitStatus = _asString(update['status']);
+      // ACP updates are partial: progress/output is not completion evidence,
+      // so a status-less update keeps the call's current status.
+      final status = explicitStatus != null
+          ? _normalizeToolStatus(explicitStatus)
+          : existing is ToolItem
+          ? existing.status
+          : ToolStatus.executing;
       final identity = _extractToolIdentity(update);
       upsertTool(
-        'tool:$toolId',
+        '${hermesTool.prefix}$toolId',
         identity.title,
         identity.toolName,
         identity.buzzToolName,
         status,
         _extractToolArgs(update),
         _extractToolResult(update),
-        status == ToolStatus.failed,
+        explicitStatus != null && status == ToolStatus.failed,
         event.timestamp,
+        event,
+        toolSession,
+        toolTurn,
       );
       continue;
     }

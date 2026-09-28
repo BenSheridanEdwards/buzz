@@ -6,6 +6,9 @@ enum ObserverConnectionState { idle, connecting, open, error }
 /// Status of a tool execution.
 enum ToolStatus { executing, completed, failed, pending }
 
+/// Visual weight of a lifecycle row: informational status or an error.
+enum LifecycleTone { status, error }
+
 /// A decrypted observer frame from a kind:24200 event.
 @immutable
 class ObserverFrame {
@@ -98,11 +101,15 @@ class LifecycleItem extends TranscriptItem {
   @override
   final String timestamp;
 
+  /// Error rows (turn errors, recovery failures) render with error styling.
+  final LifecycleTone tone;
+
   LifecycleItem({
     required this.id,
     required this.title,
     required this.text,
     required this.timestamp,
+    this.tone = LifecycleTone.status,
   });
 }
 
@@ -135,6 +142,15 @@ class ToolItem extends TranscriptItem {
   @override
   final String timestamp;
 
+  /// Observer attribution used to retire calls when their process exits.
+  int? agentIndex;
+  String? channelId;
+  String? sessionId;
+  String? turnId;
+
+  /// Set once the owning process closed; retired calls are final.
+  bool retired;
+
   ToolItem({
     required this.id,
     required this.title,
@@ -145,5 +161,10 @@ class ToolItem extends TranscriptItem {
     required this.result,
     required this.isError,
     required this.timestamp,
+    this.agentIndex,
+    this.channelId,
+    this.sessionId,
+    this.turnId,
+    this.retired = false,
   });
 }

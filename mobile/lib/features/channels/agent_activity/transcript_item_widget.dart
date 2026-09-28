@@ -160,15 +160,38 @@ class _LifecycleItemWidget extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final isError = item.tone == LifecycleTone.error;
+    final color = isError
+        ? context.colors.error
+        : context.colors.onSurfaceVariant;
+    // Outcome rows repeat their title as text; show and announce it once.
+    final detail = item.text.isNotEmpty && item.text != item.title
+        ? item.text
+        : null;
     return Padding(
       padding: const EdgeInsets.symmetric(vertical: Grid.half),
-      child: Center(
-        child: Text(
-          '${item.title}${item.text.isNotEmpty ? ' \u2014 ${item.text}' : ''}',
-          style: context.textTheme.labelSmall?.copyWith(
-            color: context.colors.onSurfaceVariant,
+      child: Semantics(
+        container: true,
+        label: detail != null ? '${item.title}: $detail' : item.title,
+        child: ExcludeSemantics(
+          child: Center(
+            child: Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                if (isError) ...[
+                  Icon(LucideIcons.circleAlert, size: 12, color: color),
+                  const SizedBox(width: Grid.quarter),
+                ],
+                Flexible(
+                  child: Text(
+                    '${item.title}${detail != null ? ' \u2014 $detail' : ''}',
+                    style: context.textTheme.labelSmall?.copyWith(color: color),
+                    textAlign: TextAlign.center,
+                  ),
+                ),
+              ],
+            ),
           ),
-          textAlign: TextAlign.center,
         ),
       ),
     );
