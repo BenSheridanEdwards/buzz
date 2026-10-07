@@ -243,6 +243,17 @@ async fn is_owner_or_sibling(
     is_sibling
 }
 
+/// Whether `author` is another agent run by this agent's owner (a sibling),
+/// as opposed to the owner themself. Uses the same cached NIP-OA lookup as the
+/// author gate.
+async fn is_sibling_agent(
+    author: &str,
+    owner_cache: &OwnerCache,
+    rest_client: &relay::RestClient,
+) -> bool {
+    owner_cache.get() != Some(author) && is_owner_or_sibling(author, owner_cache, rest_client).await
+}
+
 /// Return the workflow owner attributed by a relay-signed workflow message.
 ///
 /// `buzz:workflow-owner` alone is not authority: any ordinary event author can
@@ -611,13 +622,25 @@ struct NormalListenerIngress {
 }
 
 impl AuthorizedNormalListenerEvent {
+    /// Match the event against the subscription rules.
+    ///
+    /// `engaged` (the event is a reply in a thread this agent participates in)
+    /// lets a person continue the conversation without re-mentioning the
+    /// agent. It is withheld from sibling agents: two same-owner agents engaged
+    /// in one thread would otherwise wake each other on every reply — including
+    /// each other's "no reply" failure notices — forever. A sibling agent still
+    /// reaches this agent with an explicit `p`-tag mention.
     async fn match_subscription(
         self,
         rules: &[SubscriptionRule],
         agent_pubkey_hex: &str,
         engaged: bool,
+        owner_cache: &OwnerCache,
+        rest_client: &relay::RestClient,
     ) -> Option<NormalListenerIngress> {
         let (buzz_event, effective_author) = self.0.into_parts();
+        let engaged =
+            engaged && !is_sibling_agent(&effective_author, owner_cache, rest_client).await;
         let matched = filter::match_event_engaged(
             &buzz_event.event,
             buzz_event.channel_id,
@@ -3996,7 +4019,13 @@ async fn tokio_main() -> Result<()> {
                             };
                             let Some(ingress) =
                                 AuthorizedNormalListenerEvent(authorized_event)
-                                    .match_subscription(&rules, &pubkey_hex, is_engaged)
+                                    .match_subscription(
+                                        &rules,
+                                        &pubkey_hex,
+                                        is_engaged,
+                                        &owner_cache,
+                                        &ctx.rest_client,
+                                    )
                                     .await
                             else {
                                 tracing::debug!("authorized event matched no rule — dropping");
@@ -9012,6 +9041,113 @@ mod author_gate_tests {
             is_dm_channel(Uuid::new_v4(), &resolver(HashMap::new())).await,
             "an unresolvable channel type must be treated as a DM"
         );
+    }
+
+    /// Two same-owner agents engaged in one thread must not wake each other on
+    /// every un-mentioned reply (the Jeeves/Karpathy "No reply" ping-pong);
+    /// the owner's un-mentioned reply in that thread still reaches the agent,
+    /// and a sibling can still reach it with an explicit mention.
+    #[tokio::test]
+    async fn engaged_thread_follows_owner_but_not_sibling_agents() {
+        let owner = nostr::Keys::generate();
+        let sibling = nostr::Keys::generate();
+        let agent = nostr::Keys::generate().public_key().to_hex();
+        let (rest_client, server) = nip11_server(serde_json::json!({ "name": "relay" })).await;
+        let owner_cache = OwnerCache::new(Some(owner.public_key().to_hex()));
+        owner_cache.cache_sibling(sibling.public_key().to_hex(), true);
+        let channel_id = Uuid::new_v4();
+        let channel_info = pool::ChannelInfoResolver::new(
+            HashMap::from([(
+                channel_id,
+                relay::ChannelInfo {
+                    name: "general".into(),
+                    channel_type: "stream".into(),
+                    description: None,
+                },
+            )]),
+            rest_client.clone(),
+        );
+        let rules = vec![SubscriptionRule {
+            name: "mentions".into(),
+            channels: filter::ChannelScope::All("all".into()),
+            kinds: vec![KIND_STREAM_MESSAGE],
+            require_mention: true,
+            ..Default::default()
+        }];
+        let root = "ab".repeat(32);
+        let reply = |signer: &nostr::Keys, mention: bool| {
+            let mut tags = vec![
+                nostr::Tag::parse(["h", &channel_id.to_string()]).expect("h tag"),
+                nostr::Tag::parse(["e", &root, "", "root"]).expect("root tag"),
+            ];
+            if mention {
+                tags.push(nostr::Tag::parse(["p", &agent]).expect("p tag"));
+            }
+            nostr::EventBuilder::new(nostr::Kind::Custom(KIND_STREAM_MESSAGE as u16), "reply")
+                .tags(tags)
+                .sign_with_keys(signer)
+                .expect("signed reply")
+        };
+        #[allow(clippy::too_many_arguments)]
+        async fn wakes(
+            gate: &mut InboundAuthorGate,
+            event: nostr::Event,
+            channel_id: Uuid,
+            owner_cache: &OwnerCache,
+            channel_info: &pool::ChannelInfoResolver,
+            rest_client: &relay::RestClient,
+            rules: &[SubscriptionRule],
+            agent: &str,
+        ) -> bool {
+            let buzz_event = relay::BuzzEvent {
+                connection_generation: 0,
+                channel_id,
+                event,
+            };
+            let authorized = authorize_normal_listener_event(
+                gate,
+                buzz_event,
+                &RespondTo::OwnerOnly,
+                &HashSet::new(),
+                owner_cache,
+                channel_info,
+                rest_client,
+            )
+            .await
+            .expect("owner and sibling pass the author gate");
+            AuthorizedNormalListenerEvent(authorized)
+                .match_subscription(rules, agent, true, owner_cache, rest_client)
+                .await
+                .is_some()
+        }
+        let mut gate = InboundAuthorGate::connect(&rest_client, &agent, "test").await;
+        let mut wakes = async |event| {
+            wakes(
+                &mut gate,
+                event,
+                channel_id,
+                &owner_cache,
+                &channel_info,
+                &rest_client,
+                &rules,
+                &agent,
+            )
+            .await
+        };
+
+        assert!(
+            wakes(reply(&owner, false)).await,
+            "the owner's un-mentioned reply in an engaged thread must reach the agent"
+        );
+        assert!(
+            !wakes(reply(&sibling, false)).await,
+            "a sibling agent's un-mentioned reply must not wake the agent"
+        );
+        assert!(
+            wakes(reply(&sibling, true)).await,
+            "a sibling agent that mentions the agent must still reach it"
+        );
+        server.abort();
     }
 }
 
